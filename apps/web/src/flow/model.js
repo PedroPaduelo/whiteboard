@@ -166,7 +166,7 @@ export function minimapColorFor(el) {
  * @returns {object[]} nodes, in z-order
  */
 export function toFlowNodes(elements, opts = {}) {
-  const { selection, overrides, editingId, resizingId, onResizeStart, onResizeEnd } = opts;
+  const { selection, overrides, editingId, resizingId, onResizeStart, onResizeEnd, liveSize } = opts;
   const resizeOf = resizingId ?? null;
   const selectedIds =
     selection instanceof Set ? selection : new Set(Array.isArray(selection) ? selection : []);
@@ -188,6 +188,17 @@ export function toFlowNodes(elements, opts = {}) {
     const w = Math.max(0, num(el.w));
     const h = Math.max(0, num(el.h));
     const nodeType = NODE_TYPE_BY_ELEMENT[el.type];
+    /* React Flow's per-frame measurement for this node, while a resize runs.
+       In a CONTROLLED flow it is delivered as a `dimensions` change that
+       nothing applies, so the node component has to be handed it explicitly
+       — without it the wrapper keeps the stored size and the box never
+       visibly grows even though the drag computed a new one.
+
+       Only the node actually being resized honours it. The ResizeObserver
+       emits a `dimensions` change for every node whose measured size differs
+       at all, and honouring those would pin a node to its measured box and
+       let it drift away from the stored w/h the backend persists. */
+    const liveBox = resizeOf === el.id ? liveSize?.get?.(el.id) || null : null;
 
     // A grouped child stores ABSOLUTE coordinates like every other element,
     // but React Flow expects a grouped node's position to be RELATIVE to its
@@ -217,32 +228,15 @@ export function toFlowNodes(elements, opts = {}) {
       // backend stores and what `export.js` draws.
       width: w,
       height: h,
-      /* `style` is set while the element is NOT being resized, and omitted
-         while it is. Pinning width/height in the style makes the node
-         un-resizable: React Flow measures the box it wants, the style wins,
-         and the handle drags nothing.
-
-         The `width`/`height` fields above are enough for React Flow to lay the
-         node out; the style exists only to stop a node being sized by its
-         CONTENT, which for a long label is a different shape than the stored
-         w/h that the backend persists and the exporter draws. */
-      /* NO `style` at all.
-         React Flow measures the node's DOM and writes the measurement onto
-         the node; a pinned `style: {width, height}` overrides that
-         measurement, so the box never changes and the resize handle drags
-         nothing. `width`/`height` above are enough for React Flow to lay the
-         node out — the style was only ever a guard against a node being sized
-         by its content, and it costs the interaction that matters more.
-
-         A node sized by its content would differ from the stored w/h only for
-         an element whose text overflows its box, and that is bounded by
-         `overflow: hidden` plus `word-break` in flowLayer.css. */
-      /* The style is dropped ONLY for the node being resized, so React Flow's
-         own measurement is what paints during the gesture. Everywhere else it
-         is pinned, which is what stops a node being sized by its CONTENT —
-         a long label wrapping differently in a div than it did on canvas
-         would leave the stored w/h disagreeing with what is on screen. */
-      style: resizingId === el.id ? undefined : { width: w, height: h },
+      /* `width`/`height` are the STORED size; `style` tracks the LIVE one.
+         Dropping the style while a resize runs does not work, and the reason
+         is worth keeping: the node component sizes its OWN inner wrapper from
+         `data.w/h`, and that div is what `offsetWidth` measures. React Flow
+         pushes a new size onto the wrapper's style, but the inner div is
+         still pinned to the stored size, so the box cannot grow no matter what
+         React Flow asks for. The pin has to MOVE, not disappear — and the
+         measurement has to be handed down to the node component too. */
+      style: { width: liveBox ? liveBox.w : w, height: liveBox ? liveBox.h : h },
       data: {
         elementId: el.id,
         element: el,
@@ -251,6 +245,9 @@ export function toFlowNodes(elements, opts = {}) {
         // Cached rather than computed in the node, so hot paths stay cheap.
         w,
         h,
+        // React Flow's per-frame measurement, non-null only mid-resize.
+        liveW: liveBox ? liveBox.w : undefined,
+        liveH: liveBox ? liveBox.h : undefined,
         rotation: num(el.rotation),
         stroke: el.stroke || 'var(--draw-default-stroke)',
         fill: el.fill || 'none',
@@ -352,6 +349,7 @@ export function boardSignature(nodes, edges = []) {
     const d = n.data || {};
     out +=
       `N${n.id}|${n.type}|${n.position.x},${n.position.y}|${n.width}x${n.height}|${n.zIndex}|` +
+      `${d.liveW ?? ''}x${d.liveH ?? ''}|` +
       `${n.selected ? 1 : 0}${d.editing ? 1 : 0}${d.locked ? 1 : 0}|` +
       `${d.fill}|${d.stroke}|${d.strokeWidth}|${d.strokeStyle}|${d.rotation}|${d.minimapColor}|${n.parentId ?? ''}\n`;
   }

@@ -59,7 +59,29 @@ const Handles = memo(function Handles({ show }) {
 
 /** The resizer, mounted only when selected — always-on handles would be four
  *  permanent pointer traps on every node on the board. */
-const Resizer = memo(function Resizer({ minWidth = 48, minHeight = 32, keepAspectRatio, onResizeStart, onResizeEnd }) {
+const Resizer = memo(function Resizer({ nodeId, minWidth = 48, minHeight = 32, keepAspectRatio, onResizeStart, onResizeEnd }) {
+  // React Flow 11's `onResizeStart` / `onResizeEnd` receive the resize BOUNDS
+  // ({ width, height, x, y }) — NOT the node object, and there is no
+  // `measured` field in this version. The store handler needs an element id,
+  // so it is threaded in from the node component.
+  //
+  // It used to come from `useNodeId()`, which reads `NodeIdContext`. Inside a
+  // CUSTOM node that context is not in scope where we mount the resizer, so
+  // `useNodeId()` returned `undefined`: every resize committed to
+  // updateElement('undefined', ...) and the drag silently did nothing. Proven
+  // in a browser — the library's own computed value, committed with the right
+  // id, resized the node; the same value committed as-is, did not.
+  //
+  // Threading the id as a prop drops the dependency on a context that was
+  // never there, and it cannot go stale.
+  const start = useCallback(
+    (e, bounds) => onResizeStart?.(e, { ...bounds, nodeId }),
+    [onResizeStart, nodeId],
+  );
+  const end = useCallback(
+    (e, bounds) => onResizeEnd?.(e, { ...bounds, nodeId }),
+    [onResizeEnd, nodeId],
+  );
   return (
     /* `handleClassName` REPLACES React Flow's own handle classes, and those
        carry the direction (`.handle.se`, `.handle-bottom`, …). Replacing them
@@ -74,8 +96,8 @@ const Resizer = memo(function Resizer({ minWidth = 48, minHeight = 32, keepAspec
       minWidth={minWidth}
       minHeight={minHeight}
       keepAspectRatio={keepAspectRatio}
-      onResizeStart={onResizeStart}
-      onResizeEnd={onResizeEnd}
+      onResizeStart={start}
+      onResizeEnd={end}
       color="var(--color-accent)"
       handleStyle={{
         width: 9,
@@ -167,24 +189,24 @@ function Body({ children, data, w, h, className = '', rounded = true }) {
  * The node types
  * ------------------------------------------------------------------ */
 
-const RectNode = memo(function RectNode({ data, selected }) {
+const RectNode = memo(function RectNode({ id, data, selected }) {
   const w = data.w || 160;
   const h = data.h || 90;
   return (
-    <div style={{ width: w, height: h }}>
-      <Resizer onResizeStart={data.onResizeStart} onResizeEnd={data.onResizeEnd} />
+    <div style={{ width: data.liveW ?? w, height: data.liveH ?? h }}>
+      <Resizer nodeId={id} onResizeStart={data.onResizeStart} onResizeEnd={data.onResizeEnd} />
       <Handles show={selected} />
       <Body data={data} w={w} h={h} />
     </div>
   );
 });
 
-const EllipseNode = memo(function EllipseNode({ data, selected }) {
+const EllipseNode = memo(function EllipseNode({ id, data, selected }) {
   const w = data.w || 160;
   const h = data.h || 90;
   return (
-    <div style={{ width: w, height: h }}>
-      <Resizer minWidth={60} minHeight={40} keepAspectRatio onResizeStart={data.onResizeStart} onResizeEnd={data.onResizeEnd} />
+    <div style={{ width: data.liveW ?? w, height: data.liveH ?? h }}>
+      <Resizer nodeId={id} minWidth={60} minHeight={40} keepAspectRatio onResizeStart={data.onResizeStart} onResizeEnd={data.onResizeEnd} />
       <Handles show={selected} />
       <Body data={data} w={w} h={h} rounded={false} className="wb-node--shape">
         <SvgShape kind="ellipse" data={data} w={w} h={h} />
@@ -193,12 +215,12 @@ const EllipseNode = memo(function EllipseNode({ data, selected }) {
   );
 });
 
-const DiamondNode = memo(function DiamondNode({ data, selected }) {
+const DiamondNode = memo(function DiamondNode({ id, data, selected }) {
   const w = data.w || 140;
   const h = data.h || 100;
   return (
-    <div style={{ width: w, height: h }}>
-      <Resizer minWidth={70} minHeight={50} onResizeStart={data.onResizeStart} onResizeEnd={data.onResizeEnd} />
+    <div style={{ width: data.liveW ?? w, height: data.liveH ?? h }}>
+      <Resizer nodeId={id} minWidth={70} minHeight={50} onResizeStart={data.onResizeStart} onResizeEnd={data.onResizeEnd} />
       <Handles show={selected} />
       <Body data={data} w={w} h={h} rounded={false} className="wb-node--shape">
         <SvgShape kind="diamond" data={data} w={w} h={h} />
@@ -207,12 +229,12 @@ const DiamondNode = memo(function DiamondNode({ data, selected }) {
   );
 });
 
-const CylinderNode = memo(function CylinderNode({ data, selected }) {
+const CylinderNode = memo(function CylinderNode({ id, data, selected }) {
   const w = data.w || 140;
   const h = data.h || 100;
   return (
-    <div style={{ width: w, height: h }}>
-      <Resizer minWidth={70} minHeight={50} keepAspectRatio onResizeStart={data.onResizeStart} onResizeEnd={data.onResizeEnd} />
+    <div style={{ width: data.liveW ?? w, height: data.liveH ?? h }}>
+      <Resizer nodeId={id} minWidth={70} minHeight={50} keepAspectRatio onResizeStart={data.onResizeStart} onResizeEnd={data.onResizeEnd} />
       <Handles show={selected} />
       <Body data={data} w={w} h={h} rounded={false} className="wb-node--shape">
         <SvgShape kind="cylinder" data={data} w={w} h={h} />
@@ -245,7 +267,7 @@ function useTextEditing() {
   };
 }
 
-const StickyNode = memo(function StickyNode({ data, selected }) {
+const StickyNode = memo(function StickyNode({ id, data, selected }) {
   const { commitText, cancelEdit } = useTextEditing();
   const w = data.w || 160;
   const h = data.h || 160;
@@ -254,8 +276,8 @@ const StickyNode = memo(function StickyNode({ data, selected }) {
   // on a yellow note is unreadable, and a hardcoded table of "light" colours
   // goes stale the moment someone adds one.
   return (
-    <div style={{ width: w, height: h }}>
-      <Resizer minWidth={80} minHeight={60} onResizeStart={data.onResizeStart} onResizeEnd={data.onResizeEnd} />
+    <div style={{ width: data.liveW ?? w, height: data.liveH ?? h }}>
+      <Resizer nodeId={id} minWidth={80} minHeight={60} onResizeStart={data.onResizeStart} onResizeEnd={data.onResizeEnd} />
       <Handles show={selected} />
       <div
         className="wb-node wb-node--sticky"
@@ -284,15 +306,15 @@ const StickyNode = memo(function StickyNode({ data, selected }) {
   );
 });
 
-const TextNode = memo(function TextNode({ data, selected }) {
+const TextNode = memo(function TextNode({ id, data, selected }) {
   const { commitText, cancelEdit } = useTextEditing();
   const w = data.w || 200;
   const h = data.h || 40;
   const el = data.element || {};
   const size = el.fontSize || 24;
   return (
-    <div style={{ width: w, height: h }}>
-      <Resizer minWidth={60} minHeight={20} onResizeStart={data.onResizeStart} onResizeEnd={data.onResizeEnd} />
+    <div style={{ width: data.liveW ?? w, height: data.liveH ?? h }}>
+      <Resizer nodeId={id} minWidth={60} minHeight={20} onResizeStart={data.onResizeStart} onResizeEnd={data.onResizeEnd} />
       <Handles show={selected} />
       <div
         className="wb-node wb-node--text"
@@ -320,13 +342,13 @@ const TextNode = memo(function TextNode({ data, selected }) {
   );
 });
 
-const ImageNode = memo(function ImageNode({ data, selected }) {
+const ImageNode = memo(function ImageNode({ id, data, selected }) {
   const w = data.w || 200;
   const h = data.h || 150;
   const el = data.element || {};
   return (
-    <div style={{ width: w, height: h }}>
-      <Resizer minWidth={40} minHeight={40} onResizeStart={data.onResizeStart} onResizeEnd={data.onResizeEnd} />
+    <div style={{ width: data.liveW ?? w, height: data.liveH ?? h }}>
+      <Resizer nodeId={id} minWidth={40} minHeight={40} onResizeStart={data.onResizeStart} onResizeEnd={data.onResizeEnd} />
       <Handles show={selected} />
       <div
         className="wb-node wb-node--image"
@@ -351,7 +373,7 @@ const ImageNode = memo(function ImageNode({ data, selected }) {
  * margin to let the stroke render outside it, and `overflow: visible` on the
  * wrapper.
  */
-const ConnectorNode = memo(function ConnectorNode({ data, selected }) {
+const ConnectorNode = memo(function ConnectorNode({ id, data, selected }) {
   const el = data.element || {};
   const w = Math.max(data.w || 1, 1);
   const h = Math.max(data.h || 1, 1);

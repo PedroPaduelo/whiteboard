@@ -64,26 +64,35 @@ function BoardFlow() {
   // Live drag positions, in a ref and not in state: they change on every
   // pointermove, and React state would re-render the tree at mouse rate.
   const overrides = useRef(new Map());
+  /** React Flow's live per-frame size, keyed by node id. Only set while a
+   *  resize is running; cleared on resize end, when the store becomes the
+   *  authority again. */
+  const liveSize = useRef(new Map());
   const sigRef = useRef('');
   const nodesRef = useRef(nodes);
   const draggingId = useRef(null);
 
-  const onNodeResizeStart = useCallback((_e, node) => {
-    store().setResizing(node.id);
+  const onNodeResizeStart = useCallback((_e, params) => {
+    // React Flow 11's ResizeControl passes the resize BOUNDS
+    // ({ width, height, x, y }) — not the node. The node id is bound by the
+    // node component itself (see flowNodes.jsx `Resizer`), which hands the
+    // callbacks a payload that already carries it.
+    store().setResizing(params?.nodeId ?? null);
   }, []);
 
-  const onNodeResizeEnd = useCallback((_e, node) => {
+  const onNodeResizeEnd = useCallback((_e, params) => {
     const s = store();
-    // React Flow 11 reports the resized box on `node.measured`; some builds
-    // put it on the node itself. Read whichever is present rather than
-    // assuming — guessing wrong here writes a 0x0 element.
-    const w = node.measured?.width ?? node.width ?? node.data?.w;
-    const h = node.measured?.height ?? node.height ?? node.data?.h;
-    if (!Number.isFinite(w) || !Number.isFinite(h)) return;
+    const id = params?.nodeId;
+    const w = params?.width;
+    const h = params?.height;
     s.setResizing(null);
-    if (w === node.data?.w && h === node.data?.h) return; // no actual change
+    liveSize.current.delete(id);
+    if (!id) return;
+    if (!Number.isFinite(w) || !Number.isFinite(h)) return;
+    const el = s.elements.find((e) => e.id === id);
+    if (w === el?.w && h === el?.h) return; // no actual change
     s.commit('resize');
-    s.updateElement(node.id, { w, h });
+    s.updateElement(id, { w, h });
   }, []);
 
   /** Double-click opens the in-place editor on a text or a sticky. Anything
@@ -195,6 +204,33 @@ function BoardFlow() {
           overrides.current.set(ch.id, { x: ch.position.x, y: ch.position.y });
           moved = true;
         }
+      }
+      // React Flow emits a `dimensions` change on every frame of a resize.
+      // This is a CONTROLLED flow, so it is not applied anywhere unless the
+      // nodes here adopt it — and the node component's own wrapper is sized
+      // from `data.w/h`, which only changes when the store is written at
+      // resize END. Without this the box never visibly grows: the pointer
+      // moves, the numbers are computed, and the node stays the same size.
+      const dims = changes.filter((c) => c.type === 'dimensions' && c.dimensions);
+      if (dims.length) {
+        for (const d of dims) {
+          liveSize.current.set(d.id, { w: d.dimensions.width, h: d.dimensions.height });
+        }
+        const s = store();
+        const next = toFlowNodes(s.elements, {
+          selection: s.selection,
+          overrides: overrides.current,
+          editingId: s.editingId,
+          resizingId: s.resizingId,
+          liveSize: liveSize.current,
+        });
+        const sig = boardSignature(next, toFlowEdges(s.elements));
+        if (sig !== sigRef.current) {
+          sigRef.current = sig;
+          nodesRef.current = next;
+          setNodes(next);
+        }
+        return;
       }
       if (moved) {
         // Re-read from the store so the override and the element list cannot

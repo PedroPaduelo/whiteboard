@@ -321,11 +321,18 @@ function BoardView({ boardId, onNavigate, ui, theme, onToggleTheme }) {
         style={{
           position: 'absolute',
           top: 'calc(var(--topbar-height) + var(--sp-4))',
-          left: 'calc(var(--sp-3) + var(--toolbar-width) + var(--sp-2))',
+          // RIGHT, not left. Beside the tool rail it sat directly over the
+          // top-left corner of the board, which is exactly where a board's
+          // content starts: it swallowed the resize handles of anything placed
+          // there, and dragging a handle silently added a preset instead.
+          right: 'calc(var(--sp-3) + var(--sp-2))',
           bottom: 'calc(var(--statusbar-height) + var(--sp-4))',
           zIndex: 'var(--z-panels)',
           display: 'flex',
           alignItems: 'flex-start',
+          // The WRAPPER is transparent to the mouse; the panel opts back in
+          // for its own tiles. A wrapper that caught events would make the
+          // whole gutter a dead zone for the board underneath.
           pointerEvents: 'none',
         }}
       >
