@@ -1,0 +1,220 @@
+/* ==========================================================================
+   tokens.css — the single source of truth for colour, spacing, radii,
+   shadows and type in apps/web.
+
+   Every other stylesheet and every component consumes these custom properties
+   and never hardcodes a hex value. Dark mode is a first-class concern here:
+   a whiteboard is a long-session tool and half of its users will be in a dark
+   room, so `[data-theme='dark']` is defined completely, not partially.
+
+   Canvas surface tokens (--canvas-bg etc.) are deliberately wired to the app
+   background so the canvas does not visibly end where the UI begins — the
+   canvas bleeds under the floating panels.
+   ========================================================================== */
+
+:root {
+  /* --- colour: light (default) ------------------------------------------ */
+  --color-bg: #f4f5f7;
+  --color-surface: #ffffff;
+  --color-surface-hover: #eef0f4;
+  --color-surface-sunken: #e8eaef;
+  --color-border: #dcdfe6;
+  --color-border-strong: #b9bfca;
+  --color-text: #16181d;
+  --color-text-muted: #626a78;
+  --color-text-inverse: #ffffff;
+
+  --color-accent: #2f6df6;
+  --color-accent-hover: #2459d0;
+  --color-accent-soft: #e4ecff;
+  --color-accent-contrast: #ffffff;
+
+  --color-danger: #d43a45;
+  --color-danger-soft: #fdecee;
+  --color-warning: #b7791f;
+  --color-warning-soft: #fdf3e0;
+  --color-success: #1f8a52;
+  --color-success-soft: #e4f5ec;
+
+  /* Canvas. Same colour as the app background on purpose — no seam. */
+  --canvas-bg: #f4f5f7;
+  --canvas-grid: #d7dae1;
+  --canvas-grid-strong: #b9bfca;
+  --canvas-selection: #2f6df6;
+  --canvas-marquee-fill: rgba(47, 109, 246, 0.1);
+  --canvas-marquee-stroke: rgba(47, 109, 246, 0.7);
+
+  /* Default ink for new elements; the store holds the real value. */
+  --draw-default-stroke: #16181d;
+  --draw-default-fill: none;
+
+  /* Translucent panel base used by toolbar.css / panels.css. */
+  --panel-bg: rgba(255, 255, 255, 0.86);
+  --panel-bg-solid: #ffffff;
+  --panel-border: rgba(16, 20, 28, 0.1);
+  --panel-blur: saturate(180%) blur(14px);
+  --scrim: rgba(16, 20, 28, 0.42);
+
+  /* --- spacing: 4px base ------------------------------------------------ */
+  --sp-0: 0;
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --sp-7: 32px;
+  --sp-8: 48px;
+
+  /* --- radii ------------------------------------------------------------ */
+  --radius-xs: 3px;
+  --radius-sm: 6px;
+  --radius-md: 9px;
+  --radius-lg: 13px;
+  --radius-pill: 999px;
+
+  /* --- shadows: three levels, plus a focus ring ------------------------- */
+  --shadow-1: 0 1px 2px rgba(16, 20, 28, 0.08), 0 1px 1px rgba(16, 20, 28, 0.04);
+  --shadow-2: 0 4px 12px rgba(16, 20, 28, 0.1), 0 1px 3px rgba(16, 20, 28, 0.06);
+  --shadow-3: 0 18px 44px rgba(16, 20, 28, 0.18), 0 4px 12px rgba(16, 20, 28, 0.1);
+  --ring: 0 0 0 2px var(--color-bg), 0 0 0 4px var(--color-accent);
+
+  /* --- type scale (size / line-height) ---------------------------------- */
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue',
+    Arial, 'Noto Sans', sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji';
+  --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas,
+    'Liberation Mono', monospace;
+
+  --fs-xs: 11px;
+  --lh-xs: 16px;
+  --fs-sm: 12px;
+  --lh-sm: 18px;
+  --fs-md: 14px;
+  --lh-md: 20px;
+  --fs-lg: 16px;
+  --lh-lg: 24px;
+  --fs-xl: 20px;
+  --lh-xl: 28px;
+  --fs-2xl: 26px;
+  --lh-2xl: 32px;
+
+  --fw-normal: 400;
+  --fw-medium: 500;
+  --fw-semibold: 600;
+
+  /* --- motion ----------------------------------------------------------- */
+  --ease: cubic-bezier(0.2, 0, 0.13, 1);
+  --dur-fast: 110ms;
+  --dur-mid: 190ms;
+
+  /* --- layout constants shared by toolbar/panels ------------------------ */
+  --toolbar-width: 52px;
+  --touch-target: 44px;
+  --topbar-height: 48px;
+  --statusbar-height: 28px;
+  --z-canvas: 1;
+  --z-flow: 2;
+  --z-toolbar: 30;
+  --z-panels: 40;
+  --z-dialog: 60;
+  --z-toast: 70;
+}
+
+/* --------------------------------------------------------------------------
+   Dark theme. Applied by the ui agent's theme toggle setting
+   document.documentElement.dataset.theme = 'dark'.
+   -------------------------------------------------------------------------- */
+[data-theme='dark'] {
+  color-scheme: dark;
+
+  --color-bg: #14161b;
+  --color-surface: #1e2128;
+  --color-surface-hover: #272b34;
+  --color-surface-sunken: #0f1116;
+  --color-border: #30353f;
+  --color-border-strong: #454c59;
+  --color-text: #e8eaef;
+  --color-text-muted: #9aa2b1;
+  --color-text-inverse: #10131a;
+
+  --color-accent: #6b9bff;
+  --color-accent-hover: #85adff;
+  --color-accent-soft: #1e2b48;
+  --color-accent-contrast: #0d1220;
+
+  --color-danger: #f2808a;
+  --color-danger-soft: #3a1f23;
+  --color-warning: #e0b356;
+  --color-warning-soft: #352914;
+  --color-success: #5fca97;
+  --color-success-soft: #14301f;
+
+  --canvas-bg: #14161b;
+  --canvas-grid: #242830;
+  --canvas-grid-strong: #363c48;
+  --canvas-selection: #6b9bff;
+  --canvas-marquee-fill: rgba(107, 155, 255, 0.14);
+  --canvas-marquee-stroke: rgba(107, 155, 255, 0.75);
+
+  --draw-default-stroke: #e8eaef;
+  --draw-default-fill: none;
+
+  --panel-bg: rgba(30, 33, 40, 0.86);
+  --panel-bg-solid: #1e2128;
+  --panel-border: rgba(255, 255, 255, 0.1);
+  --scrim: rgba(0, 0, 0, 0.6);
+
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.5);
+  --shadow-2: 0 4px 14px rgba(0, 0, 0, 0.55);
+  --shadow-3: 0 18px 48px rgba(0, 0, 0, 0.65), 0 4px 12px rgba(0, 0, 0, 0.5);
+  --ring: 0 0 0 2px var(--color-bg), 0 0 0 4px var(--color-accent);
+}
+
+/* Follow the OS preference until the ui agent has written a stored choice to
+   data-theme. Once data-theme is set on <html> these are ignored, so an
+   explicit user choice always wins. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    color-scheme: dark;
+
+    --color-bg: #14161b;
+    --color-surface: #1e2128;
+    --color-surface-hover: #272b34;
+    --color-surface-sunken: #0f1116;
+    --color-border: #30353f;
+    --color-border-strong: #454c59;
+    --color-text: #e8eaef;
+    --color-text-muted: #9aa2b1;
+    --color-text-inverse: #10131a;
+
+    --color-accent: #6b9bff;
+    --color-accent-hover: #85adff;
+    --color-accent-soft: #1e2b48;
+    --color-accent-contrast: #0d1220;
+
+    --color-danger: #f2808a;
+    --color-danger-soft: #3a1f23;
+    --color-warning: #e0b356;
+    --color-warning-soft: #352914;
+    --color-success: #5fca97;
+    --color-success-soft: #14301f;
+
+    --canvas-bg: #14161b;
+    --canvas-grid: #242830;
+    --canvas-grid-strong: #363c48;
+    --canvas-selection: #6b9bff;
+    --canvas-marquee-fill: rgba(107, 155, 255, 0.14);
+    --canvas-marquee-stroke: rgba(107, 155, 255, 0.75);
+
+    --draw-default-stroke: #e8eaef;
+
+    --panel-bg: rgba(30, 33, 40, 0.86);
+    --panel-bg-solid: #1e2128;
+    --panel-border: rgba(255, 255, 255, 0.1);
+    --scrim: rgba(0, 0, 0, 0.6);
+
+    --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.5);
+    --shadow-2: 0 4px 14px rgba(0, 0, 0, 0.55);
+    --shadow-3: 0 18px 48px rgba(0, 0, 0, 0.65), 0 4px 12px rgba(0, 0, 0, 0.5);
+  }
+}

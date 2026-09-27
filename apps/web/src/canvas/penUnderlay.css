@@ -1,0 +1,28 @@
+/**
+ * penUnderlay.css — the pen layer sits UNDER React Flow and only takes
+ * pointer events for the two tools that need it.
+ *
+ * `pointer-events: none` is the load-bearing line. With it, every click, drag
+ * and wheel reaches React Flow untouched, because React Flow is the board now.
+ * Without it, this layer would sit on top and eat everything — which is
+ * precisely how the previous arrangement broke the selection and the pan.
+ */
+.pen-underlay {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  /* Transparent: the flow layer paints the background and the grid, so a fill
+     here would cover them. */
+  background: transparent;
+  touch-action: none;
+}
+
+.pen-underlay[data-active] {
+  pointer-events: all;
+  cursor: crosshair;
+}
+
+.pen-underlay[data-active][data-tool='eraser'] {
+  cursor: cell;
+}

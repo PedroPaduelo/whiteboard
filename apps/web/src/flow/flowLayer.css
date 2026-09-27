@@ -1,0 +1,260 @@
+/**
+ * flowLayer.css — the board's own styling.
+ *
+ * Every colour here is a token. Nothing in this file hardcodes a value, which
+ * is the whole reason light and dark both work: the theme lives in
+ * `tokens.css` under `[data-theme='dark']`, and these rules follow it.
+ *
+ * The previous arrangement had a second source of truth — a JS palette in
+ * `renderer.js` that painted the canvas light over a dark CSS host. That is
+ * gone; the canvas background now comes from `--canvas-bg` and nothing paints
+ * over it.
+ */
+
+.flow-host {
+  position: absolute;
+  inset: 0;
+  /* Above nothing: this IS the board now, so it takes pointer events. */
+  z-index: var(--z-canvas);
+  background: var(--canvas-bg);
+  transition: background-color var(--dur-mid) var(--ease);
+}
+
+.flow-host .react-flow__pane {
+  cursor: default;
+}
+.flow-host[data-tool='hand'] .react-flow__pane { cursor: grab; }
+.flow-host[data-tool='hand'] .react-flow__pane:active { cursor: grabbing; }
+.flow-host[data-tool='pen'] .react-flow__pane { cursor: crosshair; }
+.flow-host[data-tool='text'] .react-flow__pane { cursor: text; }
+.flow-host[data-tool='eraser'] .react-flow__pane { cursor: cell; }
+
+/* Selection rectangle drawn by React Flow. */
+.flow-host .react-flow__selection,
+.flow-host .react-flow__nodesselection-rect {
+  background: color-mix(in srgb, var(--color-accent) 10%, transparent);
+  border: 1px solid var(--color-accent);
+}
+
+/* ---- nodes ---- */
+
+.wb-node {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1.5px solid var(--color-border-strong);
+  background: var(--color-surface);
+  border-radius: var(--radius-md);
+  color: var(--color-text);
+  font-family: var(--font-sans);
+  font-size: var(--fs-md);
+  line-height: var(--lh-md);
+  /* No transition on the shape itself: a transition here fires on every drag
+     frame and is the difference between a board that feels solid and one that
+     feels like it is made of jelly. Hover feedback is a border colour only. */
+  overflow: hidden;
+  word-break: break-word;
+}
+
+.wb-node[data-selected] {
+  border-color: var(--color-accent);
+  box-shadow: var(--ring);
+}
+.wb-node[data-locked] {
+  cursor: not-allowed;
+}
+.wb-node:hover:not([data-selected]) {
+  border-color: var(--color-accent);
+}
+
+/* SVG shapes (ellipse / diamond / cylinder) paint themselves; the div is only
+   a hit region, so it must not paint a background or a border over them. */
+.wb-node--shape {
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  overflow: visible;
+}
+.wb-node--shape .wb-shape-svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+.wb-node__label {
+  padding: var(--sp-3);
+  white-space: pre-wrap;
+  text-align: left;
+  align-self: stretch;
+  display: flex;
+  align-items: flex-start;
+  font-size: var(--fs-sm);
+  line-height: var(--lh-sm);
+}
+
+/* The sticky is the only node that carries a shadow. A few dozen notes with
+   shadows is the entire look; a few hundred is the perf cliff. */
+.wb-node--sticky {
+  display: block;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-2);
+  color: var(--color-text);
+  overflow: hidden;
+}
+.wb-node--sticky[data-selected] {
+  box-shadow: var(--ring), var(--shadow-2);
+}
+
+.wb-node--text {
+  background: transparent;
+  border: 1px solid transparent;
+  align-items: flex-start;
+  justify-content: flex-start;
+  font-weight: var(--fw-medium);
+  white-space: pre-wrap;
+}
+.wb-node--text[data-selected] {
+  border-color: var(--color-accent);
+  background: color-mix(in srgb, var(--color-accent) 5%, transparent);
+}
+
+.wb-node--image {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  background: var(--color-surface-sunken);
+}
+.wb-node--image img {
+  display: block;
+  object-fit: cover;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+
+.wb-connector {
+  position: absolute;
+  inset: 0;
+  overflow: visible;
+  pointer-events: none;
+}
+
+/* ---- resize handles ---- */
+
+.wb-resize-line { border: 1px solid var(--color-accent); }
+.wb-resize-handle {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  background: var(--color-surface);
+  border: 1.5px solid var(--color-accent);
+}
+
+/* ---- edge label ---- */
+
+.wb-edge-label {
+  position: absolute;
+  padding: 2px 6px;
+  border-radius: var(--radius-xs);
+  background: var(--panel-bg-solid, var(--color-surface));
+  border: 1px solid var(--color-border);
+  color: var(--color-text-muted);
+  font-size: var(--fs-xs);
+  font-family: var(--font-sans);
+  pointer-events: none;
+}
+
+/* ---- minimap + controls, restyled to the token set ---- */
+
+.flow-host .react-flow__minimap {
+  background: var(--panel-bg-solid, var(--color-surface));
+  border: 1px solid var(--panel-border, var(--color-border));
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-2);
+  overflow: hidden;
+}
+.flow-host .react-flow__minimap-mask {
+  fill: var(--scrim);
+}
+
+.flow-host .react-flow__controls {
+  background: var(--panel-bg-solid, var(--color-surface));
+  border: 1px solid var(--panel-border, var(--color-border));
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-2);
+  overflow: hidden;
+}
+.flow-host .react-flow__controls-button {
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid var(--color-border);
+  color: var(--color-text);
+  width: 26px;
+  height: 26px;
+}
+.flow-host .react-flow__controls-button:last-child { border-bottom: none; }
+.flow-host .react-flow__controls-button:hover { background: var(--color-surface-hover); }
+.flow-host .react-flow__controls-button svg { fill: currentColor; max-width: 12px; max-height: 12px; }
+
+@media (prefers-reduced-motion: reduce) {
+  .flow-host { transition: none; }
+}
+
+
+/* ------------------------------------------------------------------ *
+ * The pane must be the direct hit target for pointer gestures.
+ *
+ * React Flow's marquee starts ONLY when `event.target === container.current` —
+ * the pane element itself, not a descendant. Its own `<Background>` renders a
+ * positioned child that sits over the pane, so a drag started on the grid has
+ * `target` pointing at that child and the marquee silently returns without
+ * doing anything. Same for the hand tool: a pan that begins on the background
+ * never reaches the pane.
+ *
+ * The fix is to let pointer events pass through the decorative layers while
+ * keeping them painted. `pointer-events: none` on the background SVG, the
+ * minimap and the controls means a gesture that starts over any of them lands
+ * on the pane, which is the only element that should receive a drag.
+ */
+.flow-host .react-flow__background,
+.flow-host .react-flow__minimap,
+.flow-host .react-flow__controls,
+.flow-host .react-flow__pane > svg {
+  pointer-events: none;
+}
+
+
+/* The hand tool over a node.
+ *
+ * `draggable: false` on the node is not enough: React Flow still routes the
+ * gesture through the node's own handlers, so a drag that starts on a shape
+ * never reaches the pane and the board does not pan. `pointer-events: none`
+ * is what actually hands the gesture back to the pane.
+ *
+ * Applied only while the hand tool is active, so a normal drag is untouched.
+ */
+.flow-host[data-tool='hand'] .react-flow__node,
+.flow-host[data-tool='hand'] .react-flow__node * {
+  pointer-events: none !important;
+}
+
+/* ------------------------------------------------------------------ *
+ * The resize handles need pointer events, and React Flow's stylesheet
+ * denies them.
+ *
+ * `reactflow/dist/style.css` sets `pointer-events: none` on
+ * `.react-flow__viewport` and on `.react-flow__nodes` — the containers that
+ * hold the nodes. Individual nodes opt back in, so a node is grabbable, but
+ * the resize handles are rendered beside the node's body INSIDE that same
+ * container, and they inherit the `none`.
+ *
+ * The result is the worst kind of bug: four handles render exactly where they
+ * should, `elementFromPoint` returns the handle, and dragging it does nothing
+ * at all. Nothing errors; the interaction is simply inert.
+ *
+ * The nodes container re-enables pointer events; the pane keeps its own
+ * behaviour, so the marquee and the pan are unaffected.
+ */

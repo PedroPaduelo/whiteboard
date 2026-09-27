@@ -1,0 +1,30 @@
+# Local env — never commit; .env.example is the documented template.
+.env
+.env.*
+!.env.example
+
+# sqlite database + the directory it lives in
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# logs / runtime noise
+*.log
+npm-debug.log*
+logs/
+
+# node
+node_modules/
+.npm/
+coverage/
+.nyc_output/
+*.tsbuildinfo
+
+# editors / os
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

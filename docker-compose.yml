@@ -1,0 +1,39 @@
+name: whiteboard
+
+# The two apps deploy to different places in production (the API behind its own
+# hostname, the web on a CDN or a static host). This compose file is the local
+# dev topology, NOT the production one — it just runs both together.
+services:
+  api:
+    build:
+      # Build context is the repo root: the API imports packages/shared.
+      context: .
+      dockerfile: apps/api/Dockerfile
+    environment:
+      PORT: 3001
+      HOST: 0.0.0.0
+      STORAGE: sqlite
+      SQLITE_PATH: /data/whiteboard.db
+      CORS_ORIGIN: 'http://localhost:5173'
+      SEED_DEMO_BOARD: 'true'
+    volumes:
+      - api-data:/data
+    ports:
+      - '3001:3001'
+    restart: unless-stopped
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      args:
+        VITE_API_URL: /api
+        VITE_WS_URL: /api/ws
+    depends_on:
+      - api
+    ports:
+      - '8080:8080'
+    restart: unless-stopped
+
+volumes:
+  api-data:

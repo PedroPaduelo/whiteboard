@@ -1,0 +1,22 @@
+{
+  "name": "@whiteboard/api",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "main": "./src/server.js",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "dev": "node --experimental-sqlite --watch src/server.js",
+    "start": "node --experimental-sqlite src/server.js",
+    "test": "node --experimental-sqlite --test test/*.test.js"
+  },
+  "dependencies": {
+    "@fastify/cors": "^10.0.1",
+    "@fastify/websocket": "^11.0.1",
+    "@whiteboard/shared": "*",
+    "fastify": "^5.2.0",
+    "ws": "^8.18.0"
+  }
+}

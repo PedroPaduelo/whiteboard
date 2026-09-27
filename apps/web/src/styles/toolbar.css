@@ -1,0 +1,384 @@
+/* ==========================================================================
+   toolbar.css — the left vertical tool rail.
+
+   Design notes:
+   - Square icon buttons, 40px on desktop, forced to 44px on coarse pointers
+     (finger) so every tool is comfortably hittable on a phone.
+   - The active state is deliberately loud: accent background, accent-contrast
+     glyph, and a 3px indicator bar on the LEFT edge of the rail. You should be
+     able to tell which tool is armed from across a room.
+   - The rail is a fixed, scrollable column; groups are separated by hairlines
+     rather than blank space so the column reads as one object.
+   ========================================================================== */
+
+.toolbar {
+  position: absolute;
+  top: 50%;
+  left: var(--sp-3);
+  z-index: var(--z-toolbar);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp-1);
+  width: var(--toolbar-width);
+  max-height: min(70dvh, 640px);
+  padding: var(--sp-2) var(--sp-1);
+  overflow-y: auto;
+  overflow-x: hidden;
+  transform: translateY(-50%);
+
+  background: var(--panel-bg);
+  -webkit-backdrop-filter: var(--panel-blur);
+  backdrop-filter: var(--panel-blur);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-3);
+  scrollbar-width: none;
+  touch-action: pan-y;
+}
+
+.toolbar::-webkit-scrollbar {
+  display: none;
+}
+
+/* Left indicator bar: hidden unless a tool is active. */
+.toolbar::before {
+  content: '';
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 3px;
+  border-radius: var(--radius-lg) 0 0 var(--radius-lg);
+  background: var(--color-accent);
+  opacity: 0;
+  transition: opacity var(--dur-fast) var(--ease);
+}
+
+.toolbar[data-has-active='true']::before {
+  opacity: 1;
+}
+
+.toolbar__group {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp-1);
+  width: 100%;
+}
+
+.toolbar__group + .toolbar__group {
+  margin-top: var(--sp-1);
+  padding-top: var(--sp-2);
+  border-top: 1px solid var(--color-border);
+}
+
+.toolbar__label {
+  margin-top: var(--sp-1);
+  color: var(--color-text-muted);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-xs);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+/* --- tool button ---------------------------------------------------------- */
+
+.tool-btn {
+  position: relative;
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 40px;
+  height: 40px;
+  border-radius: var(--radius-md);
+  color: var(--color-text-muted);
+  background: transparent;
+  transition:
+    background var(--dur-fast) var(--ease),
+    color var(--dur-fast) var(--ease),
+    transform var(--dur-fast) var(--ease);
+}
+
+.tool-btn:hover:not(:disabled) {
+  background: var(--color-surface-hover);
+  color: var(--color-text);
+}
+
+.tool-btn:active:not(:disabled) {
+  transform: scale(0.94);
+}
+
+.tool-btn[aria-pressed='true'],
+.tool-btn[aria-selected='true'],
+.tool-btn[data-active='true'] {
+  background: var(--color-accent);
+  color: var(--color-accent-contrast);
+  box-shadow: var(--shadow-1);
+}
+
+.tool-btn[aria-pressed='true']:hover,
+.tool-btn[aria-selected='true']:hover,
+.tool-btn[data-active='true']:hover {
+  background: var(--color-accent-hover);
+  color: var(--color-accent-contrast);
+}
+
+.tool-btn__icon {
+  width: 20px;
+  height: 20px;
+  pointer-events: none;
+}
+
+.tool-btn__icon svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* Filled variants (sticky, arrow) read better without the stroke outline. */
+.tool-btn__icon--filled svg {
+  fill: currentColor;
+  stroke: none;
+}
+
+/* Keyboard hint, bottom-right, only on pointer-fine devices. */
+.tool-btn__key {
+  position: absolute;
+  right: 3px;
+  bottom: 2px;
+  color: currentColor;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  line-height: 1;
+  opacity: 0.55;
+  pointer-events: none;
+}
+
+@media (pointer: coarse) {
+  .tool-btn__key {
+    display: none;
+  }
+}
+
+/* Touch: 44px minimum hit target. */
+@media (pointer: coarse) {
+  .toolbar {
+    left: var(--sp-2);
+    width: 56px;
+  }
+
+  .tool-btn {
+    width: var(--touch-target);
+    height: var(--touch-target);
+  }
+}
+
+/* --- colour swatches ------------------------------------------------------ */
+
+.swatch-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: var(--sp-1);
+  width: 100%;
+  padding: 0 var(--sp-1);
+}
+
+.swatch {
+  position: relative;
+  width: 20px;
+  height: 20px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-border-strong);
+  background: var(--swatch, var(--color-text));
+  transition: transform var(--dur-fast) var(--ease);
+}
+
+.swatch:hover {
+  transform: scale(1.12);
+}
+
+.swatch[aria-pressed='true'],
+.swatch[aria-selected='true'] {
+  box-shadow: 0 0 0 2px var(--panel-bg-solid), 0 0 0 4px var(--color-accent);
+}
+
+.swatch--none {
+  background:
+    linear-gradient(45deg, transparent 45%, var(--color-danger) 45%, var(--color-danger) 55%, transparent 55%),
+    var(--color-surface);
+}
+
+.swatch--stroke {
+  width: 20px;
+  height: 20px;
+  background: var(--color-surface);
+  border: 2px solid var(--swatch, var(--color-text));
+}
+
+/* --- size slider ---------------------------------------------------------- */
+
+.size-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: var(--touch-target);
+  margin: 0;
+  background: transparent;
+  touch-action: none;
+}
+
+.size-slider::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: var(--radius-pill);
+  background: var(--color-border);
+}
+
+.size-slider::-moz-range-track {
+  height: 4px;
+  border-radius: var(--radius-pill);
+  background: var(--color-border);
+}
+
+.size-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 18px;
+  height: 18px;
+  margin-top: -7px;
+  border-radius: 50%;
+  background: var(--color-text);
+  border: 2px solid var(--panel-bg-solid);
+  box-shadow: var(--shadow-1);
+  cursor: grab;
+}
+
+.size-slider::-moz-range-thumb {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--color-text);
+  border: 2px solid var(--panel-bg-solid);
+  box-shadow: var(--shadow-1);
+  cursor: grab;
+}
+
+.size-slider:active::-webkit-slider-thumb {
+  cursor: grabbing;
+  background: var(--color-accent);
+}
+
+.size-slider:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 4px;
+  border-radius: var(--radius-pill);
+}
+
+.size-slider__value {
+  color: var(--color-text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-xs);
+  text-align: center;
+}
+
+/* --- dash / stroke-style segmented control -------------------------------- */
+
+.segmented {
+  display: flex;
+  width: 100%;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  background: var(--color-surface);
+}
+
+.segmented__item {
+  flex: 1 1 0;
+  min-width: 0;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  color: var(--color-text-muted);
+  font-size: var(--fs-xs);
+  line-height: 1;
+  transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+}
+
+.segmented__item + .segmented__item {
+  border-left: 1px solid var(--color-border);
+}
+
+.segmented__item:hover {
+  background: var(--color-surface-hover);
+  color: var(--color-text);
+}
+
+.segmented__item[aria-pressed='true'],
+.segmented__item[aria-selected='true'] {
+  background: var(--color-accent);
+  color: var(--color-accent-contrast);
+}
+
+/* --- undo / redo ---------------------------------------------------------- */
+
+.toolbar__history {
+  display: flex;
+  gap: var(--sp-1);
+  width: 100%;
+  justify-content: center;
+}
+
+.toolbar__history .tool-btn {
+  width: 20px;
+  height: 28px;
+  border-radius: var(--radius-sm);
+}
+
+@media (pointer: coarse) {
+  .toolbar__history .tool-btn {
+    width: 24px;
+    height: var(--touch-target);
+  }
+}
+
+/* --- narrow screens: the rail becomes a bottom dock ----------------------- */
+
+@media (max-width: 640px) {
+  .toolbar {
+    top: auto;
+    bottom: calc(var(--statusbar-height) + var(--sp-2));
+    left: var(--sp-2);
+    right: var(--sp-2);
+    width: auto;
+    flex-direction: row;
+    max-height: none;
+    transform: none;
+    justify-content: flex-start;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+
+  .toolbar::before {
+    inset: auto 0 0 0;
+    width: auto;
+    height: 3px;
+    border-radius: 0;
+  }
+
+  .toolbar__group {
+    flex-direction: row;
+  }
+
+  .toolbar__group + .toolbar__group {
+    margin-top: 0;
+    margin-left: var(--sp-1);
+    padding-top: 0;
+    padding-left: var(--sp-2);
+    border-top: 0;
+    border-left: 1px solid var(--color-border);
+  }
+}
