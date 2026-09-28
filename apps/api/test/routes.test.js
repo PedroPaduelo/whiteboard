@@ -233,6 +233,95 @@ test('GET /boards — search filters case-insensitively on the title', async (t)
   assert.deepEqual(none.boards, []);
 });
 
+/** Titles in a GET /boards body, in response order. */
+const titles = (body) => body.boards.map((b) => b.title);
+
+test('GET /boards — ?owner= returns that owner PLUS every unowned board', async (t) => {
+  const { app } = await makeApp();
+  t.after(() => app.close());
+
+  await createBoard(app, { title: 'Ana board', ownerId: 'ana' });
+  await createBoard(app, { title: 'Bruno board', ownerId: 'bruno' });
+  // No ownerId: exactly the shape of a board that predates the feature.
+  await createBoard(app, { title: 'Unowned board' });
+
+  const anas = (await app.inject({ method: 'GET', url: `${P}/boards?owner=ana` })).json();
+  assert.equal(anas.total, 2, 'owner filter narrows the total too');
+  // The unowned board is the load-bearing case: excluding it looks like a bug
+  // (a board with no owner answering a filter on owner) and is not one — it is
+  // a board anyone may claim, and hiding it would make every board a person
+  // already had vanish the moment they typed a nickname.
+  assert.deepEqual(titles(anas).sort(), ['Ana board', 'Unowned board']);
+  assert.ok(
+    !titles(anas).includes('Bruno board'),
+    "another person's board must not leak into this list",
+  );
+
+  const brunos = (await app.inject({ method: 'GET', url: `${P}/boards?owner=bruno` })).json();
+  assert.deepEqual(titles(brunos).sort(), ['Bruno board', 'Unowned board']);
+
+  // No param: no filter at all.
+  const all = (await app.inject({ method: 'GET', url: `${P}/boards` })).json();
+  assert.equal(all.total, 3);
+  assert.deepEqual(titles(all).sort(), ['Ana board', 'Bruno board', 'Unowned board']);
+
+  // A present-but-empty owner is absent, not an error and not match-nothing.
+  const empty = (await app.inject({ method: 'GET', url: `${P}/boards?owner=` })).json();
+  assert.equal(empty.total, 3, '?owner= behaves like no param');
+  assert.deepEqual(titles(empty).sort(), titles(all).sort());
+
+  // An owner nobody has claimed still gets the unowned boards.
+  const carol = (await app.inject({ method: 'GET', url: `${P}/boards?owner=carol` })).json();
+  assert.deepEqual(titles(carol), ['Unowned board']);
+});
+
+test('GET /boards — ?owner= composes with ?search= and validates its input', async (t) => {
+  const { app } = await makeApp();
+  t.after(() => app.close());
+
+  await createBoard(app, { title: 'Ana notes', ownerId: 'ana' });
+  await createBoard(app, { title: 'Ana budget', ownerId: 'ana' });
+  await createBoard(app, { title: 'Bruno notes', ownerId: 'bruno' });
+  await createBoard(app, { title: 'Unowned notes' });
+
+  // Both filters apply, and the unowned board survives the search too.
+  const both = (await app.inject({ method: 'GET', url: `${P}/boards?owner=ana&search=notes` })).json();
+  assert.deepEqual(titles(both).sort(), ['Ana notes', 'Unowned notes']);
+
+  // The empty-owner case must not shadow a real search.
+  const empty = (await app.inject({ method: 'GET', url: `${P}/boards?owner=&search=notes` })).json();
+  assert.deepEqual(titles(empty).sort(), ['Ana notes', 'Bruno notes', 'Unowned notes']);
+
+  // Same bound as ownerId on the body: over MAX_ID_LEN is a 400, not a filter
+  // that quietly matches nothing.
+  const tooLong = await app.inject({ method: 'GET', url: `${P}/boards?owner=${'x'.repeat(65)}` });
+  assert.equal(tooLong.statusCode, 400);
+  assert.equal(tooLong.json().code, 'VALIDATION_FAILED');
+  assert.match(tooLong.json().message, /owner/);
+});
+
+test('GET /boards — ?owner= does not leak when the store ignores it', async (t) => {
+  // A store that has not implemented `owner` returns everything; the route has
+  // to drop the foreign rows itself or the filter is cosmetic.
+  const { app, store } = await makeApp();
+  t.after(() => app.close());
+
+  await createBoard(app, { title: 'Ana board', ownerId: 'ana' });
+  await createBoard(app, { title: 'Bruno board', ownerId: 'bruno' });
+
+  const real = store.listBoards;
+  store.listBoards = async (opts) => {
+    const { owner, ...rest } = opts ?? {};
+    return real(rest);
+  };
+
+  const res = await app.inject({ method: 'GET', url: `${P}/boards?owner=ana` });
+  assert.equal(res.statusCode, 200);
+  const body = res.json();
+  assert.deepEqual(titles(body), ['Ana board']);
+  assert.equal(body.total, 1, 'total matches what was actually returned');
+});
+
 test('GET /boards/:id — found', async (t) => {
   const { app } = await makeApp();
   t.after(() => app.close());
@@ -330,7 +419,10 @@ test('PATCH /boards/:id — rejects an empty patch with 400', async (t) => {
   const created = await createBoard(app, { title: 'Untouched' });
   const id = created.board.id;
 
-  for (const payload of [{}, { ownerId: 'u-9' }, { nope: true }]) {
+  // `{ ownerId: 'u-9' }` is no longer in this list: PATCH can now CLAIM a board,
+  // so it is a valid patch rather than an empty one. It is covered by
+  // "PATCH /boards/:id — claims an unowned board" below.
+  for (const payload of [{}, { nope: true }]) {
     const res = await app.inject({ method: 'PATCH', url: `${P}/boards/${id}`, payload });
     assert.equal(res.statusCode, 400, `payload ${JSON.stringify(payload)} should be rejected`);
     assert.equal(res.json().code, 'VALIDATION_FAILED');
@@ -339,6 +431,85 @@ test('PATCH /boards/:id — rejects an empty patch with 400', async (t) => {
   // The board must be exactly as it was.
   const snap = (await app.inject({ method: 'GET', url: `${P}/boards/${id}` })).json();
   assert.equal(snap.board.title, 'Untouched');
+});
+
+test('PATCH /boards/:id — claims an unowned board, and a claim can move', async (t) => {
+  const { app } = await makeApp();
+  t.after(() => app.close());
+
+  const ana = (await createBoard(app, { title: 'Ana board', ownerId: 'ana' })).board;
+  const bruno = (await createBoard(app, { title: 'Bruno board', ownerId: 'bruno' })).board;
+  const free = (await createBoard(app, { title: 'Free board' })).board;
+  assert.equal(free.ownerId, null, 'created with no owner, as boards always are by default');
+
+  // The claim itself: ownerId alone is a valid patch, with no title/theme.
+  const claim = await app.inject({
+    method: 'PATCH',
+    url: `${P}/boards/${free.id}`,
+    payload: { ownerId: 'ana' },
+  });
+  assert.equal(claim.statusCode, 200);
+  assert.equal(claim.json().ownerId, 'ana');
+  assert.equal(claim.json().title, 'Free board', 'claiming does not disturb the rest of the board');
+
+  const isAna = (await app.inject({ method: 'GET', url: `${P}/boards?owner=ana` })).json();
+  assert.deepEqual(titles(isAna).sort(), ['Ana board', 'Free board']);
+  const isBruno = (await app.inject({ method: 'GET', url: `${P}/boards?owner=bruno` })).json();
+  assert.deepEqual(
+    titles(isBruno),
+    ['Bruno board'],
+    'a claimed board leaves the pool of the person who never took it',
+  );
+
+  // A title-only patch must NOT wipe ownership — the field is only touched
+  // when the client actually sends it.
+  const retitle = await app.inject({
+    method: 'PATCH',
+    url: `${P}/boards/${free.id}`,
+    payload: { title: 'Renamed' },
+  });
+  assert.equal(retitle.statusCode, 200);
+  assert.equal(retitle.json().ownerId, 'ana', 'owner survives an unrelated patch');
+
+  // Claims can move between people, and the board follows.
+  const move = await app.inject({
+    method: 'PATCH',
+    url: `${P}/boards/${bruno.id}`,
+    payload: { ownerId: 'ana' },
+  });
+  assert.equal(move.statusCode, 200);
+  assert.equal(move.json().ownerId, 'ana');
+  // 'Renamed' is the board claimed and then retitled above.
+  assert.deepEqual(
+    titles((await app.inject({ method: 'GET', url: `${P}/boards?owner=ana` })).json()).sort(),
+    ['Ana board', 'Bruno board', 'Renamed'],
+  );
+  assert.deepEqual(
+    titles((await app.inject({ method: 'GET', url: `${P}/boards?owner=bruno` })).json()),
+    [],
+  );
+});
+
+test('PATCH /boards/:id — still rejects a malformed ownerId', async (t) => {
+  const { app } = await makeApp();
+  t.after(() => app.close());
+
+  const created = await createBoard(app, { title: 'Guarded' });
+  const id = created.board.id;
+
+  for (const ownerId of ['', 42, 'x'.repeat(65)]) {
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `${P}/boards/${id}`,
+      payload: { ownerId },
+    });
+    assert.equal(res.statusCode, 400, `ownerId ${JSON.stringify(ownerId)} should be rejected`);
+    assert.equal(res.json().code, 'VALIDATION_FAILED');
+    assert.match(res.json().message, /ownerId/);
+  }
+
+  const snap = (await app.inject({ method: 'GET', url: `${P}/boards/${id}` })).json();
+  assert.equal(snap.board.ownerId, null, 'a rejected claim changes nothing');
 });
 
 test('PATCH /boards/:id — 404 for an unknown board, 400 for a bad theme', async (t) => {

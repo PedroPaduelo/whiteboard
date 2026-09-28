@@ -54,6 +54,21 @@ function toBoard(row) {
 const clone = (v) => (v === undefined || v === null ? v : structuredClone(v));
 
 /**
+ * Does this row belong in the result of a `?owner=` filter?
+ *
+ * The `owner_id == null` case is deliberate and NOT a bug, so please do not
+ * "fix" it into a plain equality: `owner_id` was added after these boards
+ * already existed, and a board created without a nickname lands there too.
+ * Filtering those out would make every board a person already had disappear
+ * the instant they typed a nickname — the worst thing this feature could do.
+ * An unowned board is a board anyone may claim; PATCH /boards/:id is the claim.
+ * Mirrors OWNER_SQL in sqlite.js; store.test.js runs one suite against both.
+ */
+function ownedBy(row, owner) {
+  return row.owner_id == null || row.owner_id === owner;
+}
+
+/**
  * @param {{opTtlMs?: number, idFactory?: () => string}} [options]
  * @returns {Object} Store
  */
@@ -102,8 +117,12 @@ export function createStore(options = {}) {
 
   return {
     /** @returns {Promise<{boards: Object[], total: number}>} */
-    listBoards: guard('listBoards', async ({ limit = 50, offset = 0, search } = {}) => {
+    listBoards: guard('listBoards', async ({ limit = 50, offset = 0, search, owner } = {}) => {
       let rows = [...boards.values()];
+      // A present-but-empty owner is the same as no owner at all.
+      if (typeof owner === 'string' && owner !== '') {
+        rows = rows.filter((r) => ownedBy(r, owner));
+      }
       if (typeof search === 'string' && search.trim() !== '') {
         const needle = search.trim().toLowerCase();
         rows = rows.filter((r) => r.title.toLowerCase().includes(needle));
@@ -150,6 +169,11 @@ export function createStore(options = {}) {
       if (!row) return null;
       if (typeof patch.title === 'string' && patch.title !== '') row.title = patch.title;
       if (patch.theme === 'light' || patch.theme === 'dark') row.theme = patch.theme;
+      // `ownerId` is assignable, and `null` means "unclaim" as well as "no
+      // change" — routes/boards.js only ever passes the key when the client
+      // sent it, so an absent ownerId must leave ownership alone rather than
+      // silently wiping it on a title-only patch.
+      if (patch.ownerId !== undefined) row.owner_id = patch.ownerId ?? null;
       row.updated_at = now();
       return toBoard(row);
     }),

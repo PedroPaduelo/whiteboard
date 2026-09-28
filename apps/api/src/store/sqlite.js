@@ -39,6 +39,10 @@ const SCHEMA = [
      PRIMARY KEY (board_id, op_id)
    )`,
   `CREATE INDEX IF NOT EXISTS idx_seen_ops_at ON seen_ops(seen_at)`,
+  // Additive and idempotent, so it runs on every boot like the rest of the
+  // schema. Serving `?owner=` is a predicate on this column, and without the
+  // index SQLite scans the whole table for it.
+  `CREATE INDEX IF NOT EXISTS idx_boards_owner ON boards(owner_id)`,
 ].join(';\n');
 
 /** Row -> public `Board` wire shape. */
@@ -66,6 +70,18 @@ function toBoard(row) {
 function escapeLike(s) {
   return s.replace(/[\\%_]/g, (c) => '\\' + c);
 }
+
+/**
+ * "Boards belonging to ?owner, plus every board nobody has claimed."
+ *
+ * The `OR owner_id IS NULL` half is deliberate and NOT a bug, so please do not
+ * "fix" it into a plain equality: `owner_id` was added after these boards
+ * already existed, and a board created without a nickname lands there too.
+ * Filtering those out would make every board a person already had disappear
+ * the instant they typed a nickname — the worst thing this feature could do.
+ * An unowned board is a board anyone may claim; PATCH /boards/:id is the claim.
+ */
+const OWNER_SQL = '(owner_id = ? OR owner_id IS NULL)';
 
 /**
  * @param {{path: string, opTtlMs?: number, idFactory?: () => string}} options
@@ -107,13 +123,25 @@ export function createStore(options = {}) {
     searchBoards: db.prepare(
       "SELECT id, title, theme, rev, owner_id, created_at, updated_at FROM boards WHERE LOWER(title) LIKE ? ESCAPE '\\' ORDER BY created_at DESC, id ASC",
     ),
+    // Same two reads, narrowed by owner. Kept as their own prepared statements
+    // instead of one statement with an optional WHERE fragment: the SQL text
+    // stays fixed at prepare time, so the owner value is always bound and never
+    // concatenated into the query.
+    listBoardsByOwner: db.prepare(
+      `SELECT id, title, theme, rev, owner_id, created_at, updated_at FROM boards WHERE ${OWNER_SQL} ORDER BY created_at DESC, id ASC`,
+    ),
+    searchBoardsByOwner: db.prepare(
+      `SELECT id, title, theme, rev, owner_id, created_at, updated_at FROM boards WHERE ${OWNER_SQL} AND LOWER(title) LIKE ? ESCAPE '\\' ORDER BY created_at DESC, id ASC`,
+    ),
     getBoard: db.prepare(
       'SELECT id, title, theme, rev, owner_id, created_at, updated_at FROM boards WHERE id = ?',
     ),
     insertBoard: db.prepare(
       'INSERT INTO boards (id, title, theme, rev, owner_id, created_at, updated_at) VALUES (?, ?, ?, 0, ?, ?, ?)',
     ),
-    updateBoard: db.prepare('UPDATE boards SET title = ?, theme = ?, updated_at = ? WHERE id = ?'),
+    updateBoard: db.prepare(
+      'UPDATE boards SET title = ?, theme = ?, owner_id = ?, updated_at = ? WHERE id = ?',
+    ),
     touchBoard: db.prepare('UPDATE boards SET updated_at = ? WHERE id = ?'),
     deleteBoard: db.prepare('DELETE FROM boards WHERE id = ?'),
     getRev: db.prepare('SELECT rev FROM boards WHERE id = ?'),
@@ -148,13 +176,19 @@ export function createStore(options = {}) {
 
   return {
     /** @returns {Promise<{boards: Object[], total: number}>} */
-    listBoards: guard('listBoards', async ({ limit = 50, offset = 0, search } = {}) => {
+    listBoards: guard('listBoards', async ({ limit = 50, offset = 0, search, owner } = {}) => {
       // `search` is a case-insensitive substring on title; `total` is the
       // filtered count, so a page is never short while `total` disagrees.
+      // `owner` narrows to that owner PLUS unowned boards — see OWNER_SQL.
       const useSearch = typeof search === 'string' && search.trim() !== '';
-      const rows = useSearch
-        ? stmt.searchBoards.all('%' + escapeLike(search.trim().toLowerCase()) + '%')
-        : stmt.listBoards.all();
+      // A present-but-empty owner is the same as no owner at all.
+      const useOwner = typeof owner === 'string' && owner !== '';
+      const needle = useSearch ? '%' + escapeLike(search.trim().toLowerCase()) + '%' : null;
+      const rows = useOwner
+        ? (useSearch
+            ? stmt.searchBoardsByOwner.all(owner, needle)
+            : stmt.listBoardsByOwner.all(owner))
+        : (useSearch ? stmt.searchBoards.all(needle) : stmt.listBoards.all());
 
       const total = rows.length;
       const start = Math.max(0, offset | 0);
@@ -199,7 +233,15 @@ export function createStore(options = {}) {
       if (!row) return null;
       const title = typeof patch.title === 'string' && patch.title !== '' ? patch.title : row.title;
       const theme = patch.theme === 'light' || patch.theme === 'dark' ? patch.theme : row.theme;
-      stmt.updateBoard.run(title, theme, Date.now(), id);
+      // `ownerId` is assignable, and `null` means "unclaim" as well as "no
+      // change" — routes/boards.js only ever passes the key when the client
+      // sent it, so an absent ownerId must fall back to the stored value rather
+      // than silently wiping ownership on a title-only patch.
+      const ownerId =
+        patch.ownerId === undefined
+          ? (row.owner_id ?? null)
+          : (patch.ownerId === null ? null : patch.ownerId);
+      stmt.updateBoard.run(title, theme, ownerId, Date.now(), id);
       return toBoard(stmt.getBoard.get(id));
     }),
 

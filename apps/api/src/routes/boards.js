@@ -120,16 +120,43 @@ function validateBoardInput(body, { partial }) {
     out.ownerId = null;
   }
 
-  // PATCH takes `{title?, theme?}` only. `ownerId` is a create-time field — the
-  // store's updateBoard has no notion of reassigning ownership — so a PATCH
-  // carrying nothing else is an empty patch, not an ownership change.
-  if (partial) delete out.ownerId;
+  // PATCH may also carry `ownerId`, and that is how a board gets CLAIMED: the
+  // store's updateBoard can assign ownership, and `?owner=` hands every
+  // unowned board to whoever asked. Without this a person could see an unowned
+  // board but never take it, which makes the visibility meaningless.
 
   if (partial && Object.keys(out).length === 0) {
-    return { ok: false, message: 'patch: expected at least one of title, theme' };
+    return { ok: false, message: 'patch: expected at least one of title, theme, ownerId' };
   }
 
   return { ok: true, value: out };
+}
+
+/**
+ * Validate the `?owner=` query param, the same way `ownerId` is validated on the
+ * body: 1..MAX_ID_LEN chars, case-sensitive (an owner_id is an opaque id, not a
+ * display name, so no trimming or folding — the same string must match on
+ * write and on read).
+ *
+ * A present-but-empty param is NOT an error: it is the same as absent, so a
+ * client that builds the URL from an empty nickname box gets the unfiltered
+ * list instead of a 400 it has no way to interpret.
+ *
+ * @returns {{ok: true, value: string|null} | {ok: false, message: string}}
+ */
+export function validateOwnerQuery(raw) {
+  // Absent entirely, or present and empty: no filter. Checked first, because
+  // `undefined` is not a string and the type check below would reject it.
+  if (raw === undefined || raw === null || raw === '') return { ok: true, value: null };
+  // A repeated `?owner=a&owner=b` arrives as an array; that is a malformed
+  // filter, not a name.
+  if (Array.isArray(raw) || typeof raw !== 'string') {
+    return { ok: false, message: `owner: expected a single string of 1..${MAX_ID_LEN} chars` };
+  }
+  if (raw.length > MAX_ID_LEN) {
+    return { ok: false, message: `owner: expected a string of 1..${MAX_ID_LEN} chars` };
+  }
+  return { ok: true, value: raw };
 }
 
 export default async function boardsRoutes(fastify, opts) {
@@ -181,8 +208,15 @@ export default async function boardsRoutes(fastify, opts) {
     const offset = clampInt(q.offset, 0, 0);
     const search = typeof q.search === 'string' ? q.search.trim() : '';
 
+    // Same validation as `ownerId` on the body; an empty param means "no filter".
+    const owner = validateOwnerQuery(q.owner);
+    if (!owner.ok) {
+      return sendError(reply, 400, 'VALIDATION_FAILED', owner.message);
+    }
+
     const query = { limit, offset };
     if (search) query.search = search;
+    if (owner.value !== null) query.owner = owner.value;
 
     const res = await store.listBoards(query);
     let boards = Array.isArray(res && res.boards) ? res.boards : [];
@@ -198,7 +232,21 @@ export default async function boardsRoutes(fastify, opts) {
         (b) => typeof b.title === 'string' && b.title.toLowerCase().includes(needle),
       );
       if (filtered.length !== boards.length) {
-        return reply.send({ boards: filtered, total: filtered.length });
+        boards = filtered;
+        return reply.send({ boards, total: boards.length });
+      }
+    }
+
+    // Same story for `owner`: an unfiltered store must not leak another person's
+    // boards. Unowned boards (ownerId null) are kept for everyone — see the
+    // note on the predicate in the store; that is a feature, not a leak.
+    if (owner.value !== null) {
+      const filtered = boards.filter(
+        (b) => b.ownerId == null || b.ownerId === owner.value,
+      );
+      if (filtered.length !== boards.length) {
+        boards = filtered;
+        return reply.send({ boards, total: boards.length });
       }
     }
 

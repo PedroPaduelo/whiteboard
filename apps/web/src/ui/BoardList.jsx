@@ -1,6 +1,16 @@
 /**
- * BoardList.jsx — the landing screen: every board you own, with create,
- * open, rename, duplicate and delete.
+ * BoardList.jsx — the landing screen: the boards you own, plus the ones nobody
+ * has claimed yet, with create, open, rename, duplicate, claim and delete.
+ *
+ * The list is SCOPED BY NICKNAME. `useBoards` sends `?owner=<nickname>` and keys
+ * its cache by that nickname, so switching names is a different query rather
+ * than a re-read of the previous name's rows.
+ *
+ * The second thing this screen exists to do is make OWNERSHIP LEGIBLE. Every
+ * row says who it belongs to, and a row with no owner says so and offers to
+ * take it. That is not decoration: a list where fifteen rows all read
+ * "Untitled board · just now" is a list where you cannot tell your work from
+ * a stranger's, and the previous version of this screen was exactly that.
  *
  * "Duplicate" is the interesting one. It is a create + a replay of the
  * source board's elements as create ops, which is the same path an import
@@ -19,13 +29,17 @@ import {
   keys as queryKeys,
   useApplyOps,
   useBoards,
+  useClaimBoard,
   useCreateBoard,
   useDeleteBoard,
+  useNickname,
   useUpdateBoard,
 } from '../api/queries.js';
 import { api } from '../api/client.js';
 import { toast } from './Toasts.jsx';
+import { NicknameSwitcher } from './NicknameGate.jsx';
 import {
+  IconCheck,
   IconClose,
   IconCopy,
   IconLayers,
@@ -115,13 +129,116 @@ function BoardPreview({ seed, w = 96, h = 64 }) {
   );
 }
 
+/* --- ownership ------------------------------------------------------------- */
+
+/**
+ * The owner line under each board.
+ *
+ * Three cases, and they must be distinguishable at a glance:
+ *   - yours      → a filled chip with your name
+ *   - someone    → a muted chip with THEIR name, and no claim button
+ *   - unclaimed  → an explicit "unclaimed" label plus a claim action
+ *
+ * The unclaimed case is the one the old screen lacked entirely. "No owner" is
+ * not an absence to render as blank space; it is the fact that makes a board
+ * claimable, so it gets words and a button.
+ */
+function OwnerTag({ owner, nickname, onClaim, claiming, canClaim }) {
+  const isMine = Boolean(owner) && owner === nickname;
+  const unclaimed = !owner;
+
+  const chip = {
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: 4,
+    padding: '1px var(--sp-2)',
+    borderRadius: 'var(--radius-pill)',
+    fontSize: 'var(--fs-xs)',
+    lineHeight: 'var(--lh-xs)',
+    fontWeight: 'var(--fw-semibold)',
+    border: '1px solid transparent',
+    whiteSpace: 'nowrap',
+  };
+
+  if (unclaimed) {
+    return (
+      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 'var(--sp-2)' }}>
+        <span
+          data-testid="owner-unclaimed"
+          data-owner=""
+          title="Nobody owns this board yet"
+          style={{
+            ...chip,
+            color: 'var(--color-text-muted)',
+            borderColor: 'var(--color-border)',
+            borderStyle: 'dashed',
+            background: 'var(--color-surface-sunken)',
+          }}
+        >
+          Unclaimed
+        </span>
+        {canClaim ? (
+          <button
+            type="button"
+            className="btn btn--icon"
+            data-testid="claim-board"
+            data-board-id={claiming?.id ?? ''}
+            disabled={claiming?.pending}
+            onClick={(e) => {
+              // The whole row opens the board. Claim lives inside that row, so
+              // without this the click that takes the board ALSO navigates into
+              // it — you would claim a board and be dropped onto its canvas
+              // before the list has re-rendered.
+              e.stopPropagation();
+              onClaim();
+            }}
+            title="Claim this board for your name"
+            aria-label={`Reivindicar ${claiming?.title ?? 'board'}`}
+            style={{
+              minHeight: 24,
+              minWidth: 24,
+              padding: '0 var(--sp-2)',
+              fontSize: 'var(--fs-xs)',
+              fontWeight: 'var(--fw-semibold)',
+              borderColor: 'var(--color-border-strong)',
+            }}
+          >
+            {claiming?.pending ? '…' : 'reivindicar'}
+          </button>
+        ) : null}
+      </span>
+    );
+  }
+
+  return (
+    <span
+      data-testid="owner-tag"
+      data-owner={owner}
+      title={isMine ? 'This board is yours' : `Owned by ${owner}`}
+      style={{
+        ...chip,
+        color: isMine ? 'var(--color-accent)' : 'var(--color-text-muted)',
+        background: isMine ? 'var(--color-accent-soft)' : 'var(--color-surface-sunken)',
+        borderColor: isMine ? 'var(--color-accent)' : 'var(--color-border)',
+      }}
+    >
+      {isMine ? (
+        <span style={{ display: 'inline-flex', flex: 'none' }}>
+          <IconCheck size={12} />
+        </span>
+      ) : null}
+      {isMine ? 'yours' : owner}
+    </span>
+  );
+}
+
 /* --- a card ---------------------------------------------------------------- */
 
 /**
  * One row. It owns the three per-board mutations (rename / duplicate /
  * delete) because each is a hook, and a list cannot call hooks in a loop.
  */
-function BoardCard({ board, onOpen }) {
+function BoardCard({ board, onOpen, nickname }) {
   const [renaming, setRenaming] = useState(false);
   const [draft, setDraft] = useState(board.title || '');
   const [confirming, setConfirming] = useState(false);
@@ -134,6 +251,7 @@ function BoardCard({ board, onOpen }) {
   const updateBoard = useUpdateBoard(board.id);
   const createBoard = useCreateBoard();
   const deleteBoard = useDeleteBoard();
+  const claimBoard = useClaimBoard();
   const applyOps = useApplyOps(board.id);
   const qc = useQueryClient();
 
@@ -158,16 +276,35 @@ function BoardCard({ board, onOpen }) {
   }, [board.title, draft, updateBoard]);
 
   /**
+   * Claim: PATCH `ownerId` to the current nickname. Only offered on a board
+   * with no owner — a row owned by someone else must not offer to take it,
+   * because that button would be a lie about what it does.
+   */
+  const claim = useCallback(() => {
+    claimBoard.mutate(
+      { id: board.id, owner: nickname },
+      {
+        onSuccess: () => toast.success(`Claimed for ${nickname}`),
+        onError: (e) => toast.error(e?.message || 'Could not claim the board'),
+      },
+    );
+  }, [board.id, claimBoard, nickname]);
+
+  /**
    * Duplicate = create an empty board, then replay the source snapshot onto
    * it as `create` ops. This is the same wire path an import uses, and it
    * gives the copy FRESH element ids — so the two boards are independent
    * afterwards, which is what "duplicate" has to mean on a board that other
    * people may be editing.
+   *
+   * The copy inherits the source's owner when you are duplicating someone
+   * else's board, so your copy is yours; duplicating your own board copies
+   * your ownership, which is the same thing.
    */
   const duplicate = useCallback(() => {
     setBusy(true);
     createBoard.mutate(
-      { title: `${board.title || 'Untitled board'} (copy)` },
+      { title: `${board.title || 'Untitled board'} (copy)`, ownerId: nickname },
       {
         onSuccess: async (created) => {
           try {
@@ -201,7 +338,7 @@ function BoardCard({ board, onOpen }) {
             }
             // The copy is a different id; drop any cached board list view so
             // the row appears with the right element count.
-            qc.invalidateQueries({ queryKey: queryKeys.boards });
+            qc.invalidateQueries({ queryKey: queryKeys.allBoards });
             qc.invalidateQueries({ queryKey: queryKeys.board(created.id) });
             onOpen?.(created.id);
           } catch (e) {
@@ -216,7 +353,7 @@ function BoardCard({ board, onOpen }) {
         },
       },
     );
-  }, [board.id, board.title, applyOps, createBoard, onOpen, qc]);
+  }, [board.id, board.title, applyOps, createBoard, nickname, onOpen, qc]);
 
   const remove = useCallback(() => {
     deleteBoard.mutate(board.id, {
@@ -316,17 +453,33 @@ function BoardCard({ board, onOpen }) {
             {board.title || 'Untitled board'}
           </button>
         )}
-        <p
+        <div
           style={{
-            color: 'var(--color-text-muted)',
-            fontSize: 'var(--fs-xs)',
-            lineHeight: 'var(--lh-xs)',
-            marginTop: 2,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 'var(--sp-2)',
+            flexWrap: 'wrap',
+            marginTop: 3,
           }}
         >
-          Updated {relativeTime(board.updatedAt)}
-          {Number.isFinite(board.rev) ? ` · rev ${board.rev}` : ''}
-        </p>
+          <p
+            style={{
+              color: 'var(--color-text-muted)',
+              fontSize: 'var(--fs-xs)',
+              lineHeight: 'var(--lh-xs)',
+            }}
+          >
+            Updated {relativeTime(board.updatedAt)}
+            {Number.isFinite(board.rev) ? ` · rev ${board.rev}` : ''}
+          </p>
+          <OwnerTag
+            owner={board.ownerId}
+            nickname={nickname}
+            canClaim={!board.ownerId}
+            claiming={{ id: board.id, title: board.title, pending: claimBoard.isPending }}
+            onClaim={claim}
+          />
+        </div>
       </div>
 
       {confirming ? (
@@ -408,8 +561,12 @@ function BoardCard({ board, onOpen }) {
 /* --- the screen ------------------------------------------------------------ */
 
 export function BoardList({ onOpen }) {
+  // No `owner` argument: the hook reads the current nickname itself, so there
+  // is no way for this screen and the cache key to disagree about who is
+  // asking. That disagreement is the bug.
   const { data: boards, isLoading, isError, error, refetch } = useBoards();
   const createBoard = useCreateBoard();
+  const nickname = useNickname();
   const [tick, setTick] = useState(0);
 
   // The relative timestamps above are pure functions of Date.now(); bumping a
@@ -423,9 +580,18 @@ export function BoardList({ onOpen }) {
     return (b.updatedAt ?? 0) - (a.updatedAt ?? 0);
   }), [boards, tick]);
 
+  // Split once, so the header can say how much of the list is actually yours
+  // rather than counting rows that belong to nobody.
+  const counts = useMemo(() => {
+    const mine = list.filter((b) => b.ownerId && b.ownerId === nickname).length;
+    return { mine, unclaimed: list.filter((b) => !b.ownerId).length, total: list.length };
+  }, [list, nickname]);
+
   const create = useCallback(() => {
+    // `ownerId` is defaulted inside `useCreateBoard` to the current nickname;
+    // passing it here as well keeps the intent visible at the call site.
     createBoard.mutate(
-      { title: 'Untitled board' },
+      { title: 'Untitled board', ownerId: nickname },
       {
         onSuccess: (b) => {
           toast.success('Board created');
@@ -434,7 +600,20 @@ export function BoardList({ onOpen }) {
         onError: (e) => toast.error(e?.message || 'Could not create a board'),
       },
     );
-  }, [createBoard, onOpen]);
+  }, [createBoard, nickname, onOpen]);
+
+  /* --- empty state ---------------------------------------------------
+     The empty state has to explain WHY the list is empty, not just offer a
+     button.
+
+     With the list now filtered by name, "empty" has two very different causes
+     that need opposite advice: nobody has ever made a board (so make one), or
+     boards exist but they belong to other names (so fix YOUR name — the board
+     you are looking for is real, it is just filed under someone else). A bare
+     "Create your first board" is actively wrong in the second case: it tells
+     you to make a duplicate of work you already have. Hence the second
+     paragraph, and the shortcut straight to the name control.
+     ------------------------------------------------------------------ */
 
   return (
     <div
@@ -443,6 +622,7 @@ export function BoardList({ onOpen }) {
       // so a test can wait for the list without counting every <li> on the page
       // (skeleton rows are <li> too).
       data-screen="board-list"
+      data-owner={nickname}
       style={{ overflow: 'auto', display: 'block', background: 'var(--color-bg)' }}
     >
       <div style={{ maxWidth: 860, margin: '0 auto', padding: 'var(--sp-7) var(--sp-5) var(--sp-8)' }}>
@@ -463,9 +643,16 @@ export function BoardList({ onOpen }) {
               Boards
             </h1>
             <p style={{ color: 'var(--color-text-muted)', fontSize: 'var(--fs-sm)' }}>
-              A shared whiteboard. Open one to start drawing, or create a new board.
+              {counts.total === 0
+                ? 'A shared whiteboard. Open one to start drawing, or create a new board.'
+                : `${counts.mine} owned by you${counts.unclaimed ? ` · ${counts.unclaimed} unclaimed` : ''}.`}
             </p>
           </div>
+          {/* Where the name can be changed. It lives on the list screen rather
+              than only inside a board's TopBar, because the list is the screen
+              where the name matters most: it is the filter, and getting it
+              wrong is why your boards look missing. */}
+          <NicknameSwitcher />
           <button
             type="button"
             className="btn btn--primary"
@@ -546,18 +733,40 @@ export function BoardList({ onOpen }) {
                 <IconLayers size={26} />
               </span>
               <h2 className="panel__title" style={{ fontSize: 'var(--fs-lg)' }}>
-                No boards yet
+                Nothing here for {nickname || 'you'} yet
               </h2>
               <p
                 style={{
                   color: 'var(--color-text-muted)',
                   fontSize: 'var(--fs-sm)',
-                  maxWidth: '42ch',
+                  maxWidth: '46ch',
                   lineHeight: 'var(--lh-md)',
                 }}
               >
                 A board is a shared canvas — draw shapes, drop sticky notes, and invite
-                other people to work alongside you in real time.
+                other people to work alongside you in real time. Anything you create
+                here is owned by <strong>{nickname}</strong>.
+              </p>
+              <p
+                style={{
+                  color: 'var(--color-text-muted)',
+                  fontSize: 'var(--fs-sm)',
+                  maxWidth: '46ch',
+                  lineHeight: 'var(--lh-md)',
+                  margin: 'var(--sp-1) 0 0',
+                }}
+              >
+                Looking for a board you made earlier under a different name?{' '}
+                <button
+                  type="button"
+                  className="btn btn--ghost"
+                  data-testid="empty-change-name"
+                  onClick={() => document.querySelector('[data-testid="nickname-chip"]')?.click()}
+                  style={{ minHeight: 0, padding: 0, textDecoration: 'underline' }}
+                >
+                  Change your name
+                </button>{' '}
+                — boards owned by other names stay hidden on purpose.
               </p>
               <button
                 type="button"
@@ -577,7 +786,7 @@ export function BoardList({ onOpen }) {
               style={{ display: 'grid', gap: 'var(--sp-2)', listStyle: 'none', margin: 0, padding: 0 }}
             >
               {list.map((b) => (
-                <BoardCard key={b.id} board={b} onOpen={onOpen} />
+                <BoardCard key={b.id} board={b} onOpen={onOpen} nickname={nickname} />
               ))}
             </ul>
           )}

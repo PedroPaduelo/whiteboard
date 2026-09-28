@@ -15,11 +15,12 @@
  * "DB" and "cylinder" finds "database".
  */
 
-import { useCallback, useMemo, useState } from 'react';
+import { Fragment, useCallback, useMemo, useState } from 'react';
 import { useDraggable } from '@dnd-kit/core';
 import { PRESET_GROUPS, PRESETS, searchPresets } from '../store/presets.js';
 import { useDndContext } from './DndProvider.jsx';
 import { useDropOnCanvas } from './useDropOnCanvas.js';
+import './palette.css';
 
 /**
  * Flavour text per group. The store's own `PRESET_GROUPS` is the authority for
@@ -90,33 +91,20 @@ function PaletteItem({ preset, onPlace, selected, onSelect }) {
     data: { preset },
   });
 
-  const style = {
-    display: 'flex',
-    alignItems: 'center',
-    gap: 'var(--sp-2)',
-    width: '100%',
-    padding: 'var(--sp-2)',
-    borderRadius: 'var(--radius-sm)',
-    border: `1px solid ${selected ? 'var(--color-accent)' : 'var(--color-border)'}`,
-    background: selected ? 'var(--color-accent-soft)' : 'var(--color-surface)',
-    color: 'var(--color-text)',
-    fontSize: 'var(--fs-sm)',
-    fontFamily: 'var(--font-sans)',
-    textAlign: 'left',
-    cursor: isDragging ? 'grabbing' : 'grab',
-    opacity: isDragging ? 0.4 : 1,
-    touchAction: 'none',
-    // The palette must be fully interactive; it is a panel above the canvas,
-    // not part of the pointer-transparent flow layer.
-    pointerEvents: 'auto',
-  };
+  // Styling lives in palette.css. Inline styles cannot express hover, and
+  // they are the reason this panel looked improvised.
+  const style = { opacity: isDragging ? 0.4 : 1 };
 
   return (
-    <div ref={setNodeRef} style={{ position: 'relative' }}>
-      <button
+    /* The dnd-kit ref goes on the BUTTON, not on a wrapper. A wrapper div
+       would be the grid item, so the button inside it inherited a single
+       52px column instead of filling its cell — which is what made the
+       palette look like a narrow list no matter what the grid said. */
+    <button
+      ref={setNodeRef}
         type="button"
-        {...attributes}
-        {...listeners}
+      {...attributes}
+      {...listeners}
         // Click-to-place. Also the keyboard path: Enter/Space fires click on a
         // button, so this one handler covers mouse, touch and keyboard.
         onClick={() => onPlace(preset)}
@@ -127,38 +115,35 @@ function PaletteItem({ preset, onPlace, selected, onSelect }) {
           }
         }}
         aria-label={`Add ${preset.label}. Drag onto the canvas, or press Enter to place it at the centre.`}
+        className="wb-palette__tile"
+        data-selected={selected ? '' : undefined}
+        data-dragging={isDragging ? '' : undefined}
         style={style}
       >
-        <span
-          aria-hidden="true"
-          style={{
-            width: 22,
-            height: 22,
-            display: 'inline-flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            flex: '0 0 auto',
-            borderRadius: 'var(--radius-xs)',
-            background: 'var(--color-surface-sunken)',
-            color: 'var(--color-text-muted)',
-            fontSize: 13,
-          }}
-        >
-          {preset.icon ?? '▭'}
+        <span className="wb-palette__icon" aria-hidden="true">
+          {/* `preset.icon` is an SVG PATH STRING ("M4 7V5h16v2M12 5v14..."),
+              not a glyph. Rendering it as a text child prints the path
+              source over the label, which is exactly what it did. It has to
+              go inside a <path d={...}>, or the palette shows you its own
+              source code. */}
+          <svg
+            viewBox="0 0 24 24"
+            width="15"
+            height="15"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.7"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <path d={preset.icon} />
+          </svg>
         </span>
-        <span
-          style={{
-            flex: '1 1 auto',
-            minWidth: 0,
-            overflow: 'hidden',
-            textOverflow: 'ellipsis',
-            whiteSpace: 'nowrap',
-          }}
-        >
+        <span className="wb-palette__label">
           {preset.label}
         </span>
-      </button>
-    </div>
+    </button>
   );
 }
 
@@ -186,18 +171,13 @@ export function PresetPalette({ className = '', style, onPlaced }) {
 
   return (
     <aside
-      className={className}
+      className={`wb-palette ${className}`}
       data-preset-palette=""
       aria-label="Element presets"
-      style={{
-        width: 232,
-        display: 'flex',
-        flexDirection: 'column',
-        gap: 'var(--sp-2)',
-        fontFamily: 'var(--font-sans)',
-        pointerEvents: 'auto',
-        ...style,
-      }}
+      /* Layout comes from palette.css. The inline `width: 232` that used to
+         be here overrode the stylesheet, which is why the panel stayed narrow
+         no matter what the CSS said. Only caller-supplied style stays inline. */
+      style={style}
     >
       <input
         type="search"
@@ -218,55 +198,33 @@ export function PresetPalette({ className = '', style, onPlaced }) {
         }}
       />
 
-      <div
-        style={{
-          display: 'flex',
-          flexDirection: 'column',
-          gap: 'var(--sp-3)',
-          overflowY: 'auto',
-          // A short list: a keyboard user arrowing down it does not want to
-          // scroll the page out from under them.
-          maxHeight: 'min(52vh, 460px)',
-        }}
-      >
+      {/* ONE grid of tiles for every preset, with each group heading
+          spanning the full width. The previous version nested a flex-column
+          per group INSIDE a grid, so each group got one narrow column: the
+          tiles came out 52px wide and the heading overlapped them. A Fragment
+          keeps the heading and the tiles as direct grid items, which is the
+          only way to get both "heading spans" and "tiles flow in two
+          columns" out of one grid. */}
+      <div className="wb-palette__grid">
         {groups.length === 0 ? (
-          <p style={{ color: 'var(--color-text-muted)', fontSize: 'var(--fs-sm)', margin: 0 }}>
-            No preset matches “{query}”.
-          </p>
+          <p className="wb-palette__empty">No preset matches "{query}".</p>
         ) : (
           groups.map((group) => (
-            <section key={group.name} aria-label={group.name}>
-              <h3
-                style={{
-                  margin: '0 0 var(--sp-1)',
-                  fontSize: 'var(--fs-xs)',
-                  lineHeight: 'var(--lh-xs)',
-                  fontWeight: 'var(--fw-semibold)',
-                  color: 'var(--color-text-muted)',
-                  letterSpacing: '0.04em',
-                  textTransform: 'uppercase',
-                }}
-              >
+            <Fragment key={group.name}>
+              <h3 className="wb-palette__group">
                 {group.name}
-                {group.hint ? (
-                  <span style={{ textTransform: 'none', letterSpacing: 0, fontWeight: 400 }}>
-                    {' '}
-                    · {group.hint}
-                  </span>
-                ) : null}
+                {group.hint ? <span className="wb-palette__group-hint"> · {group.hint}</span> : null}
               </h3>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--sp-1)' }}>
-                {group.items.map((preset) => (
-                  <PaletteItem
-                    key={preset.id}
-                    preset={preset}
-                    onPlace={onPlace}
-                    selected={activePreset?.id === preset.id}
-                    onSelect={setActivePreset}
-                  />
-                ))}
-              </div>
-            </section>
+              {group.items.map((preset) => (
+                <PaletteItem
+                  key={preset.id}
+                  preset={preset}
+                  onPlace={onPlace}
+                  selected={activePreset?.id === preset.id}
+                  onSelect={setActivePreset}
+                />
+              ))}
+            </Fragment>
           ))
         )}
       </div>

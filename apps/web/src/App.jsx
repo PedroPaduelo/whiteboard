@@ -31,11 +31,13 @@ import { BoardList } from './ui/BoardList.jsx';
 import { ErrorBoundary } from './ui/ErrorBoundary.jsx';
 import { ExportDialog } from './ui/ExportDialog.jsx';
 import { HelpOverlay } from './ui/HelpOverlay.jsx';
+import { NicknameGate } from './ui/NicknameGate.jsx';
 import { StatusBar } from './ui/StatusBar.jsx';
 import { Toaster, toast, resetToasts } from './ui/Toasts.jsx';
 import { Toolbar } from './ui/Toolbar.jsx';
 import { TopBar, applyTheme, readStoredTheme } from './ui/TopBar.jsx';
 import { isTypingTarget, matchesEvent, runShortcut } from './ui/shortcuts.js';
+import { useNickname } from './api/queries.js';
 
 /* --- routing ---------------------------------------------------------------- */
 
@@ -388,6 +390,19 @@ export default function App() {
   const [helpOpen, setHelpOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
 
+  /* --- the nickname gate ---------------------------------------------
+     No name means no board list, and the board page is a link away. So the
+     gate is checked BEFORE the routing branch and returns instead of
+     overlaying: the list is never mounted, never fetched and never in the DOM
+     behind it. An overlay you can click through, or a list rendered under a
+     dim layer, is a gate in appearance only.
+
+     It also gates the board page, not just the list. `?board=<id>` is a URL
+     you can paste, so without this a nameless visitor lands straight on a
+     canvas with no name to file their work under.
+     ------------------------------------------------------------------ */
+  const nickname = useNickname();
+
   /* --- theme --------------------------------------------------------- */
   const [theme, setTheme] = useState(readStoredTheme);
   const themeRef = useRef('stored');
@@ -518,6 +533,18 @@ export default function App() {
     setTheme((current) => (current === boardTheme ? current : boardTheme));
   }, []);
   const ui = { openHelp, closeHelp, openExport, closeExport, onBoardTheme };
+
+  // The gate. Placed ahead of the routing branch, and it RETURNS: nothing
+  // below this line is mounted, so there is no board list in the DOM to peek
+  // at and no `useBoards` query to fire with an empty owner.
+  if (!nickname) {
+    return (
+      <>
+        <NicknameGate />
+        <Toaster />
+      </>
+    );
+  }
 
   if (!boardId) {
     return (
