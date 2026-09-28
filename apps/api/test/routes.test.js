@@ -25,11 +25,9 @@ const P = '/api';
 /**
  * A REAL hub with `broadcast` wrapped in a spy.
  *
- * Real, not a fake, for one concrete reason: the ws plugin's onClose hook
- * reaches into `hub.peers` / `hub.rooms`, so a hand-rolled object with only a
- * `broadcast` method makes `app.close()` throw and takes the whole test file
- * down with it. Using the actual Hub also means the routes broadcast through
- * the same code path production does; the wrapper only records.
+ * Real rather than a fake so the routes broadcast through the same code path
+ * production does (and the ws plugin's onClose finds a real `close()`); the
+ * wrapper only records.
  */
 function spyHub() {
   const hub = new Hub();
@@ -567,6 +565,8 @@ test('POST /boards/:id/ops — a valid create is applied and shows up in the sna
   assert.equal(result.rev, 1, 'one batch bumps the rev exactly once');
   assert.equal(result.appliedOps.length, 1);
   assert.equal(result.appliedOps[0].opId, 'op-1');
+  assert.deepEqual(result.applied, ['op-1'], 'REST results carry the acked opIds too');
+  assert.equal(result.elements.length, 1, 'REST keeps the full element list');
 
   // The element is really on the board.
   const snap = (await app.inject({ method: 'GET', url: `${P}/boards/${id}` })).json();
@@ -587,6 +587,7 @@ test('POST /boards/:id/ops — a valid create is applied and shows up in the sna
   assert.equal(hub.sent[0].envelope.type, 'op');
   assert.equal(hub.sent[0].envelope.rev, 1);
   assert.equal(hub.sent[0].envelope.ops.length, 1);
+  assert.equal(hub.sent[0].envelope.boardId, id, 'the op envelope names its board, like the WS one');
   assert.equal(hub.sent[0].except, null, 'null except = everyone in the room');
 
   assert.equal((await store.hasOp(id, 'op-1')), true, 'the opId is recorded for dedupe');
@@ -759,6 +760,7 @@ test('POST /boards/:id/ops — replaying the same opIds is a 200 duplicate', asy
   assert.equal(body.status, 'duplicate');
   assert.equal(body.rev, appliedRev, 'the rev is unchanged by a retry');
   assert.deepEqual(body.appliedOps, [], 'a retry applies nothing');
+  assert.deepEqual(body.applied, ['op-retry'], 'but it still acks the opIds it already holds');
 
   // ...and the element exists exactly once.
   const snap = (await app.inject({ method: 'GET', url: `${P}/boards/${id}` })).json();
@@ -823,7 +825,14 @@ test('DELETE /boards/:id/elements — clears the board and bumps the rev', async
   const result = res.json();
   assert.equal(result.status, 'applied');
   assert.equal(result.rev, 2, 'a clear is a mutation, so the rev moves');
-  assert.deepEqual(result.appliedOps, []);
+  // A REAL clear op, so peers apply it (an empty op list was ignored).
+  assert.equal(result.appliedOps.length, 1);
+  const [clearOp] = result.appliedOps;
+  assert.equal(clearOp.kind, 'clear');
+  assert.equal(typeof clearOp.opId, 'string');
+  assert.ok(clearOp.opId.length > 0 && clearOp.opId.length <= 40, 'fits LIMITS.MAX_ID');
+  assert.deepEqual(result.applied, [clearOp.opId]);
+  assert.deepEqual(result.elements, []);
 
   const after = (await app.inject({ method: 'GET', url: `${P}/boards/${id}` })).json();
   assert.equal(after.elements.length, 0, 'the board is empty');
@@ -836,6 +845,102 @@ test('DELETE /boards/:id/elements — clears the board and bumps the rev', async
   assert.equal(hub.sent.length, broadcastsBefore + 1, 'the clear is fanned out');
   assert.equal(hub.sent.at(-1).boardId, id);
   assert.equal(hub.sent.at(-1).except, null);
+  const envelope = hub.sent.at(-1).envelope;
+  assert.equal(envelope.type, 'op');
+  assert.equal(envelope.boardId, id);
+  assert.equal(envelope.rev, 2);
+  assert.deepEqual(envelope.ops.map((o) => [o.kind, o.opId]), [['clear', clearOp.opId]]);
+
+  // Recorded like any op, and a second clear is a NEW op (fresh opId).
+  const store = app.store;
+  assert.equal(await store.hasOp(id, clearOp.opId), true);
+  const again = (await app.inject({ method: 'DELETE', url: `${P}/boards/${id}/elements` })).json();
+  assert.equal(again.rev, 3);
+  assert.notEqual(again.applied[0], clearOp.opId);
+
+  // And the board still takes ops afterwards.
+  const next = await app.inject({ method: 'POST', url, payload: { ops: [createStickyOp(id, 'op-3', 'el-3')] } });
+  assert.equal(next.json().status, 'applied');
+  assert.equal(next.json().rev, 4);
+});
+
+test('PATCH /boards/:id — broadcasts the new board to the room', async (t) => {
+  const { app, hub } = await makeApp();
+  t.after(() => app.close());
+
+  const created = await createBoard(app, { title: 'Antes' });
+  const id = created.board.id;
+  const before = hub.sent.length;
+
+  const res = await app.inject({ method: 'PATCH', url: `${P}/boards/${id}`, payload: { title: 'Depois', theme: 'dark' } });
+  assert.equal(res.statusCode, 200);
+  assert.equal(hub.sent.length, before + 1);
+  const { boardId, envelope, except } = hub.sent.at(-1);
+  assert.equal(boardId, id);
+  assert.equal(except, null, 'everyone, the renamer included');
+  assert.equal(envelope.type, 'board');
+  assert.equal(envelope.boardId, id);
+  assert.deepEqual(envelope.board, res.json(), 'the payload IS the PATCH response');
+
+  // Failed PATCHes broadcast nothing.
+  await app.inject({ method: 'PATCH', url: `${P}/boards/${id}`, payload: { theme: 'neon' } });
+  await app.inject({ method: 'PATCH', url: `${P}/boards/ghost`, payload: { title: 'x' } });
+  assert.equal(hub.sent.length, before + 1);
+
+  // A dead room never fails the write.
+  hub.broadcast = () => {
+    throw new Error('socket exploded');
+  };
+  const ok = await app.inject({ method: 'PATCH', url: `${P}/boards/${id}`, payload: { title: 'Ainda salvo' } });
+  assert.equal(ok.statusCode, 200);
+  assert.equal(ok.json().title, 'Ainda salvo');
+});
+
+test('POST /boards/:id/ops — the Excalidraw-style fields round-trip over REST', async (t) => {
+  const { app } = await makeApp();
+  t.after(() => app.close());
+
+  const created = await createBoard(app, {});
+  const id = created.board.id;
+  const url = `${P}/boards/${id}/ops`;
+  const shape = {
+    id: 'box', type: 'rect', x: 0, y: 0, w: 100, h: 100, seed: 42, roughness: 1,
+    fillStyle: 'hachure', roundness: 'round', fontFamily: 'hand', fontSize: 20, align: 'center', label: 'Caixa',
+  };
+  const elbow = {
+    id: 'elbow', type: 'arrow', x: 0, y: 0, w: 0, h: 0, startId: 'box',
+    points: [{ x: 50, y: 50 }, { x: 50, y: 300 }, { x: 300, y: 300 }],
+    startArrowhead: 'none', endArrowhead: 'triangle',
+  };
+  const res = await app.inject({
+    method: 'POST', url,
+    payload: { ops: [{ opId: 'x1', kind: 'create', element: shape }, { opId: 'x2', kind: 'create', element: elbow }] },
+  });
+  assert.equal(res.statusCode, 200, res.body);
+  const els = res.json().elements;
+  const box = els.find((e) => e.id === 'box');
+  for (const [k, v] of Object.entries(shape)) assert.deepEqual(box[k], v, k);
+  const arrow = els.find((e) => e.id === 'elbow');
+  assert.equal(arrow.points.length, 3, 'multi-point connectors are accepted');
+  assert.deepEqual(arrow.points[0], { x: 50, y: 104 }, 'the bound start is on the box outline plus the gap');
+  assert.equal(arrow.endArrowhead, 'triangle');
+
+  // Unbinding over REST: null clears the binding and the point stays put.
+  const unbind = await app.inject({
+    method: 'POST', url,
+    payload: { ops: [{ opId: 'x3', kind: 'update', elementId: 'elbow', patch: { startId: null, points: [{ x: -80, y: -80 }, { x: 50, y: 300 }, { x: 300, y: 300 }] } }] },
+  });
+  const after = unbind.json().elements.find((e) => e.id === 'elbow');
+  assert.equal('startId' in after, false);
+  assert.deepEqual(after.points[0], { x: -80, y: -80 });
+
+  // A bad value in a new field is a 400 naming the field.
+  const bad = await app.inject({
+    method: 'POST', url,
+    payload: { ops: [{ opId: 'x4', kind: 'update', elementId: 'box', patch: { fillStyle: 'polka' } }] },
+  });
+  assert.equal(bad.statusCode, 400);
+  assert.match(bad.json().message, /fillStyle/);
 });
 
 test('DELETE /boards/:id/elements — an unknown board is 404', async (t) => {
@@ -903,6 +1008,17 @@ test('POST /boards/:id/ops — a genuine store failure is a 500, not masked as 4
   });
   assert.equal(res.statusCode, 500);
   assert.equal(res.json().code, 'INTERNAL');
+
+  // node:sqlite errors carry a string `code` too; that must not make them 400s.
+  store.applyOps = async () => {
+    throw Object.assign(new Error('disk I/O error'), { code: 'ERR_SQLITE_ERROR' });
+  };
+  const res2 = await app.inject({
+    method: 'POST',
+    url: `${P}/boards/whatever/ops`,
+    payload: { ops: [createStickyOp('whatever', 'op-2', 'el-2')] },
+  });
+  assert.equal(res2.statusCode, 500);
 });
 
 test('GET /health — 200 with a real store read', async (t) => {

@@ -9,34 +9,48 @@
  * state) and no action has to remember to notify, so a future action cannot
  * forget.
  *
- * Three rules make this correct:
+ * Four rules make this correct:
  *
- *  1. **Never re-enter on your own writes.** A mutation applied from a remote
- *     broadcast sets `applyingRemote` for the duration of the `set()` call,
- *     so the subscription that fires synchronously inside it sees the guard
- *     and emits nothing. Getting this backwards means every drag draws
- *     twice, once locally and once again when the echo comes back.
+ *  1. **Never re-enter on your own writes.** A mutation applied from the
+ *     network runs inside `withRemote`, so the subscription that fires
+ *     synchronously inside it sees the guard, advances its baseline and emits
+ *     nothing. Getting this backwards means every drag draws twice.
  *
- *  2. **Debounce into batches.** A drag emits ~60 updates a second. Sending
- *     60 messages a second per peer is what makes a collaborative canvas
- *     feel laggy, so ops accumulate and go out together on a short timer.
+ *  2. **Debounce into batches.** A drag emits ~60 updates a second; ops
+ *     accumulate for BATCH_MS and go out together, one `update` per element.
  *
- *  3. **Undo/redo encodes as clear + create.** A diff would be tidier, but
- *     undo is rarely hit compared to dragging, and an encoding that is
- *     occasionally wasteful is far better than one that is occasionally
- *     wrong.
+ *  3. **Every transition is a plain diff — undo and redo included.** An undo
+ *     used to be shipped as `clear` + re-create of the whole board, which
+ *     wiped whatever collaborators had added since. Now it is exactly the
+ *     creates/updates/deletes that differ (and the store rebases its undo
+ *     stack over remote edits, so that diff only reverts YOUR changes).
+ *
+ *  4. **A removed key is sent as its "cleared" value.** Unbinding a
+ *     connector end deletes `startId` locally; the patch carries
+ *     `startId: null`, which the server treats as "remove the field". Keys the
+ *     server cannot null get their rendering default instead (`locked:false`,
+ *     `rotation:0`, …) so an undo of "lock" or of a first rotation still
+ *     reaches everyone.
+ *
+ * A board switch (the store's `boardId` changes) is never a user edit: the
+ * baseline moves and nothing is shipped, so leftovers from board A can never
+ * be sent to board B.
  */
 
+import * as shared from '@whiteboard/shared';
 import { realtime } from './realtime.js';
-import { useBoardStore, getState, historyEpoch } from '../store/boardStore.js';
+import { collapseOps } from './ops.js';
+import { useBoardStore } from '../store/boardStore.js';
+
+export { collapseOps };
 
 /** How long ops accumulate before being flushed. ~3 frames at 60fps. */
-const BATCH_MS = 50;
+export const BATCH_MS = 50;
 
 /**
  * True while a remote op is being applied. The store's `set` is synchronous,
- * so a single boolean is enough — no reentrancy depth needed, but a counter
- * is used anyway so a nested application cannot clear the flag early.
+ * so the subscription runs inside the guarded call; a counter (not a flag)
+ * keeps a nested application from clearing it early.
  */
 let applyingRemote = 0;
 
@@ -53,89 +67,133 @@ export function withRemote(fn) {
   }
 }
 
-/** Field-by-field shallow equality, ignoring key order. */
-function shallowEqual(a, b) {
-  if (a === b) return true;
-  if (!a || !b || typeof a !== 'object' || typeof b !== 'object') return false;
-  const ka = Object.keys(a);
-  const kb = Object.keys(b);
-  if (ka.length !== kb.length) return false;
-  for (const k of ka) {
-    if (k === 'points') {
-      // Points are arrays of objects; compare as a sequence of coordinates
-      // so a drag that rewrites the identical point list is not an update.
-      const pa = a.points;
-      const pb = b.points;
-      if (!pa || !pb || pa.length !== pb.length) return false;
-      for (let i = 0; i < pa.length; i++) {
-        if (pa[i]?.x !== pb[i]?.x || pa[i]?.y !== pb[i]?.y) return false;
-      }
-      continue;
-    }
-    if (!Object.prototype.hasOwnProperty.call(b, k)) return false;
-    if (a[k] !== b[k]) return false;
+/* ------------------------------------------------------------------ diffing */
+
+/** Patch keys the server accepts `null` for, meaning "remove the field". */
+const NULLABLE_KEYS = new Set(
+  Array.isArray(shared.NULLABLE_PATCH_KEYS) ? shared.NULLABLE_PATCH_KEYS : ['startId', 'endId', 'groupId', 'label'],
+);
+
+/**
+ * The value that says "this key is gone" to the server, for a key that
+ * disappeared from `el`. `undefined` means it cannot be expressed (the key is
+ * left alone on the server — only harmless keys such as timestamps land here).
+ * Defaults match the renderer's defaults for absent fields, so the server's
+ * explicit value draws exactly like the local missing one.
+ */
+export function clearedValue(key, el) {
+  if (NULLABLE_KEYS.has(key)) return null;
+  switch (key) {
+    case 'locked':
+      return false;
+    case 'rotation':
+      return 0;
+    case 'opacity':
+      return 1;
+    case 'strokeStyle':
+      return 'solid';
+    case 'stroke':
+    case 'fill':
+      return 'none';
+    case 'roughness':
+      return 1;
+    case 'fillStyle':
+      return 'solid';
+    case 'roundness':
+      return 'sharp';
+    case 'fontFamily':
+      return 'hand';
+    case 'fontSize':
+      return el?.type === 'text' ? 24 : 20;
+    case 'align':
+      return el?.type === 'text' || el?.type === 'sticky' ? 'left' : 'center';
+    case 'startArrowhead':
+      return 'none';
+    case 'endArrowhead':
+      return el?.type === 'arrow' ? 'arrow' : 'none';
+    default:
+      return undefined;
+  }
+}
+
+/** Same point sequence (x/y only — that is all the wire carries)? */
+function samePoints(pa, pb) {
+  if (pa === pb) return true;
+  if (!Array.isArray(pa) || !Array.isArray(pb) || pa.length !== pb.length) return false;
+  for (let i = 0; i < pa.length; i++) {
+    if (pa[i]?.x !== pb[i]?.x || pa[i]?.y !== pb[i]?.y) return false;
   }
   return true;
 }
 
-/** The patch to send for a changed element: only what actually differs. */
-function diffElement(before, after) {
+/** Structural equality for plain JSON values (nested arrays/objects). */
+function jsonEqual(a, b) {
+  if (a === b) return true;
+  if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  const ka = Object.keys(a);
+  if (ka.length !== Object.keys(b).length) return false;
+  for (const k of ka) if (!jsonEqual(a[k], b[k])) return false;
+  return true;
+}
+
+/**
+ * The patch to send for a changed element: only what actually differs.
+ * Exported for tests.
+ * @returns {object|null}
+ */
+export function diffElement(before, after) {
   const patch = {};
   for (const k of Object.keys(after)) {
     if (k === 'id' || k === 'type') continue; // identity, never an update
+    const v = after[k];
+    if (v === undefined || v === null) continue; // treated as absent, below
     if (k === 'points') {
-      if (!shallowEqual({ points: before.points }, { points: after.points })) {
-        patch.points = after.points.map((p) => ({ x: p.x, y: p.y }));
-      }
+      if (!samePoints(before.points, v)) patch.points = v.map((p) => ({ x: p.x, y: p.y }));
       continue;
     }
-    if (before[k] !== after[k]) patch[k] = after[k];
+    if (before[k] === v) continue;
+    if (typeof v === 'object' && jsonEqual(before[k], v)) continue;
+    patch[k] = v;
   }
-
-  // A key that DISAPPEARED (a detached startId) deliberately does not become
-  // `patch[k] = undefined`. Two reasons, both verified against the shared
-  // validator: `undefined` and `null` are both stripped by `sanitisePatch`, so
-  // the clear would never reach the server; and the server does not need it —
-  // `applyOpBatch` runs `detachMissingConnectors` itself whenever the batch
-  // touches geometry, which is exactly the batch that removed the anchor.
-  // The local detach still happened (see `removeAndDetach`), so this client
-  // is already consistent; the server reaches the same state on its own.
-
+  for (const k of Object.keys(before)) {
+    if (k === 'id' || k === 'type') continue;
+    if (before[k] === undefined || before[k] === null) continue;
+    if (after[k] !== undefined && after[k] !== null) continue;
+    const cleared = clearedValue(k, after);
+    if (cleared !== undefined) patch[k] = cleared;
+  }
   return Object.keys(patch).length > 0 ? patch : null;
 }
-
-/** Same id sequence on both sides? */
-const sameOrder = (a, b) => a.length === b.length && a.every((el, i) => el.id === b[i].id);
 
 /**
  * Turn an elements-array transition into ops. Pure — exported so it can be
  * tested without a socket.
  *
+ * Order is part of the board, so it is checked too: the server appends a
+ * `create` on top, which is wrong when the new element sits lower (an undo
+ * of a delete restores it in place). The server's resulting order is
+ * simulated and a `reorder` is added only when it would differ.
+ *
  * @param {object[]} prev
  * @param {object[]} next
- * @param {(op: object) => object} makeOp
- * @param {boolean} [forceFull] encode as clear+create (undo/redo)
- * @returns {{ops: object[], full: boolean}} `full` means clear+create.
+ * @param {(kind: string, fields?: object) => object} makeOp
+ * @returns {{ops: object[], full: false}}
  */
-export function diffElements(prev, next, makeOp, forceFull = false) {
+export function diffElements(prev, next, makeOp) {
   const before = new Map(prev.map((el) => [el.id, el]));
   const after = new Map(next.map((el) => [el.id, el]));
-
-  // Wholesale replacement: an undo, a redo, or a very large jump. clear +
-  // create is always correct whatever the two boards have in common, and
-  // for undo it is the encoding the contract asks for.
-  if (forceFull) {
-    return { ops: [makeOp('clear'), ...next.map((el) => makeOp('create', { element: el }))], full: true };
-  }
-
   const ops = [];
+  const createdIds = [];
 
   for (const el of next) {
     const old = before.get(el.id);
     if (!old) {
       ops.push(makeOp('create', { element: el }));
+      createdIds.push(el.id);
       continue;
     }
+    if (old === el) continue;
     const patch = diffElement(old, el);
     if (patch) ops.push(makeOp('update', { elementId: el.id, patch }));
   }
@@ -144,35 +202,43 @@ export function diffElements(prev, next, makeOp, forceFull = false) {
     if (!after.has(el.id)) ops.push(makeOp('delete', { elementId: el.id }));
   }
 
-  // A reorder that changed nothing else still has to be shipped, but only
-  // when the SETS match — otherwise the creates/deletes above already carry
-  // the new order and a reorder op would be redundant.
-  if (ops.length === 0 && !sameOrder(prev, next)) {
-    ops.push(makeOp('reorder', { order: next.map((el) => el.id) }));
-  }
+  // What order would the server end up with? Survivors keep prev's order and
+  // creates are appended in the order they were sent.
+  const simulated = [];
+  for (const el of prev) if (after.has(el.id)) simulated.push(el.id);
+  simulated.push(...createdIds);
+  let reordered = simulated.length !== next.length;
+  for (let i = 0; !reordered && i < next.length; i++) if (simulated[i] !== next[i].id) reordered = true;
+  if (reordered) ops.push(makeOp('reorder', { order: next.map((el) => el.id) }));
 
   return { ops, full: false };
 }
 
+/* --------------------------------------------------------------- StoreSync */
+
 export class StoreSync {
   /**
    * @param {import('./realtime.js').RealtimeClient} [client]
+   * @param {{getState?: () => object, subscribe?: Function}} [store]
    */
-  constructor(client = realtime) {
+  constructor(client = realtime, store = useBoardStore) {
     this.client = client;
+    this.store = store;
     this.pending = [];
     this.timer = null;
     this.unsubscribe = null;
-    this.prevElements = getState().elements;
-    this.epoch = historyEpoch.value;
+    const st = store.getState();
+    this.prevElements = st.elements;
+    this.prevBoardId = st.boardId;
   }
 
   /** Start bridging. Idempotent — calling twice keeps one subscription. */
   start() {
     if (this.unsubscribe) return this;
-    this.prevElements = getState().elements;
-    this.epoch = historyEpoch.value;
-    this.unsubscribe = useBoardStore.subscribe((state) => this._onChange(state));
+    const st = this.store.getState();
+    this.prevElements = st.elements;
+    this.prevBoardId = st.boardId;
+    this.unsubscribe = this.store.subscribe((state) => this._onChange(state));
     return this;
   }
 
@@ -180,31 +246,36 @@ export class StoreSync {
   stop() {
     if (this.unsubscribe) this.unsubscribe();
     this.unsubscribe = null;
-    this._flush();
+    this.flush();
+  }
+
+  /** Ops computed but not yet handed to the client (the current debounce window). */
+  pendingOps() {
+    return this.pending.slice();
   }
 
   _onChange(state) {
+    // A different board (or none): hydration/reset, never an edit. Checked on
+    // EVERY store change, not only element changes, or a bare `setBoardId`
+    // would leave the guard armed and swallow the first real edit.
+    if (state.boardId !== this.prevBoardId) {
+      this.prevBoardId = state.boardId;
+      this.prevElements = state.elements;
+      return;
+    }
+
     const next = state.elements;
     const prev = this.prevElements;
     if (next === prev) return;
 
-    // Advance the diff baseline FIRST, unconditionally. A remote create is
-    // the clearest way to get this wrong: if the baseline is left pointing at
-    // the pre-create board, the next local edit diffs against a board that
-    // never had that element and re-ships the remote peer's create as our own.
+    // Advance the baseline FIRST, unconditionally: a remote create left out
+    // of the baseline would be re-shipped as ours by the next local edit.
     this.prevElements = next;
 
-    // Our own echo, or a resync: not a user edit, so it must not be shipped.
-    // (Safe to check after the baseline update — a remote change is already
-    // accounted for, and must never reach the network.)
+    // Our own echo, a resync, a hydration: not a user edit.
     if (isApplyingRemote()) return;
 
-    // An undo/redo bumped the epoch: ship the whole board as clear + create
-    // rather than trying to describe the difference. Rare, and always right.
-    const forceFull = this.epoch !== historyEpoch.value;
-    this.epoch = historyEpoch.value;
-
-    const { ops } = diffElements(prev, next, (kind, fields) => this.client.makeOp(kind, fields), forceFull);
+    const { ops } = diffElements(prev, next, (kind, fields) => this.client.makeOp(kind, fields));
     if (ops.length === 0) return;
 
     this.pending.push(...ops);
@@ -215,11 +286,12 @@ export class StoreSync {
     if (this.timer !== null) return;
     this.timer = setTimeout(() => {
       this.timer = null;
-      this._flush();
+      this.flush();
     }, BATCH_MS);
   }
 
-  _flush() {
+  /** Hand everything queued to the client now (collapsed). */
+  flush() {
     if (this.timer !== null) {
       clearTimeout(this.timer);
       this.timer = null;
@@ -229,75 +301,25 @@ export class StoreSync {
     this.pending = [];
     this.client.sendOps(batch);
   }
-}
 
-/**
- * Fold a batch of ops down to one per element.
- *
- * Debouncing the SEND is not enough on its own. A drag produces a real diff
- * on every frame — 60 `update` ops for the same element in 50ms — and
- * sending those is exactly the "collaborative canvas feels laggy" problem:
- * 60 messages a second per peer, each one superseded by the next.
- *
- * Only `update` ops merge, and only for the same `elementId`. Creates,
- * deletes and reorders are NOT collapsed: a create followed by a delete of
- * the same element is a real intent, and collapsing it would mean the server
- * never learns the element existed. Every surviving op keeps its ORIGINAL
- * opId, so the server's opId dedupe still recognises a retried batch.
- *
- * @param {object[]} ops
- * @returns {object[]} a new array, in first-seen order
- */
-export function collapseOps(ops) {
-  // Everything BEFORE a `clear` is dead: a clear wipes the board, so any
-  // create/update/delete ahead of it is overwritten and only costs bytes.
-  // This happens for real when two undos land in one debounce window —
-  // `clear, create, update, clear, create` — where the middle update is
-  // already superseded. Dropping it keeps the batch honest about the final
-  // state instead of shipping ops the server will throw away.
-  const lastClear = ops.reduce((acc, op, i) => (op.kind === 'clear' ? i : acc), -1);
-  const live = lastClear === -1 ? ops : ops.slice(lastClear);
-
-  const out = [];
-  const byElement = new Map();
-
-  for (const op of live) {
-    if (op.kind === 'update' && op.elementId) {
-      const existing = byElement.get(op.elementId);
-      if (existing) {
-        // Same element twice in one window: one op, merged patch, LAST value
-        // wins. The element is sent once with its final geometry, which is
-        // all the server needs to converge.
-        existing.patch = { ...existing.patch, ...op.patch };
-        continue;
-      }
-      const entry = { ...op, patch: { ...op.patch } };
-      byElement.set(op.elementId, entry);
-      out.push(entry);
-      continue;
-    }
-    out.push(op);
+  /** Back-compat alias. */
+  _flush() {
+    this.flush();
   }
-
-  return out;
 }
 
 /**
- * The one instance. Exported as a class too, so a test can drive a fake
- * client through the exact same code path.
+ * The one instance, bound to the realtime singleton. Exported as a class too,
+ * so a test can drive a fake client through the exact same code path.
  */
 export const storeSync = new StoreSync();
 
-/**
- * Start the bridge. Called once by `useRealtime` on connect. Safe to call
- * repeatedly — `start()` is a no-op when already subscribed, which is what
- * makes a StrictMode double-mount safe.
- */
+/** Start the bridge (idempotent). Called by the realtime binding on connect. */
 export function startSync() {
   storeSync.start();
 }
 
-/** Stop the bridge. Called on unmount; flushes first so nothing is lost. */
+/** Stop the bridge. Flushes first so nothing is lost. */
 export function stopSync() {
   storeSync.stop();
 }

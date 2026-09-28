@@ -5,17 +5,18 @@
  * — anything that invalidates the board must invalidate the same key, so
  * these are the only three places a key literal is written.
  *
- * `useApplyOps` is the interesting one. It is the HTTP fallback for ops the
- * WebSocket could not deliver, and the 409 path is the board's resync
- * mechanism. It deliberately does NOT throw into a component: a rev conflict
- * is an expected, recoverable outcome, and a rejected promise in a drag
- * handler produces an unhandled rejection and a red console instead of a
- * quiet resync. It returns a discriminated result the caller can branch on.
+ * `useApplyOps` posts a batch over HTTP (board duplication uses it; the live
+ * editor goes through the WebSocket client). It deliberately does NOT throw
+ * into a component: a rev conflict is an expected, recoverable outcome, and
+ * a rejected promise in an event handler produces an unhandled rejection
+ * instead of a quiet resync. It returns a discriminated result the caller
+ * can branch on.
  */
 
 import { useSyncExternalStore } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, ApiError, getActorId, newId } from './client.js';
+import { useBoardStore } from '../store/boardStore.js';
 
 /* ==========================================================================
    The nickname
@@ -223,9 +224,11 @@ export function useBoard(id, { enabled = true } = {}) {
 }
 
 /**
- * The snapshot endpoint, kept separate from `useBoard` because the resync
- * path invalidates ONLY this key. Invalidating `board` too would refetch
- * metadata nobody needs and make the status bar flicker on every conflict.
+ * The snapshot endpoint: the HTTP seed of a board before the socket's
+ * `ready`. Seed the store with `applyServerSnapshot` from
+ * `realtime/bridge.js` (not a bare `setSnapshot`): it skips a snapshot older
+ * than what the board already shows and keeps unacknowledged local edits.
+ * The live resync path fetches its own snapshot and does not use this cache.
  */
 export function useBoardSnapshot(id, { enabled = true } = {}) {
   return useQuery({
@@ -307,19 +310,79 @@ export function useClaimBoard() {
   });
 }
 
-/** Rename / re-theme a board. */
-export function useUpdateBoard(id) {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: (patch) => api.patch(`/boards/${id}`, patch),
-    onSuccess: (board) => {
-      // Patch the cached copy in place so the title updates without a refetch,
-      // then invalidate the board lists in the background.
-      qc.setQueryData(keys.board(id), (old) => (old ? { ...old, board: { ...old.board, ...board } } : old));
-      qc.invalidateQueries({ queryKey: keys.board(id) });
+/**
+ * The PATCH body for a board edit. Accepts `{title}` / `{theme}` directly, or
+ * the older `{id, patch: {title}}` envelope (a caller once sent that whole
+ * object as the body to `/boards/undefined`). Only rename and theme go through
+ * here; ownership has its own mutation (`useClaimBoard`).
+ *
+ * @param {object} input
+ * @returns {{title?: string, theme?: 'light'|'dark'}}
+ */
+export function boardPatchOf(input) {
+  const src =
+    input && typeof input === 'object'
+      ? input.patch && typeof input.patch === 'object'
+        ? input.patch
+        : input
+      : {};
+  const body = {};
+  if (typeof src.title === 'string') body.title = src.title.trim();
+  if (src.theme === 'light' || src.theme === 'dark') body.theme = src.theme;
+  return body;
+}
+
+/**
+ * The mutation options behind `useUpdateBoard`, as a plain object so the
+ * request and the store update can be tested without React.
+ *
+ * @param {string} id  the board to update (or pass `{id}` in the input)
+ * @param {import('@tanstack/react-query').QueryClient} qc
+ */
+export function updateBoardMutation(id, qc) {
+  return {
+    mutationFn: (input = {}) => {
+      const target = id ?? input?.id;
+      const body = boardPatchOf(input);
+      if (!target) throw new ApiError('Cannot update a board without an id', { status: 0, path: '/boards/' });
+      if (body.title === '') {
+        throw new ApiError('O nome do quadro não pode ficar vazio.', {
+          status: 0,
+          code: 'EMPTY_TITLE',
+          path: `/boards/${target}`,
+        });
+      }
+      if (Object.keys(body).length === 0) {
+        throw new ApiError('Nothing to update (expected title or theme)', { status: 0, path: `/boards/${target}` });
+      }
+      return api.patch(`/boards/${encodeURIComponent(target)}`, body);
+    },
+    onSuccess: (board, input) => {
+      const target = id ?? input?.id ?? board?.id;
+      if (board && typeof board === 'object' && board.id) {
+        const s = useBoardStore.getState();
+        if (s.boardId === board.id) s.setBoard(board);
+        const merge = (old) => (old && old.board ? { ...old, board: { ...old.board, ...board } } : old);
+        qc.setQueryData(keys.board(target), merge);
+        qc.setQueryData(keys.snapshot(target), merge);
+      }
+      // The lists show titles; refresh them in the background.
       qc.invalidateQueries({ queryKey: keys.allBoards });
     },
-  });
+  };
+}
+
+/**
+ * Rename / re-theme a board: `useUpdateBoard(boardId).mutate({title})` sends
+ * `PATCH /boards/<boardId>` with `{title}`.
+ *
+ * On success the store's `board` is updated right away (the header shows the
+ * new title without waiting for anything) and the cached copies are patched;
+ * other people on the board get the server's `{type:'board'}` broadcast.
+ */
+export function useUpdateBoard(id) {
+  const qc = useQueryClient();
+  return useMutation(updateBoardMutation(id, qc));
 }
 
 /** Delete a board and everything on it. */
@@ -343,7 +406,7 @@ export function useDeleteBoard() {
  * an outcome that is entirely routine. `mutateAsync` is wrapped so it always
  * RESOLVES with:
  *
- *   `{ ok: true,  status, rev, applied }`  the batch landed
+ *   `{ ok: true,  status, rev, result }`  the batch landed (`result` is the server's body)
  *   `{ ok: false, code: 'REV_CONFLICT', ... }`  the board moved; resynced
  *   `{ ok: false, code: 'NETWORK', ... }`  never reached the server
  *   `{ ok: false, code: 'HTTP', ... }`  anything else the server rejected
@@ -379,7 +442,7 @@ export function useApplyOps(id) {
           };
         }
 
-        // --- Connection-level failure: the ops are still in the outbox.
+        // --- Connection-level failure: nothing reached the server.
         if (err instanceof ApiError && err.status === 0) {
           return { ok: false, code: 'NETWORK', error: err.message };
         }

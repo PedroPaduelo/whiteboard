@@ -15,11 +15,16 @@
  *  2. **Trailing cursor.** The cursor is rate-limited, but the last position is
  *     always delivered, even if it arrives 2ms after the previous one. Dropping
  *     it freezes the remote ghost short of where the pointer actually is.
+ *  3. **Every batch is acked, exactly once.** Applied, duplicate, conflict,
+ *     missing or error: the client keeps one batch in flight and waits for
+ *     its ack, so a batch that is never answered stalls that client forever.
  */
 
 import websocket from '@fastify/websocket';
-import { API, WS_MSG, validateOps, colorForPeer } from '@whiteboard/shared';
+import fp from 'fastify-plugin';
+import { WS_MSG, OP_RESULT, validateOps, colorForPeer } from '@whiteboard/shared';
 import { Hub } from './hub.js';
+import { rejectionCode } from '../store/ops.js';
 
 /** Must match `config.BODY_LIMIT`, or a big op batch is cut off mid-parse. */
 const MAX_PAYLOAD = 8 * 1024 * 1024;
@@ -49,16 +54,29 @@ function toText(data) {
   return String(data);
 }
 
-/** `'/api' + '/api/ws'` would double the prefix; the route is built once. */
-function joinPath(prefix, suffix) {
-  if (!prefix) return suffix;
-  if (suffix.startsWith(prefix)) return suffix;
-  return `${prefix.replace(/\/+$/, '')}${suffix}`;
+/**
+ * The socket route: `${apiPrefix}/ws`, next to the REST routes it belongs
+ * with (`/api/ws` by default, `/v1/ws` for API_PREFIX=/v1, `/ws` for an empty
+ * prefix). No config at all means the default prefix.
+ */
+export function wsPath(apiPrefix) {
+  const prefix = typeof apiPrefix === 'string' ? apiPrefix.replace(/\/+$/, '') : '/api';
+  return `${prefix}/ws`;
 }
 
 /**
- * Registered as a normal Fastify plugin, so it gets the whole instance and may
- * decorate it. `app.js` calls it as
+ * The ack body for a store result. The full element list is dropped: the
+ * sender already holds its optimistic state, and shipping the whole board on
+ * every drag frame is O(board) bandwidth per 16ms. REST keeps `elements`.
+ */
+function ackResult(result) {
+  const { elements, ...rest } = result ?? {};
+  return rest;
+}
+
+/**
+ * The plugin body. The default export wraps it with fastify-plugin (see the
+ * bottom of this file). `app.js` calls it as
  * `app.register(websocketPlugin, { config, store, hub })` and mounts REST under
  * `config.apiPrefix`; this route lives on the ROOT scope, so it has to spell
  * the prefix out itself.
@@ -81,7 +99,7 @@ export async function wsPlugin(fastify, opts = {}) {
   const peerTtlMs = opts.peerTtlMs ?? config?.wsPeerTtlMs ?? 30_000;
   const cursorRateMs = opts.cursorRateMs ?? config?.wsCursorRateMs ?? 33;
   const maxPayload = opts.maxPayload ?? config?.bodyLimit ?? MAX_PAYLOAD;
-  const path = opts.path ?? joinPath(config?.apiPrefix, API.WS);
+  const path = opts.path ?? wsPath(config ? config.apiPrefix : undefined);
 
   const store = opts.store ?? fastify.store;
   if (!store || typeof store.getSnapshot !== 'function') {
@@ -362,19 +380,46 @@ export async function wsPlugin(fastify, opts = {}) {
     try {
       ops = validateOps(message.ops);
     } catch (err) {
-      // Rejected without touching the store: nothing is half-applied, and the
-      // client keeps its optimistic state to re-send from.
+      // Rejected without touching the store: nothing is half-applied. The
+      // client must DROP this batch (re-sending it can only fail again).
       hub.send(peer, {
         type: WS_MSG.OP_ACK,
-        result: { status: 'error', message: err?.message ?? 'invalid ops' },
+        result: {
+          status: OP_RESULT.ERROR,
+          message: err?.message ?? 'invalid ops',
+          code: 'VALIDATION_FAILED',
+          applied: [],
+        },
       });
       return;
     }
 
     const boardId = session.boardId;
-    const result = await store.applyOps(boardId, ops, peer.id);
+    let result;
+    try {
+      result = await store.applyOps(boardId, ops, peer.id);
+    } catch (err) {
+      // The store refused the batch as a whole (duplicate element id, MAX_ELS,
+      // an update whose merged element is invalid) or failed outright. It
+      // rolled everything back, so the board is untouched; the sender still
+      // needs an answer or its outbox stalls behind this batch forever.
+      const code = rejectionCode(err) ?? 'INTERNAL';
+      if (code === 'INTERNAL') {
+        fastify.log.error({ err: err?.message, peerId: peer.id, boardId }, 'ws: applyOps failed');
+      }
+      hub.send(peer, {
+        type: WS_MSG.OP_ACK,
+        result: {
+          status: OP_RESULT.ERROR,
+          message: err?.message ?? 'ops rejected',
+          code,
+          applied: [],
+        },
+      });
+      return;
+    }
 
-    hub.send(peer, { type: WS_MSG.OP_ACK, result });
+    hub.send(peer, { type: WS_MSG.OP_ACK, result: ackResult(result) });
 
     if (result.status === 'applied' || result.status === 'duplicate') {
       // ECHO SUPPRESSED: everyone but the sender, who already drew it.
@@ -394,10 +439,10 @@ export async function wsPlugin(fastify, opts = {}) {
       return;
     }
 
-    // conflict / missing: the sender lost its race. Tell the WHOLE room to
-    // refetch, the sender included, so its optimistic state is replaced by the
-    // truth instead of silently diverging.
-    hub.broadcast(boardId, { type: WS_MSG.RESYNC, boardId, rev: result.rev ?? 0 }, null);
+    // conflict / missing: only the SENDER lost its race, so only the sender
+    // refetches. Telling the whole room made every other peer throw away its
+    // own unacked edits over someone else's stale batch.
+    hub.send(peer, { type: WS_MSG.RESYNC, boardId, rev: result.rev ?? 0 });
   }
 
   function onCursor(session, message) {
@@ -490,4 +535,13 @@ export async function wsPlugin(fastify, opts = {}) {
   return hub;
 }
 
-export default wsPlugin;
+/**
+ * Registered WITHOUT encapsulation (fastify-plugin), so @fastify/websocket's
+ * hooks live on the root scope. That matters for an upgrade request to a path
+ * that is not the socket route (a stale client, a scanner): the root 404
+ * handler answers it, and only a root-level `onResponse` hook destroys the
+ * upgrade socket afterwards. Encapsulated, that socket stayed half-open and
+ * `app.close()` waited on it forever (graceful shutdown hit its hard timeout).
+ * It also makes every REST route close a stray upgrade instead of serving it.
+ */
+export default fp(wsPlugin, { name: 'whiteboard-ws', fastify: '5.x' });

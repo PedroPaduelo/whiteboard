@@ -1,432 +1,384 @@
 /**
- * shortcuts.js — the single source of truth for keyboard behaviour.
+ * shortcuts.js — the keyboard map, as data.
  *
- * Every key binding in the app lives in `SHORTCUTS` as data. The global
- * handler installed by App.jsx walks this array; Toolbar.jsx reads it to draw
- * the hint badge next to each tool button; HelpOverlay.jsx renders it as the
- * shortcut sheet. None of those three can drift from the bindings, because
- * none of them own a key.
+ * ONE table (`SHORTCUTS`) drives both the global keydown handler (App.jsx →
+ * `runShortcut`) and the help dialog (`groupedShortcuts`), and the tool rows
+ * are derived from editor/tools.js TOOLBAR, so the digit badge on a tool
+ * button, the help sheet and the key that actually selects the tool cannot
+ * disagree.
  *
- * A handler is `({ store, ui, event }) => void`, where:
- *   store  — the board store: `getState()` plus every documented action
- *   ui     — shell-level intents App owns (open help, export, theme, …)
- *   event  — the original KeyboardEvent, for `preventDefault` decisions
+ * A binding is:
+ *   { id, group, label, keys: string[], handler({store, ui, actions, event}),
+ *     when?(ctx) => boolean, native?: true, hold?: true, allowInInput?: true,
+ *     repeat?: false, display?: string[] }
+ * `keys` lists alternative chords like 'Mod+Shift+Z' or '?'. A handler may
+ * return `false` to say "not handled" — the event then keeps its default and
+ * the next binding gets a chance. `native` bindings (Ctrl+C/X/V) are shown in
+ * help but never run from keydown: the real copy/cut/paste events do the work,
+ * so this handler must not preventDefault them. `hold` rows are help-only.
  *
- * Handlers must be defensive: the store may not be hydrated yet, and a
- * binding must never throw just because there is nothing selected.
+ * Key matching (`matchesEvent`):
+ *   - letters: `event.key` when it is a Latin letter, else `event.code`
+ *     (`KeyZ`), so Cyrillic/Greek/… layouts and Alt/Option-mangled keys
+ *     (⌥D = "∂") still hit the right binding;
+ *   - digits: `event.code` (`Digit1`/`Numpad1`) first, so Shift+1 (= "!")
+ *     and AZERTY's unshifted digit row work;
+ *   - symbols: the character itself or its shifted twin (`[`/`{`); Shift is
+ *     ignored for '?', '=' and '-', which need Shift on many layouts;
+ *   - modifiers are exact: 'Mod' is Ctrl or ⌘, and an unnamed modifier held
+ *     down means no match (Ctrl+Z is not Z).
  */
 
-import { TOOLS } from '@whiteboard/shared';
+import { TOOLBAR } from '../editor/tools.js';
+import { NUDGE, NUDGE_SHIFT } from '../editor/constants.js';
+import { actions as editorActions } from '../editor/actions.js';
+import { t } from './strings.js';
 
-/* --- key normalisation ----------------------------------------------------- */
+const DEV = (() => {
+  try {
+    return Boolean(import.meta.env?.DEV);
+  } catch {
+    return false;
+  }
+})();
 
-/** Canonical name for a modifier flag, whatever the event actually reports. */
-const MODS = {
-  ctrl: (e) => e.ctrlKey,
-  // Cmd on macOS is the same intent as Ctrl everywhere else; `matchesEvent`
-  // treats them as interchangeable so a Mac user does not have to learn a
-  // second vocabulary.
-  mod: (e) => e.ctrlKey || e.metaKey,
-  meta: (e) => e.metaKey,
-  shift: (e) => e.shiftKey,
-  alt: (e) => e.altKey,
+/* ------------------------------------------------------------------ *
+ * Matching
+ * ------------------------------------------------------------------ */
+
+/** Symbol tokens: accepted characters, physical-code fallback, Shift policy. */
+const SYMBOLS = {
+  '?': { chars: ['?'], codes: ['Slash', 'IntlRo'], shiftAgnostic: true },
+  '=': { chars: ['=', '+'], codes: ['Equal', 'NumpadAdd'], shiftAgnostic: true },
+  '-': { chars: ['-', '_'], codes: ['Minus', 'NumpadSubtract'], shiftAgnostic: true },
+  '[': { chars: ['[', '{'], codes: ['BracketLeft'] },
+  ']': { chars: [']', '}'], codes: ['BracketRight'] },
+  "'": { chars: ["'", '"'], codes: ['Quote'] },
 };
 
-/** Human-facing names for the keys we actually bind. */
-const KEY_ALIASES = {
-  Mod: 'Ctrl',
-  Ctrl: 'Ctrl',
-  Meta: 'Cmd',
-  Cmd: 'Cmd',
-  Shift: 'Shift',
-  Alt: 'Alt',
-  Esc: 'Esc',
-  Escape: 'Esc',
-  Del: 'Delete',
-  Delete: 'Delete',
-  Backspace: 'Delete',
-  Space: 'Space',
-  Enter: 'Enter',
-  Tab: 'Tab',
-  Question: '?',
-};
+const MODIFIER_TOKENS = new Set(['Mod', 'Shift', 'Alt']);
 
-function isModifier(key) {
-  return Object.prototype.hasOwnProperty.call(MODS, key);
-}
-
-/** "Escape" / "?" / "A" all reduce to a single comparable token. */
-function keyToken(event) {
-  const k = event.key;
-  if (!k) return '';
-  return k.length === 1 ? k.toLowerCase() : k.toLowerCase();
-}
-
-/* --- helpers ---------------------------------------------------------------- */
-
-/** True when the event target is a text-entry surface. */
+/** True when the event target is a text-entry surface (keys belong to it). */
 export function isTypingTarget(target) {
-  if (!target || !target.tagName) return false;
-  const tag = target.tagName.toUpperCase();
-  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
-  return target.isContentEditable === true;
+  if (!target || typeof target !== 'object') return false;
+  if (target.isContentEditable) return true;
+  const tag = String(target.tagName || '').toUpperCase();
+  if (tag === 'TEXTAREA' || tag === 'SELECT') return true;
+  if (tag === 'INPUT') {
+    const type = String(target.type || 'text').toLowerCase();
+    return !['button', 'checkbox', 'radio', 'range', 'color', 'submit', 'reset', 'file', 'image'].includes(type);
+  }
+  return false;
 }
 
 /**
- * Does `event` match the `keys` chord?
- *
- * A chord is a list like `['Mod', 'z']` or `['Shift', '?']` or `['1']`.
- * Modifier requirements are exact: a binding on `['z']` does NOT fire on
- * Ctrl+Z, because that would shadow the undo binding. Conversely a binding on
- * `['Mod','z']` requires at least one of Ctrl/Meta and nothing more.
- *
- * `allowInInput` opts a binding into firing while someone is typing — only
- * Escape ever sets it, and only because it must also dismiss a dialog.
+ * True when the target is a focused control that owns Enter/Space/arrows
+ * itself: a button (Enter clicks it), a slider, a menu or radio group (arrows
+ * move within it). Shortcuts on those keys must not steal them.
  */
-export function matchesEvent(event, keys, { allowInInput = false } = {}) {
-  if (!event || !Array.isArray(keys) || keys.length === 0) return false;
-  if (!allowInInput && isTypingTarget(event.target)) return false;
-
-  const wanted = keys.map((k) => (isModifier(k) ? k : String(k).toLowerCase()));
-  const wantKey = wanted.find((k) => !isModifier(k));
-  const wantMods = wanted.filter(isModifier);
-
-  // Every modifier the binding names must be physically down…
-  for (const m of wantMods) {
-    if (!MODS[m](event)) return false;
-  }
-  // …and no *extra* modifier may be down. `mod` is satisfied by either Ctrl
-  // or Meta, so pressing both is still not "extra".
-  for (const m of ['ctrl', 'meta', 'shift', 'alt']) {
-    const named = wantMods.includes(m) || (wantMods.includes('mod') && m !== 'shift' && m !== 'alt');
-    if (MODS[m](event) && !named) return false;
-  }
-
-  if (!wantKey) return true; // a pure modifier chord
-  return keyToken(event) === wantKey;
+export function isControlTarget(target) {
+  if (!target || typeof target !== 'object') return false;
+  const tag = String(target.tagName || '').toUpperCase();
+  if (tag === 'BUTTON' || tag === 'A' || tag === 'SUMMARY' || tag === 'SELECT') return true;
+  if (tag === 'INPUT') return true;
+  const role = typeof target.getAttribute === 'function' ? target.getAttribute('role') : null;
+  if (role && /^(button|menuitem|menuitemradio|menuitemcheckbox|option|radio|slider|tab|switch|checkbox)$/.test(role)) return true;
+  return typeof target.closest === 'function' && Boolean(target.closest('[role="menu"],[role="listbox"],[role="radiogroup"],[role="dialog"] [role="slider"]'));
 }
 
-/** `['Mod','z']` → `"Ctrl+Z"`, `['Shift','?']` → `"Shift+?"`. */
-export function formatKeys(keys) {
-  if (!Array.isArray(keys)) return '';
-  return keys
-    .map((k) => {
-      if (isModifier(k)) return KEY_ALIASES[k] ?? k;
-      return KEY_ALIASES[k] ?? String(k);
-    })
-    .join('+');
+const CONTROL_KEYS = new Set(['Enter', ' ', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Home', 'End']);
+
+/** Split 'Mod+Shift+Z' into modifiers and the key token. '+' alone is not used. */
+export function parseChord(chord) {
+  const parts = String(chord).split('+');
+  const mods = new Set();
+  let key = '';
+  for (const p of parts) {
+    if (MODIFIER_TOKENS.has(p)) mods.add(p);
+    else key = p;
+  }
+  return { mods, key };
 }
 
-/* --- the table --------------------------------------------------------------
-   Order within a group is the order the help sheet shows. `id` is unique and
-   is what Toolbar looks up when it wants a hint badge.
-   -------------------------------------------------------------------------- */
+const isPrintableAscii = (k) => typeof k === 'string' && k.length === 1 && k >= ' ' && k <= '~';
 
-const TOOL_KEY_BY_TOOL = {
-  select: 'v',
-  hand: 'h',
-  pen: 'p',
-  rect: 'r',
-  ellipse: 'o',
-  diamond: 'd',
-  cylinder: 'c',
-  sticky: 's',
-  text: 't',
-  arrow: 'a',
-  line: 'l',
-  eraser: 'e',
+/** The Latin letter an event stands for, by key or (non-Latin layouts) by code. */
+function letterOf(event) {
+  const k = event.key;
+  if (typeof k === 'string' && /^[a-zA-Z]$/.test(k)) return k.toLowerCase();
+  const m = /^Key([A-Z])$/.exec(event.code || '');
+  return m ? m[1].toLowerCase() : null;
+}
+
+function keyMatches(event, key) {
+  if (!key) return false;
+  if (/^[a-zA-Z]$/.test(key)) return letterOf(event) === key.toLowerCase();
+  if (/^[0-9]$/.test(key)) {
+    const code = event.code || '';
+    if (code === `Digit${key}` || code === `Numpad${key}`) return true;
+    return !code && event.key === key;
+  }
+  const sym = SYMBOLS[key];
+  if (sym) {
+    if (sym.chars.includes(event.key)) return true;
+    return !isPrintableAscii(event.key) && sym.codes.includes(event.code);
+  }
+  return event.key === key; // named keys: Delete, Escape, ArrowUp…
+}
+
+/** Does `event` match one chord ('Mod+Z', '?', 'Shift+1', 'Delete')? */
+export function matchesChord(event, chord) {
+  if (!event) return false;
+  const { mods, key } = parseChord(chord);
+  const mod = Boolean(event.ctrlKey || event.metaKey);
+  if (mods.has('Mod') !== mod) return false;
+  if (mods.has('Alt') !== Boolean(event.altKey)) return false;
+  const shiftAgnostic = Boolean(SYMBOLS[key]?.shiftAgnostic) && !mods.has('Shift');
+  if (!shiftAgnostic && mods.has('Shift') !== Boolean(event.shiftKey)) return false;
+  return keyMatches(event, key);
+}
+
+/** Does `event` match any of `keys` (a chord or a list of alternative chords)? */
+export function matchesEvent(event, keys) {
+  const list = Array.isArray(keys) ? keys : [keys];
+  return list.some((chord) => matchesChord(event, chord));
+}
+
+/* ------------------------------------------------------------------ *
+ * Display
+ * ------------------------------------------------------------------ */
+
+const IS_MAC =
+  typeof navigator !== 'undefined' && /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAgent || '');
+
+const KEY_NAMES = {
+  Mod: IS_MAC ? '⌘' : 'Ctrl',
+  Shift: 'Shift',
+  Alt: IS_MAC ? '⌥' : 'Alt',
+  Delete: 'Delete',
+  Backspace: 'Backspace',
+  Escape: 'Esc',
+  Enter: 'Enter',
+  Space: 'Espaço',
+  ArrowUp: '↑',
+  ArrowDown: '↓',
+  ArrowLeft: '←',
+  ArrowRight: '→',
+  '=': '+',
 };
 
-const TOOL_LABEL = {
-  select: 'Select',
-  hand: 'Pan',
-  pen: 'Pen',
-  rect: 'Rectangle',
-  ellipse: 'Ellipse',
-  diamond: 'Diamond',
-  cylinder: 'Database',
-  sticky: 'Sticky note',
-  text: 'Text',
-  arrow: 'Arrow',
-  line: 'Line',
-  eraser: 'Eraser',
-};
+/** 'Mod+Shift+Z' -> ['Ctrl', 'Shift', 'Z'] (the key caps the help dialog draws). */
+export function formatChord(chord) {
+  return String(chord)
+    .split('+')
+    .filter(Boolean)
+    .map((p) => KEY_NAMES[p] ?? (p.length === 1 ? p.toUpperCase() : p));
+}
 
-/** Digit shortcuts, in TOOLS order: 1 → select … 9 → eraser. */
-const TOOL_DIGITS = ['1', '2', '3', '4', '5', '6', '7', '8', '9'];
+/** 'Mod+Shift+Z' -> 'Ctrl+Shift+Z' (tooltips). */
+export function formatKeys(chord) {
+  return formatChord(chord).join('+');
+}
 
-const toolDigitBindings = TOOLS.map((tool, i) => ({
-  id: `tool.${tool}.digit`,
-  keys: [TOOL_DIGITS[i]],
-  label: TOOL_LABEL[tool],
-  group: 'Tools',
-  allowInInput: false,
-  handler: ({ store }) => store.setTool(tool),
+/* ------------------------------------------------------------------ *
+ * The table
+ * ------------------------------------------------------------------ */
+
+const GROUP = { tools: 'tools', edit: 'edit', view: 'view', board: 'board' };
+
+/** The chords that select a TOOLBAR tool: its letter, then its digit. */
+export function toolChords(tool) {
+  return [tool.key, tool.digit].filter(Boolean).map((k) => k.toUpperCase());
+}
+
+const toolBindings = TOOLBAR.map((tool) => ({
+  id: `tool.${tool.id}`,
+  group: GROUP.tools,
+  label: t.tools[tool.id] ?? tool.id,
+  keys: toolChords(tool),
+  repeat: false,
+  handler: ({ actions }) => actions.selectTool(tool.id),
 }));
 
-const toolLetterBindings = TOOLS.map((tool) => ({
-  id: `tool.${tool}.letter`,
-  keys: [TOOL_KEY_BY_TOOL[tool]],
-  label: `${TOOL_LABEL[tool]} tool`,
-  group: 'Tools',
-  allowInInput: false,
-  handler: ({ store }) => store.setTool(tool),
-}));
+const ARROW_DELTAS = { ArrowUp: [0, -1], ArrowDown: [0, 1], ArrowLeft: [-1, 0], ArrowRight: [1, 0] };
 
 export const SHORTCUTS = [
-  /* --- Tools ------------------------------------------------------------- */
-  ...toolDigitBindings,
-  ...toolLetterBindings,
+  /* --- tools ------------------------------------------------------------- */
+  ...toolBindings,
   {
-    id: 'tool.select.escape',
-    keys: ['Escape'],
-    label: 'Back to select / close dialogs',
-    group: 'Tools',
-    allowInInput: true,
-    handler: ({ store, ui }) => {
-      // Escape is overloaded: it dismisses the topmost dialog, and only
-      // reaches the canvas when nothing is open.
-      if (ui.closeTopOverlay()) return;
-      store.setTool('select');
-    },
+    id: 'tool.lock',
+    group: GROUP.tools,
+    label: t.actions.toggleToolLock,
+    keys: ['Q'],
+    repeat: false,
+    handler: ({ store }) => store.toggleToolLocked(),
   },
-  {
-    id: 'view.pan.space',
-    keys: ['Space'],
-    label: 'Pan (hold)',
-    group: 'Tools',
-    allowInInput: false,
-    hold: true,
-    handler: () => {},
-  },
-  {
-    id: 'view.pan.middle',
-    keys: ['middle'],
-    label: 'Pan (middle-drag)',
-    group: 'Tools',
-    allowInInput: false,
-    hold: true,
-    handler: () => {},
-  },
-  {
-    id: 'tool.select.digitZero',
-    keys: ['0'],
-    label: 'Select tool',
-    group: 'Tools',
-    allowInInput: false,
-    handler: ({ store }) => store.setTool('select'),
-  },
+  { id: 'view.pan.space', group: GROUP.tools, label: t.actions.pan, keys: ['Space'], hold: true, handler: () => false },
 
-  /* --- Editing ----------------------------------------------------------- */
-  {
-    id: 'edit.undo',
-    keys: ['Mod', 'z'],
-    label: 'Undo',
-    group: 'Editing',
-    handler: ({ store }) => store.undo(),
-  },
-  {
-    id: 'edit.redo',
-    keys: ['Mod', 'Shift', 'z'],
-    label: 'Redo',
-    group: 'Editing',
-    handler: ({ store }) => store.redo(),
-  },
-  {
-    id: 'edit.redo.y',
-    keys: ['Mod', 'y'],
-    label: 'Redo (Ctrl+Y)',
-    group: 'Editing',
-    handler: ({ store }) => store.redo(),
-  },
-  {
-    id: 'edit.selectAll',
-    keys: ['Mod', 'a'],
-    label: 'Select all',
-    group: 'Editing',
-    handler: ({ store }) => store.select(store.getState().elements.map((e) => e.id)),
-  },
+  /* --- editing ------------------------------------------------------------ */
+  { id: 'edit.undo', group: GROUP.edit, label: t.actions.undo, keys: ['Mod+Z'], handler: ({ store }) => store.undo() },
+  { id: 'edit.redo', group: GROUP.edit, label: t.actions.redo, keys: ['Mod+Shift+Z', 'Mod+Y'], handler: ({ store }) => store.redo() },
+  { id: 'edit.selectAll', group: GROUP.edit, label: t.actions.selectAll, keys: ['Mod+A'], handler: ({ actions }) => void actions.selectAll() },
+  { id: 'edit.duplicate', group: GROUP.edit, label: t.actions.duplicate, keys: ['Mod+D'], handler: ({ actions }) => void actions.duplicateSelection() },
+  { id: 'edit.copy', group: GROUP.edit, label: t.actions.copy, keys: ['Mod+C'], native: true, handler: () => false },
+  { id: 'edit.cut', group: GROUP.edit, label: t.actions.cut, keys: ['Mod+X'], native: true, handler: () => false },
+  { id: 'edit.paste', group: GROUP.edit, label: t.actions.paste, keys: ['Mod+V'], native: true, handler: () => false },
   {
     id: 'edit.delete',
-    keys: ['Delete'],
-    label: 'Delete selection',
-    group: 'Editing',
-    // This is the SINGLE owner of Delete. React Flow's own `deleteKeyCode`
-    // is set to null on the flow layer, and the canvas no longer binds a
-    // keydown handler for it — two handlers racing on one keystroke is what
-    // made deletion unreliable before.
-    //
-    // `commit` FIRST, per the store's rule: a mutation without a preceding
-    // commit still deletes the elements but leaves nothing on the undo stack,
-    // so the delete could not be taken back.
-    handler: ({ store }) => {
-      const ids = [...store.getState().selection];
-      if (ids.length) {
-        store.commit('delete');
-        store.removeElements(ids);
+    group: GROUP.edit,
+    label: t.actions.delete,
+    keys: ['Delete', 'Backspace'],
+    // commit('delete') -> removeElements(ids) -> clearSelection(): undoable,
+    // and never leaves a stale selection behind.
+    handler: ({ store }) => void editorActions.deleteSelection(store),
+  },
+  {
+    id: 'edit.nudge',
+    group: GROUP.edit,
+    label: t.actions.nudge,
+    keys: ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Shift+ArrowUp', 'Shift+ArrowDown', 'Shift+ArrowLeft', 'Shift+ArrowRight'],
+    display: ['ArrowUp', 'Shift+ArrowUp'],
+    handler: ({ actions, event }) => {
+      const d = ARROW_DELTAS[event?.key];
+      if (!d) return false;
+      const step = event.shiftKey ? NUDGE_SHIFT : NUDGE;
+      return actions.nudge(d[0] * step, d[1] * step);
+    },
+  },
+  { id: 'edit.group', group: GROUP.edit, label: t.actions.group, keys: ['Mod+G'], handler: ({ actions }) => void actions.group() },
+  { id: 'edit.ungroup', group: GROUP.edit, label: t.actions.ungroup, keys: ['Mod+Shift+G'], handler: ({ actions }) => void actions.ungroup() },
+  {
+    id: 'edit.lock',
+    group: GROUP.edit,
+    label: `${t.actions.lock} / ${t.actions.unlock}`,
+    keys: ['Mod+Shift+L'],
+    repeat: false,
+    handler: ({ actions }) => void actions.toggleLock(),
+  },
+  { id: 'edit.forward', group: GROUP.edit, label: t.actions.bringForward, keys: ['Mod+]'], handler: ({ actions }) => void actions.bringForward() },
+  { id: 'edit.backward', group: GROUP.edit, label: t.actions.sendBackward, keys: ['Mod+['], handler: ({ actions }) => void actions.sendBackward() },
+  { id: 'edit.front', group: GROUP.edit, label: t.actions.bringToFront, keys: ['Mod+Shift+]'], handler: ({ actions }) => void actions.bringToFront() },
+  { id: 'edit.back', group: GROUP.edit, label: t.actions.sendToBack, keys: ['Mod+Shift+['], handler: ({ actions }) => void actions.sendToBack() },
+  {
+    id: 'edit.enter',
+    group: GROUP.edit,
+    label: t.actions.editText,
+    keys: ['Enter'],
+    handler: ({ actions }) => actions.editSelected(),
+  },
+  {
+    id: 'edit.escape',
+    group: GROUP.edit,
+    label: t.actions.escape,
+    keys: ['Escape'],
+    allowInInput: true,
+    // Close overlay -> finish text edit -> clear selection -> select tool.
+    handler: ({ store, ui, event }) => {
+      if (ui?.closeTopOverlay?.()) return true;
+      // Escape inside a field (board title, library search) belongs to it.
+      if (isTypingTarget(event?.target)) return false;
+      const s = store.getState();
+      if (s.editingId) {
+        // Blur the editor so it COMMITS what was typed (TextEditor commits on
+        // blur); only without one on screen is the stale edit state dropped.
+        const editor = globalThis.document?.querySelector?.('[data-testid="text-editor"]');
+        if (editor) editor.blur();
+        else store.setEditing(null);
+        return true;
       }
-      // Clear the selection either way. `removeElements` prunes it, but a
-      // Delete on an empty selection still has to drop a stale one, and
-      // leaving a selection behind after the elements are gone means the next
-      // Delete acts on nothing.
-      store.clearSelection();
+      if (s.selection && s.selection.size > 0) {
+        store.clearSelection();
+        return true;
+      }
+      if (s.tool !== 'select') {
+        store.setTool('select');
+        return true;
+      }
+      return false;
     },
   },
-  {
-    id: 'edit.duplicate',
-    keys: ['Mod', 'd'],
-    label: 'Duplicate selection',
-    group: 'Editing',
-    handler: ({ ui }) => ui.duplicateSelection(),
-  },
-  {
-    id: 'edit.copy',
-    keys: ['Mod', 'c'],
-    label: 'Copy selection',
-    group: 'Editing',
-    handler: ({ ui }) => ui.copySelection(),
-  },
-  {
-    id: 'edit.cut',
-    keys: ['Mod', 'x'],
-    label: 'Cut selection',
-    group: 'Editing',
-    handler: ({ ui }) => ui.cutSelection(),
-  },
-  {
-    id: 'edit.paste',
-    keys: ['Mod', 'v'],
-    label: 'Paste',
-    group: 'Editing',
-    handler: ({ ui }) => ui.pasteClipboard(),
-  },
 
-  /* --- View -------------------------------------------------------------- */
-  {
-    id: 'view.zoomReset',
-    keys: ['Mod', '0'],
-    label: 'Reset zoom to 100%',
-    group: 'View',
-    handler: ({ store }) => store.resetView(),
-  },
-  {
-    id: 'view.zoomFit',
-    keys: ['Mod', '1'],
-    label: 'Zoom to fit content',
-    group: 'View',
-    handler: ({ store }) => store.fitToContent(),
-  },
-  {
-    id: 'view.zoomIn',
-    keys: ['+', '='],
-    label: 'Zoom in',
-    group: 'View',
-    handler: ({ ui }) => ui.zoomStep(1),
-  },
-  {
-    id: 'view.zoomOut',
-    keys: ['-', '_'],
-    label: 'Zoom out',
-    group: 'View',
-    handler: ({ ui }) => ui.zoomStep(-1),
-  },
-  {
-    id: 'view.grid',
-    keys: ['g'],
-    label: 'Toggle grid',
-    group: 'View',
-    handler: ({ store }) => {
-      const { gridSize } = store.getState();
-      store.setGridSize(gridSize > 0 ? 0 : 20);
-    },
-  },
-  {
-    id: 'view.snap',
-    keys: ['k'],
-    label: 'Toggle snapping',
-    group: 'View',
-    handler: ({ store }) => store.toggleSnap(),
-  },
-  {
-    id: 'view.help',
-    keys: ['?'],
-    label: 'This shortcut sheet',
-    group: 'View',
-    handler: ({ ui }) => ui.toggleHelp(),
-  },
+  /* --- view ------------------------------------------------------------- */
+  { id: 'view.zoomIn', group: GROUP.view, label: t.actions.zoomIn, keys: ['Mod+='], handler: ({ actions }) => actions.zoomIn() },
+  { id: 'view.zoomOut', group: GROUP.view, label: t.actions.zoomOut, keys: ['Mod+-'], handler: ({ actions }) => actions.zoomOut() },
+  { id: 'view.zoomReset', group: GROUP.view, label: t.actions.resetZoom, keys: ['Mod+0'], handler: ({ actions }) => actions.resetZoom() },
+  { id: 'view.zoomFit', group: GROUP.view, label: t.actions.zoomToFit, keys: ['Shift+1'], handler: ({ actions }) => actions.zoomToFit() },
+  { id: 'view.zoomSelection', group: GROUP.view, label: t.actions.zoomToSelection, keys: ['Shift+2'], handler: ({ actions }) => actions.zoomToSelection() },
+  { id: 'view.wheel', group: GROUP.view, label: t.actions.wheelZoom, keys: ['Mod+Wheel'], hold: true, display: ['Mod+Roda'], handler: () => false },
+  { id: 'view.grid', group: GROUP.view, label: t.actions.toggleGrid, keys: ["Mod+'"], repeat: false, handler: ({ actions }) => actions.toggleGrid() },
+  { id: 'view.theme', group: GROUP.view, label: t.actions.toggleTheme, keys: ['Alt+Shift+D'], repeat: false, handler: ({ ui }) => ui.toggleTheme() },
+  { id: 'view.help', group: GROUP.view, label: t.actions.help, keys: ['?'], repeat: false, handler: ({ ui }) => ui.toggle('helpOpen') },
 
-  /* --- Board ------------------------------------------------------------- */
-  {
-    id: 'board.share',
-    keys: ['Mod', 'Shift', 'l'],
-    label: 'Copy share link',
-    group: 'Board',
-    handler: ({ ui }) => ui.copyShareLink(),
-  },
-  {
-    id: 'board.export',
-    keys: ['Mod', 'Shift', 'e'],
-    label: 'Export / import',
-    group: 'Board',
-    handler: ({ ui }) => ui.toggleExport(),
-  },
-  {
-    id: 'board.boards',
-    keys: ['Mod', 'Shift', 'b'],
-    label: 'All boards',
-    group: 'Board',
-    handler: ({ ui }) => ui.goToBoardList(),
-  },
-  {
-    id: 'board.theme',
-    keys: ['Mod', 'Shift', 'd'],
-    label: 'Toggle dark mode',
-    group: 'Board',
-    handler: ({ ui }) => ui.toggleTheme(),
-  },
+  /* --- board -------------------------------------------------------------- */
+  { id: 'board.export', group: GROUP.board, label: t.actions.exportImage, keys: ['Mod+Shift+E'], repeat: false, handler: ({ ui }) => ui.toggle('exportOpen') },
+  { id: 'board.save', group: GROUP.board, label: t.actions.save, keys: ['Mod+S'], repeat: false, handler: ({ actions }) => actions.saveToFile() },
+  { id: 'board.open', group: GROUP.board, label: t.actions.open, keys: ['Mod+O'], repeat: false, handler: ({ ui }) => (ui.openFile ? ui.openFile() : false) },
 ];
 
-/* --- lookups used by the Toolbar's hint badges ---------------------------- */
+/** Binding by id. */
+export const SHORTCUT_BY_ID = Object.freeze(Object.fromEntries(SHORTCUTS.map((s) => [s.id, s])));
 
-/** The primary (single) binding to advertise for a tool: its letter key. */
-export function hintForTool(tool) {
-  const binding = SHORTCUTS.find((s) => s.id === `tool.${tool}.letter`);
-  return binding ? binding.keys[0] : '';
-}
+/** Help dialog order. */
+export const SHORTCUT_GROUPS = [GROUP.tools, GROUP.edit, GROUP.view, GROUP.board];
 
-/** The digit for a tool, if it has one. */
-export function digitForTool(tool) {
-  const i = TOOLS.indexOf(tool);
-  return i >= 0 && i < TOOL_DIGITS.length ? TOOL_DIGITS[i] : '';
-}
-
-export const TOOL_LABELS = TOOL_LABEL;
-
-/** Ordered group names for the help sheet. */
-export const SHORTCUT_GROUPS = ['Tools', 'Editing', 'View', 'Board'];
-
-/** Bindings grouped for rendering, dropping the hold-only pseudo bindings. */
+/**
+ * Bindings grouped for the help dialog: `{group, title, items: [{id, label,
+ * chords: string[][]}]}` — each chord already formatted into key caps.
+ */
 export function groupedShortcuts() {
   return SHORTCUT_GROUPS.map((group) => ({
     group,
-    items: SHORTCUTS.filter((s) => s.group === group && !s.hold),
-  })).filter((g) => g.items.length > 0);
+    title: t.help.groups[group] ?? group,
+    items: SHORTCUTS.filter((s) => s.group === group).map((s) => ({
+      id: s.id,
+      label: s.label,
+      chords: (s.display ?? s.keys).map(formatChord),
+    })),
+  }));
+}
+
+/** The first chord of a binding, formatted for a tooltip ('Ctrl+D'). */
+export function shortcutHint(id) {
+  const s = SHORTCUT_BY_ID[id];
+  if (!s || !s.keys.length) return '';
+  return (s.display ?? s.keys).map(formatKeys).join(` ${t.help.or} `);
 }
 
 /**
- * Run the first binding that matches. Returns the binding's id, or null.
- * A handler that throws is swallowed: one broken shortcut must not take down
- * the whole keyboard listener for every other binding.
+ * Run the first binding matching `event`. Returns the binding id when a
+ * handler handled it (the caller then preventDefaults), else null — so a key
+ * nothing handled keeps its browser default.
+ *
+ * `ctx` = `{store, ui, actions}`; `actions` defaults to editor/actions.js.
+ * A handler that throws is reported with console.error (never silently) and
+ * counts as not handled; in development it is re-thrown so it cannot hide.
+ *
+ * @param {KeyboardEvent} event
+ * @param {{store:object, ui?:object, actions?:object}} ctx
+ * @param {{dev?: boolean}} [opts]
+ * @returns {string|null}
  */
-export function runShortcut(event, ctx) {
+export function runShortcut(event, ctx, { dev = DEV } = {}) {
+  if (!event || event.isComposing) return null;
+  const typing = isTypingTarget(event.target);
+  // Enter/Space/arrows on a focused button, slider or menu are that control's.
+  if (!typing && CONTROL_KEYS.has(event.key) && !(event.ctrlKey || event.metaKey) && isControlTarget(event.target)) return null;
+  const full = { actions: editorActions, ...ctx, event };
   for (const s of SHORTCUTS) {
-    if (s.hold) continue;
-    if (!matchesEvent(event, s.keys, { allowInInput: s.allowInInput })) continue;
+    if (s.hold || s.native) continue;
+    if (typing && !s.allowInInput) continue;
+    if (event.repeat && s.repeat === false) continue;
+    if (!matchesEvent(event, s.keys)) continue;
+    if (s.when && !s.when(full)) continue;
+    let result;
     try {
-      s.handler({ ...ctx, event });
-    } catch {
-      return s.id;
+      result = s.handler(full);
+    } catch (err) {
+      console.error(`[shortcuts] "${s.id}" failed`, err);
+      if (dev) throw err;
+      return null;
     }
+    if (result === false) continue;
     return s.id;
   }
   return null;

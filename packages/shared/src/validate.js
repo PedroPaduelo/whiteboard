@@ -11,9 +11,24 @@
  *   point pen stroke.
  *  - Unknown fields are stripped, not rejected, so a newer client can add
  *   fields without breaking an older server.
+ *  - Every optional field exists in TWO places: `validateElement` (creates,
+ *   and the merged result of every update) and `PATCHABLE` + `sanitisePatch`
+ *   (update patches). A field in only one of them is silently lost on the
+ *   other path, so they are kept side by side and tested together.
  */
 
-import { ELEMENT_TYPES, STROKE_STYLES, DRAWING_TOOLS } from './types.js';
+import {
+  ELEMENT_TYPES,
+  STROKE_STYLES,
+  DRAWING_TOOLS,
+  FILL_STYLES,
+  ROUNDNESS,
+  FONT_FAMILY_KEYS,
+  TEXT_ALIGNS,
+  ARROWHEADS,
+  ROUGHNESS_RANGE,
+  SEED_MAX,
+} from './types.js';
 import { boundsOfPoints } from './geometry.js';
 
 /** Hard caps, mirrored by the web client so it refuses locally first. */
@@ -74,6 +89,62 @@ function optStr(v, path, max) {
 function point(v, path) {
   if (!v || typeof v !== 'object') fail('expected a point', path);
   return { x: reqNum(v.x, `${path}.x`), y: reqNum(v.y, `${path}.y`) };
+}
+
+/** A value from a fixed list; absent or null is an error. */
+function reqEnum(v, list, path) {
+  if (!list.includes(v)) fail(`must be one of ${list.join(', ')}`, path);
+  return v;
+}
+
+/** A value from a fixed list, or undefined when absent/null. */
+function optEnum(v, list, path) {
+  if (v === undefined || v === null) return undefined;
+  if (!list.includes(v)) fail(`must be one of ${list.join(', ')}`, path);
+  return v;
+}
+
+/** roughjs seed: an integer 0..SEED_MAX, or undefined. */
+function optSeed(v, path) {
+  if (v === undefined || v === null) return undefined;
+  if (!Number.isInteger(v) || v < 0 || v > SEED_MAX) fail(`seed must be an integer 0..${SEED_MAX}`, path);
+  return v;
+}
+
+/** roughjs roughness: a number in ROUGHNESS_RANGE, or undefined. */
+function optRoughness(v, path) {
+  const n = optNum(v, path);
+  if (n === undefined) return undefined;
+  if (n < ROUGHNESS_RANGE.min || n > ROUGHNESS_RANGE.max) {
+    fail(`roughness must be ${ROUGHNESS_RANGE.min}..${ROUGHNESS_RANGE.max}`, path);
+  }
+  return n;
+}
+
+/** Font size: a number 4..512, or undefined. */
+function optFontSize(v, path) {
+  const n = optNum(v, path);
+  if (n === undefined) return undefined;
+  if (n < 4 || n > 512) fail('fontSize must be 4..512', path);
+  return n;
+}
+
+/**
+ * The text-styling trio shared by text elements and label-carrying shapes.
+ * `fontSize` is NOT here: text defaults it, shapes do not.
+ */
+function textStyle(raw, base, path) {
+  const fontFamily = optEnum(raw.fontFamily, FONT_FAMILY_KEYS, `${path}.fontFamily`);
+  if (fontFamily !== undefined) base.fontFamily = fontFamily;
+  const align = optEnum(raw.align, TEXT_ALIGNS, `${path}.align`);
+  if (align !== undefined) base.align = align;
+}
+
+/** A connector's 2..MAX_POINTS points (first = start, last = end). */
+function connectorPoints(v, path) {
+  const points = pointList(v, path);
+  if (points.length < 2) fail('a connector needs at least 2 points (start, end)', path);
+  return points;
 }
 
 function pointList(v, path) {
@@ -160,6 +231,18 @@ export function validateElement(raw, path = 'element') {
   const groupId = optId(raw.groupId, `${path}.groupId`);
   if (groupId) base.groupId = groupId;
 
+  // Hand-drawn look. All optional: a board saved before these existed renders
+  // with the defaults documented in types.js, and the roughjs `seed` is what
+  // makes every peer, reload and export draw the identical wobble.
+  const seed = optSeed(raw.seed, `${path}.seed`);
+  if (seed !== undefined) base.seed = seed;
+  const roughness = optRoughness(raw.roughness, `${path}.roughness`);
+  if (roughness !== undefined) base.roughness = roughness;
+  const fillStyle = optEnum(raw.fillStyle, FILL_STYLES, `${path}.fillStyle`);
+  if (fillStyle !== undefined) base.fillStyle = fillStyle;
+  const roundness = optEnum(raw.roundness, ROUNDNESS, `${path}.roundness`);
+  if (roundness !== undefined) base.roundness = roundness;
+
   const authorId = optId(raw.authorId, `${path}.authorId`);
   if (authorId !== undefined) base.authorId = authorId;
   const createdAt = optNum(raw.createdAt, `${path}.createdAt`);
@@ -182,11 +265,9 @@ export function validateElement(raw, path = 'element') {
     }
     case 'arrow':
     case 'line': {
-      const points = pointList(raw.points, `${path}.points`);
-      if (points.length !== 2) {
-        fail('a connector has exactly 2 points (start, end)', `${path}.points`);
-      }
-      base.points = [points[0], points[1]];
+      // 2..MAX_POINTS: a straight connector or a multi-point one. Only the
+      // first and last point are ever moved by binding (resolveConnectors).
+      base.points = connectorPoints(raw.points, `${path}.points`);
       const b = boundsOfPoints(base.points);
       base.x = b.x;
       base.y = b.y;
@@ -196,6 +277,10 @@ export function validateElement(raw, path = 'element') {
       const endId = optId(raw.endId, `${path}.endId`);
       if (startId) base.startId = startId;
       if (endId) base.endId = endId;
+      const startArrowhead = optEnum(raw.startArrowhead, ARROWHEADS, `${path}.startArrowhead`);
+      if (startArrowhead !== undefined) base.startArrowhead = startArrowhead;
+      const endArrowhead = optEnum(raw.endArrowhead, ARROWHEADS, `${path}.endArrowhead`);
+      if (endArrowhead !== undefined) base.endArrowhead = endArrowhead;
       break;
     }
     case 'text': {
@@ -204,15 +289,8 @@ export function validateElement(raw, path = 'element') {
         fail(`text must be a string <= ${LIMITS.MAX_TEXT} chars`, `${path}.text`);
       }
       base.text = text;
-      const fontSize = optNum(raw.fontSize, `${path}.fontSize`) ?? 24;
-      if (fontSize < 4 || fontSize > 512) fail('fontSize must be 4..512', `${path}.fontSize`);
-      base.fontSize = fontSize;
-      if (raw.align !== undefined) {
-        if (!['left', 'center', 'right'].includes(raw.align)) {
-          fail('align must be left, center or right', `${path}.align`);
-        }
-        base.align = raw.align;
-      }
+      base.fontSize = optFontSize(raw.fontSize, `${path}.fontSize`) ?? 24;
+      textStyle(raw, base, path);
       break;
     }
     case 'sticky': {
@@ -222,6 +300,9 @@ export function validateElement(raw, path = 'element') {
       }
       base.label = label;
       if (!base.fill) base.fill = '#fde68a';
+      const fontSize = optFontSize(raw.fontSize, `${path}.fontSize`);
+      if (fontSize !== undefined) base.fontSize = fontSize;
+      textStyle(raw, base, path);
       break;
     }
     case 'image': {
@@ -247,9 +328,17 @@ export function validateElement(raw, path = 'element') {
     case 'rect':
     case 'ellipse':
     case 'diamond':
-    case 'cylinder':
-      // Nothing extra. The box is the whole truth.
+    case 'cylinder': {
+      // The box is the whole geometric truth; the optional label is the text
+      // shown inside it (Excalidraw's bound text), with its own font styling.
+      // No fontSize default: the renderer picks one when it is absent.
+      const label = optStr(raw.label, `${path}.label`, LIMITS.MAX_LABEL);
+      if (label !== undefined) base.label = label;
+      const fontSize = optFontSize(raw.fontSize, `${path}.fontSize`);
+      if (fontSize !== undefined) base.fontSize = fontSize;
+      textStyle(raw, base, path);
       break;
+    }
     default:
       fail(`unhandled type ${type}`, `${path}.type`);
   }
@@ -257,22 +346,41 @@ export function validateElement(raw, path = 'element') {
   return base;
 }
 
-/** Fields a patch may touch. Identity and kind are deliberately absent. */
+/**
+ * Fields a patch may touch. Identity and kind are deliberately absent.
+ * Keep in step with validateElement: a field missing here is dropped from
+ * every update even though creates keep it.
+ */
 const PATCHABLE = new Set([
   'x', 'y', 'w', 'h', 'rotation', 'stroke', 'fill', 'strokeWidth', 'strokeStyle',
   'opacity', 'label', 'text', 'fontSize', 'align', 'points', 'startId', 'endId',
   'src', 'naturalWidth', 'naturalHeight', 'updatedAt', 'locked', 'groupId',
+  'seed', 'roughness', 'fillStyle', 'roundness', 'fontFamily',
+  'startArrowhead', 'endArrowhead',
 ]);
+
+/**
+ * Patch keys where `null` means "remove this field" (the store's shallow merge
+ * writes the null and validateElement then drops it). Unbinding a connector
+ * end and leaving a group are real operations, not the same as "no change".
+ */
+export const NULLABLE_PATCH_KEYS = Object.freeze(['startId', 'endId', 'groupId', 'label']);
 
 /** Drop unknown keys from a patch so they cannot smuggle fields into an element. */
 function sanitisePatch(patch, path) {
   const out = {};
   for (const [k, v] of Object.entries(patch)) {
     if (!PATCHABLE.has(k)) continue;
+    if (v === null && NULLABLE_PATCH_KEYS.includes(k)) {
+      // Kept as an explicit null: the merge must overwrite the stored value.
+      out[k] = null;
+      continue;
+    }
     if (k === 'points') {
       out.points = pointList(v, `${path}.points`);
     } else if (k === 'label') {
-      out.label = optStr(v, `${path}.label`, LIMITS.MAX_LABEL);
+      const label = optStr(v, `${path}.label`, LIMITS.MAX_LABEL);
+      if (label !== undefined) out.label = label;
     } else if (k === 'text') {
       out.text = optStr(v, `${path}.text`, LIMITS.MAX_TEXT);
     } else if (k === 'src') {
@@ -286,20 +394,27 @@ function sanitisePatch(patch, path) {
       if (!STROKE_STYLES.includes(v)) fail('bad strokeStyle', `${path}.strokeStyle`);
       out.strokeStyle = v;
     } else if (k === 'align') {
-      if (!['left', 'center', 'right'].includes(v)) fail('bad align', `${path}.align`);
+      if (!TEXT_ALIGNS.includes(v)) fail('bad align', `${path}.align`);
       out.align = v;
+    } else if (k === 'fillStyle') {
+      out.fillStyle = reqEnum(v, FILL_STYLES, `${path}.fillStyle`);
+    } else if (k === 'roundness') {
+      out.roundness = reqEnum(v, ROUNDNESS, `${path}.roundness`);
+    } else if (k === 'fontFamily') {
+      out.fontFamily = reqEnum(v, FONT_FAMILY_KEYS, `${path}.fontFamily`);
+    } else if (k === 'startArrowhead' || k === 'endArrowhead') {
+      out[k] = reqEnum(v, ARROWHEADS, `${path}.${k}`);
+    } else if (k === 'seed') {
+      if (v === null || v === undefined) fail('seed must be an integer', `${path}.seed`);
+      out.seed = optSeed(v, `${path}.seed`);
+    } else if (k === 'roughness') {
+      if (v === null || v === undefined) fail('expected a finite number', `${path}.roughness`);
+      out.roughness = optRoughness(v, `${path}.roughness`);
     } else if (k === 'locked') {
       if (typeof v !== 'boolean') fail('locked must be a boolean', `${path}.locked`);
       out.locked = v;
-    } else if (k === 'groupId') {
-      // Nullable: `null` is how a child is released from its group, which is a
-      // real operation and not the same as "never had one".
-      if (v === null) out.groupId = null;
-      else {
-        const i = optId(v, `${path}.groupId`);
-        if (i !== undefined) out.groupId = i;
-      }
-    } else if (k === 'startId' || k === 'endId') {
+    } else if (k === 'groupId' || k === 'startId' || k === 'endId') {
+      // (null was handled above: it removes the field.)
       const i = optId(v, `${path}.${k}`);
       if (i !== undefined) out[k] = i;
     } else if (k === 'w' || k === 'h') {

@@ -1,16 +1,12 @@
 /**
- * Memo-friendly derived data.
+ * Derived data over the store state.
  *
- * Every selector here is PURE and CHEAP. They are used inside `useShallow`
- * wrappers in `index.js`, which means the returned value is compared one
- * level deep on every store change — a selector that walks the whole element
- * list on every pointer move is a selector that re-renders the board on
- * every pointer move. Where a scan is unavoidable it is done with a single
- * pass and a cheap equality result (an id list, a count, a box) rather than
- * a new object graph.
- *
- * All of them take the store state as their argument, so they can be used
- * outside React too (`store.getState().elements`, tests, the SVG export).
+ * Every selector here is PURE and takes the whole state, so it works outside
+ * React too (`selectSelectedElements(useBoardStore.getState())` in an action,
+ * a test, the export). Most of them walk `elements` and return a NEW array or
+ * object: as a React hook that would re-render on every store change, so wrap
+ * those in `useShallow` (arrays of primitives / stable element objects) or
+ * call them from an event handler instead of a render.
  */
 
 import { boundsOfRectList } from '@whiteboard/shared';
@@ -95,12 +91,19 @@ export const selectCursorMap = (s) => s.remoteCursors;
 /** Other peers, for a roster that excludes you. */
 export const selectOtherPeers = (s) => s.peers.filter((p) => p.id !== s.myPeerId);
 
-/** Connection state for the status bar. */
+/** Realtime connection state (idle|connecting|connected|offline|disconnected). */
+export const selectConnection = (s) => s.connection;
+
+/** True while the live connection is up (joined and syncing). */
+export const selectIsLive = (s) => s.connection === 'connected';
+
+/** Connection summary for a status line. Returns a new object: use with `useShallow`. */
 export const selectStatusLine = (s) => ({
   status: s.status,
   rev: s.rev,
   error: s.error,
-  connected: s.myPeerId !== null,
+  connection: s.connection,
+  connected: s.connection === 'connected',
 });
 
 /** A lookup map for the canvas hot path, rebuilt only when elements change. */

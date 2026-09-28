@@ -15,7 +15,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { LIMITS } from '@whiteboard/shared';
+import { LIMITS, BIND_GAP, validateOps } from '@whiteboard/shared';
 
 import { createStore as createMemoryStore } from '../src/store/memory.js';
 import { createStore as createSqliteStore } from '../src/store/sqlite.js';
@@ -528,7 +528,7 @@ for (const driver of DRIVERS) {
       // move?" is unambiguous.
       const linkBefore = (await store.listElements(b.id)).find((e) => e.id === 'link');
       const endBefore = linkBefore.points[1];
-      assert.equal(endBefore.x, 0, 'the arrow rests on the box left edge (x=0)');
+      assert.equal(endBefore.x, -BIND_GAP, 'the arrow rests just outside the box left edge (x=0)');
       assert.equal(endBefore.y, 50, 'and on its vertical centre');
 
       await store.applyOps(b.id, [update(b.id, 'box', { x: 300, y: 200 })]);
@@ -541,7 +541,7 @@ for (const driver of DRIVERS) {
       // The box now spans x 300..400, y 200..300. The arrow approaches from the
       // left, so it must land ON the left edge, somewhere in the vertical span.
       const endAfter = linkAfter.points[1];
-      assert.equal(endAfter.x, 300, 'lands on the new left edge');
+      assert.ok(endAfter.x < 300 && endAfter.x >= 300 - BIND_GAP, `lands just outside the new left edge, got ${endAfter.x}`);
       assert.ok(
         endAfter.y >= 200 && endAfter.y <= 300,
         `lands within the box's vertical span, got ${endAfter.y}`,
@@ -599,7 +599,163 @@ for (const driver of DRIVERS) {
       assert.equal('startId' in link, false, 'the end pointing at the deleted box is detached');
       assert.equal(link.endId, 'keep', 'the end pointing at the live box is KEPT');
       // The surviving attachment is still resolved: it rests on that box's edge.
-      assert.equal(link.points[1].x, 500, 'and the live end still tracks its box');
+      // (It aims at the now-free start, a slightly slanted ray, so it sits
+      // BIND_GAP outside the left edge along that ray.)
+      const x = link.points[1].x;
+      assert.ok(x < 500 && x >= 500 - BIND_GAP, `and the live end still tracks its box, got x=${x}`);
+      await store.deleteBoard(b.id);
+    });
+
+    /* --- results: applied opIds, original indices ------------------------ */
+
+    test('applied/duplicate results list the batch opIds in `applied`', async () => {
+      const b = await store.createBoard({ title: 'Acks' });
+      const ops = [create(b.id, rect('k1')), create(b.id, rect('k2'))];
+      const first = await store.applyOps(b.id, ops);
+      assert.equal(first.status, 'applied');
+      assert.deepEqual(first.applied, ops.map((o) => o.opId));
+      assert.deepEqual(first.appliedOps.map((o) => o.opId), ops.map((o) => o.opId));
+
+      const retry = await store.applyOps(b.id, ops);
+      assert.equal(retry.status, 'duplicate');
+      assert.deepEqual(retry.applied, ops.map((o) => o.opId), 'a retry acks the same opIds');
+      assert.deepEqual(retry.appliedOps, []);
+
+      // A partial retry: the seen op is acked too, but only the new one applies.
+      const fresh = create(b.id, rect('k3'));
+      const partial = await store.applyOps(b.id, [ops[0], fresh]);
+      assert.equal(partial.status, 'applied');
+      assert.deepEqual(partial.applied, [ops[0].opId, fresh.opId]);
+      assert.deepEqual(partial.appliedOps.map((o) => o.opId), [fresh.opId]);
+      await store.deleteBoard(b.id);
+    });
+
+    test('conflict and missing results carry an empty `applied`', async () => {
+      const b = await store.createBoard({ title: 'No acks' });
+      await store.applyOps(b.id, [create(b.id, rect('m1'))]);
+      const conflict = await store.applyOps(b.id, [create(b.id, rect('m2'), { baseRev: 0 })]);
+      assert.equal(conflict.status, 'conflict');
+      assert.deepEqual(conflict.applied, []);
+      const missing = await store.applyOps('no-such-board', [create('x', rect('m3'))]);
+      assert.equal(missing.status, 'missing');
+      assert.deepEqual(missing.applied, []);
+      await store.deleteBoard(b.id);
+    });
+
+    test('appliedOps are the ops as sent (actorId filled), with no internal fields', async () => {
+      const b = await store.createBoard({ title: 'Clean ops' });
+      const res = await store.applyOps(b.id, [create(b.id, rect('c9'))], 'peer-7');
+      const [op] = res.appliedOps;
+      assert.equal(op.actorId, 'peer-7');
+      assert.equal(op.kind, 'create');
+      assert.equal('index' in op, false);
+      await store.deleteBoard(b.id);
+    });
+
+    test('an error names the op index AS SENT, even after dedupe dropped some', async () => {
+      const b = await store.createBoard({ title: 'Indices' });
+      const seen = create(b.id, rect('dup'));
+      await store.applyOps(b.id, [seen]);
+      // ops[0] is already seen and skipped; the duplicate id is ops[2].
+      await assert.rejects(
+        () => store.applyOps(b.id, [seen, create(b.id, rect('ok')), create(b.id, rect('dup'))]),
+        (err) => err.code === 'DUPLICATE_ELEMENT' && /ops\[2\]/.test(err.message),
+      );
+      await store.deleteBoard(b.id);
+    });
+
+    /* --- the Excalidraw-style model through the store ------------------- */
+
+    test('new fields persist through create AND update, on this driver', async () => {
+      const b = await store.createBoard({ title: 'Styles' });
+      const styled = {
+        seed: 12345, roughness: 2, fillStyle: 'cross-hatch', roundness: 'round',
+        fontFamily: 'code', fontSize: 28, align: 'right', label: 'Olá, mundo',
+      };
+      await store.applyOps(b.id, [
+        create(b.id, rect('shape', styled)),
+        create(b.id, rect('plain')),
+        create(b.id, arrow('conn', { x: 0, y: 0 }, { x: 5, y: 5 }, { startArrowhead: 'dot', endArrowhead: 'triangle' })),
+      ]);
+      let els = await store.listElements(b.id);
+      const shape = els.find((e) => e.id === 'shape');
+      for (const [k, v] of Object.entries(styled)) assert.deepEqual(shape[k], v, `create kept ${k}`);
+      const conn = els.find((e) => e.id === 'conn');
+      assert.deepEqual([conn.startArrowhead, conn.endArrowhead], ['dot', 'triangle']);
+
+      // The same fields arrive as an UPDATE (through validateOps, as the routes do).
+      const ops = validateOps([
+        update(b.id, 'plain', styled),
+        update(b.id, 'conn', { startArrowhead: 'bar', endArrowhead: 'none', roughness: 0 }),
+      ]);
+      const res = await store.applyOps(b.id, ops);
+      assert.equal(res.status, 'applied');
+      els = await store.listElements(b.id);
+      const plain = els.find((e) => e.id === 'plain');
+      for (const [k, v] of Object.entries(styled)) assert.deepEqual(plain[k], v, `update kept ${k}`);
+      const conn2 = els.find((e) => e.id === 'conn');
+      assert.deepEqual([conn2.startArrowhead, conn2.endArrowhead, conn2.roughness], ['bar', 'none', 0]);
+
+      // label: null removes a shape label.
+      await store.applyOps(b.id, validateOps([update(b.id, 'plain', { label: null })]));
+      els = await store.listElements(b.id);
+      assert.equal('label' in els.find((e) => e.id === 'plain'), false);
+      await store.deleteBoard(b.id);
+    });
+
+    test('startId: null UNBINDS on the server; the dragged-off end stays where it was put', async () => {
+      const b = await store.createBoard({ title: 'Unbind' });
+      await store.applyOps(b.id, [
+        create(b.id, rect('box', { x: 0, y: 0, w: 100, h: 100 })),
+        create(b.id, arrow('link', { x: 50, y: 50 }, { x: 400, y: 50 }, { startId: 'box' })),
+      ]);
+      let link = (await store.listElements(b.id)).find((e) => e.id === 'link');
+      assert.deepEqual(link.points[0], { x: 100 + BIND_GAP, y: 50 }, 'bound: snapped onto the box');
+
+      // The user drags the start off the box: the client sends the new point
+      // AND startId: null in one patch. The server must not snap it back.
+      const ops = validateOps([update(b.id, 'link', { startId: null, points: [{ x: -300, y: 400 }, { x: 400, y: 50 }] })]);
+      await store.applyOps(b.id, ops);
+      link = (await store.listElements(b.id)).find((e) => e.id === 'link');
+      assert.equal('startId' in link, false, 'the binding is gone');
+      assert.deepEqual(link.points[0], { x: -300, y: 400 }, 'and the end is where the user left it');
+
+      // Moving the box no longer drags the unbound end along.
+      await store.applyOps(b.id, [update(b.id, 'box', { x: 500 })]);
+      link = (await store.listElements(b.id)).find((e) => e.id === 'link');
+      assert.deepEqual(link.points[0], { x: -300, y: 400 });
+
+      // groupId: null leaves a group, the same way.
+      await store.applyOps(b.id, [update(b.id, 'box', { groupId: 'g1' })]);
+      await store.applyOps(b.id, validateOps([update(b.id, 'box', { groupId: null })]));
+      assert.equal('groupId' in (await store.listElements(b.id)).find((e) => e.id === 'box'), false);
+      await store.deleteBoard(b.id);
+    });
+
+    test('a multi-point connector: moving a bound shape moves ONLY the end points', async () => {
+      const b = await store.createBoard({ title: 'Elbow' });
+      const pts = [{ x: 50, y: 50 }, { x: 50, y: 300 }, { x: 350, y: 300 }, { x: 350, y: 50 }];
+      await store.applyOps(b.id, [
+        create(b.id, rect('from', { x: 0, y: 0, w: 100, h: 100 })),
+        create(b.id, { id: 'to', type: 'ellipse', x: 300, y: 0, w: 100, h: 100 }),
+        create(b.id, { id: 'elbow', type: 'arrow', x: 0, y: 0, w: 0, h: 0, points: pts, startId: 'from', endId: 'to' }),
+      ]);
+      let elbow = (await store.listElements(b.id)).find((e) => e.id === 'elbow');
+      assert.equal(elbow.points.length, 4);
+      assert.deepEqual(elbow.points[0], { x: 50, y: 100 + BIND_GAP });
+      assert.deepEqual(elbow.points.slice(1, 3), pts.slice(1, 3));
+
+      await store.applyOps(b.id, [update(b.id, 'from', { x: -40, y: 20 })]);
+      elbow = (await store.listElements(b.id)).find((e) => e.id === 'elbow');
+      assert.deepEqual(elbow.points.slice(1, 3), pts.slice(1, 3), 'interior points never move');
+      // The box now spans y 20..120; the start aims at (50,300), a slanted ray,
+      // so it sits just below the bottom edge, at most BIND_GAP below it.
+      const y = elbow.points[0].y;
+      assert.ok(y > 120 && y <= 120 + BIND_GAP, `the start rides the moved box bottom edge, got y=${y}`);
+      // And a no-op batch leaves the stored connector byte-identical (idempotent).
+      const before = JSON.stringify(await store.listElements(b.id));
+      await store.applyOps(b.id, [update(b.id, 'to', {})]);
+      assert.equal(JSON.stringify(await store.listElements(b.id)), before);
       await store.deleteBoard(b.id);
     });
 

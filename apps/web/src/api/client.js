@@ -41,29 +41,45 @@ export const API_URL =
   '/api';
 
 /**
- * Derive the WebSocket URL from the API URL.
+ * Derive the WebSocket URL from the API URL, always ABSOLUTE (`ws://` or
+ * `wss://`). `new WebSocket('/api/ws')` only works in recent browsers
+ * (Chrome 125+, Firefox 124+, Safari 17.3+); older ones throw a SyntaxError,
+ * and the client would burn its whole reconnect budget on it. So a relative
+ * URL is resolved against the page's `location` here, once.
  *
  * `http://localhost:3001/api`  ->  `ws://localhost:3001/api/ws`
  * `https://board.example/api`  ->  `wss://board.example/api/ws`
- * `/api` (relative, same-origin via the vite proxy)  ->  `/api/ws`
+ * `/api` on `https://host:8443` ->  `wss://host:8443/api/ws`
+ * `wss://rt.example/socket` (VITE_WS_URL) is used as is.
  *
  * The trailing-slash dance matters: `http://host/api/` must not become
  * `http://host/api//ws`, and a URL with no path at all must still get `/ws`.
+ *
+ * @param {string} apiUrl            API base (absolute or relative)
+ * @param {{protocol:string, host:string}|null} [loc]  the page location; none in node
+ * @param {string} [explicitWsUrl]   VITE_WS_URL, when set
+ * @returns {string}
  */
-function deriveWsUrl(apiUrl) {
+export function resolveWsUrl(apiUrl, loc = typeof location !== 'undefined' ? location : null, explicitWsUrl) {
+  const toAbsolute = (url) => {
+    if (/^wss?:\/\//i.test(url)) return url;
+    if (/^https?:\/\//i.test(url)) return url.replace(/^http/i, 'ws'); // http->ws, https->wss
+    if (!loc || !loc.host) return url; // node / tests: nothing to resolve against
+    const scheme = loc.protocol === 'https:' ? 'wss:' : 'ws:';
+    if (url.startsWith('//')) return `${scheme}${url}`;
+    return `${scheme}//${loc.host}${url.startsWith('/') ? '' : '/'}${url}`;
+  };
+  if (explicitWsUrl) return toAbsolute(String(explicitWsUrl));
   const trimmed = String(apiUrl).replace(/\/+$/, ''); // kill trailing slashes
-  if (/^https?:\/\//i.test(trimmed)) {
-    const ws = trimmed.replace(/^http/i, 'ws'); // http->ws, https->wss
-    return `${ws}/ws`;
-  }
-  // Relative or protocol-relative: leave the origin alone and just append.
-  return `${trimmed}/ws`;
+  return toAbsolute(`${trimmed}/ws`);
 }
 
-/** WebSocket endpoint. `VITE_WS_URL` wins if set, otherwise derived. */
-export const WS_URL =
-  (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_WS_URL) ||
-  deriveWsUrl(API_URL);
+/** WebSocket endpoint. `VITE_WS_URL` wins if set, otherwise derived. Absolute in a browser. */
+export const WS_URL = resolveWsUrl(
+  API_URL,
+  typeof location !== 'undefined' ? location : null,
+  typeof import.meta !== 'undefined' && import.meta.env ? import.meta.env.VITE_WS_URL : undefined,
+);
 
 /** Thrown for every non-2xx response. Carries what callers branch on. */
 export class ApiError extends Error {
@@ -95,10 +111,14 @@ const NETWORK_MESSAGE =
  * Perform one JSON request.
  *
  * @param {string} path  Path relative to API_URL, e.g. `/boards/abc`.
- * @param {{method?: string, body?: unknown, signal?: AbortSignal, headers?: Record<string,string>}} [opts]
+ * `keepalive` lets a request outlive the page (the realtime client uses it to
+ * post unacknowledged ops when the board is left); browsers cap such bodies
+ * at 64KB, so it is dropped for anything bigger.
+ *
+ * @param {{method?: string, body?: unknown, signal?: AbortSignal, headers?: Record<string,string>, keepalive?: boolean}} [opts]
  * @returns {Promise<any>} parsed JSON, or `null` for 204/empty bodies
  */
-export async function request(path, { method = 'GET', body, signal, headers } = {}) {
+export async function request(path, { method = 'GET', body, signal, headers, keepalive } = {}) {
   const url = `${API_URL}${path}`;
   const init = {
     method,
@@ -110,6 +130,7 @@ export async function request(path, { method = 'GET', body, signal, headers } = 
     },
   };
   if (body !== undefined) init.body = JSON.stringify(body);
+  if (keepalive && (init.body === undefined || init.body.length < 60_000)) init.keepalive = true;
 
   let res;
   try {

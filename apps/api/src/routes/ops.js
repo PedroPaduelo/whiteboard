@@ -7,14 +7,23 @@
  * surfacing as a 500.
  *
  * After a successful write the batch is fanned out to the board's websocket
- * room, if a hub is attached. `except` is null: this batch came over HTTP from
- * a client that may be a different peer than the socket one (or may have no
- * socket at all), so nobody in the room can be assumed to already have it.
+ * room, if a hub is attached, as `{type:'op', boardId, ops, rev}`. `except` is
+ * null: this batch came over HTTP from a client that may be a different peer
+ * than the socket one (or may have no socket at all), so nobody in the room
+ * can be assumed to already have it; a client that also holds a socket must
+ * tolerate receiving its own ops once more (every op is idempotent by id).
+ *
+ * The board-wide clear goes through the same op pipeline as a real
+ * `{kind:'clear'}` op, so it is recorded for dedupe and broadcast as an op
+ * every peer applies — an empty broadcast was ignored by clients, who then
+ * kept drawing stale elements on top of the new rev.
  */
 
-import { validateOps } from '@whiteboard/shared';
+import { randomUUID } from 'node:crypto';
+import { WS_MSG, validateOps } from '@whiteboard/shared';
 
 import { assertBoardId, sendError } from './boards.js';
+import { rejectionCode } from '../store/ops.js';
 
 const MAX_ID_LEN = 64;
 
@@ -97,15 +106,18 @@ export default async function opsRoutes(fastify, opts) {
     try {
       result = await store.applyOps(id, ops, actorId);
     } catch (err) {
-      const isValidation =
-        err && (err.name === 'InvalidElement' || typeof err.code === 'string');
-      if (!isValidation) throw err;
+      // Only a batch the store REFUSED is the client's fault; a database
+      // error (which also carries a string `code`) is a 500 via the handler.
+      if (rejectionCode(err) === null) throw err;
       return sendError(reply, 400, 'VALIDATION_FAILED', err.message ?? 'ops: rejected by the store');
     }
 
     const status = result && result.status;
     const rev = Number.isFinite(result && result.rev) ? result.rev : 0;
     const appliedOps = Array.isArray(result && result.appliedOps) ? result.appliedOps : [];
+    const applied = Array.isArray(result && result.applied)
+      ? result.applied
+      : appliedOps.map((op) => op.opId);
 
     if (status === 'missing') {
       return sendError(reply, 404, 'NOT_FOUND', (result && result.message) || `board ${id} not found`);
@@ -120,14 +132,14 @@ export default async function opsRoutes(fastify, opts) {
     // `duplicate` is a successful no-op retry (the client did not get our ack
     // and resent the same opIds), not a failure — same 200 and same rev.
     if (status !== 'applied' && status !== 'duplicate') {
-      return sendError(reply, 500, 'INTERNAL_ERROR', `unexpected applyOps status ${String(status)}`);
+      return sendError(reply, 500, 'INTERNAL', `unexpected applyOps status ${String(status)}`);
     }
 
-    if (status === 'applied') {
-      broadcast(fastify, id, { type: 'op', ops: appliedOps, rev });
+    if (status === 'applied' && appliedOps.length > 0) {
+      broadcast(fastify, id, { type: WS_MSG.OP_BROADCAST, boardId: id, ops: appliedOps, rev });
     }
 
-    const payload = { status, rev, appliedOps };
+    const payload = { status, rev, applied, appliedOps };
     if (Array.isArray(result && result.elements)) payload.elements = result.elements;
     return reply.send(payload);
   });
@@ -138,17 +150,28 @@ export default async function opsRoutes(fastify, opts) {
 
     const store = fastify.store;
 
-    // clearBoard returns the new rev, not existence, so confirm the board is
-    // there first — otherwise a typo would 200 and lie about the clear.
-    const existing = await store.getBoard(id);
-    if (!existing) {
+    // A server-minted opId (<= LIMITS.MAX_ID): the clear is an op like any
+    // other, so it bumps the rev once, is recorded for dedupe, and peers get
+    // something they actually apply.
+    const clearOp = { opId: `clear-${randomUUID().replace(/-/g, '')}`, kind: 'clear', at: Date.now() };
+    const result = await store.applyOps(id, [clearOp]);
+
+    if (!result || result.status === 'missing') {
       return sendError(reply, 404, 'NOT_FOUND', `board ${id} not found`);
     }
+    if (result.status !== 'applied') {
+      return sendError(reply, 500, 'INTERNAL', `unexpected clear status ${String(result.status)}`);
+    }
 
-    const rev = await store.clearBoard(id);
-    const finalRev = Number.isFinite(rev) ? rev : (existing.rev ?? 0);
-
-    broadcast(fastify, id, { type: 'op', ops: [], rev: finalRev });
-    return reply.send({ status: 'applied', rev: finalRev, appliedOps: [] });
+    const rev = Number.isFinite(result.rev) ? result.rev : 0;
+    const appliedOps = Array.isArray(result.appliedOps) ? result.appliedOps : [clearOp];
+    broadcast(fastify, id, { type: WS_MSG.OP_BROADCAST, boardId: id, ops: appliedOps, rev });
+    return reply.send({
+      status: 'applied',
+      rev,
+      applied: appliedOps.map((op) => op.opId),
+      appliedOps,
+      elements: [],
+    });
   });
 }

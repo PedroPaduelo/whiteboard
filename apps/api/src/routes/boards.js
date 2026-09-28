@@ -13,7 +13,12 @@
  * produced even when the app-level error handler is not in the chain (tests,
  * embedded use). Genuinely unexpected failures still throw and reach the app
  * error handler.
+ *
+ * A successful PATCH is fanned out to the board's websocket room as
+ * `{type:'board', boardId, board}`, so a rename shows up in every open tab.
  */
+
+import { WS_MSG } from '@whiteboard/shared';
 
 /** Board ids are opaque client-visible strings; keep them short and printable. */
 const MAX_ID_LEN = 64;
@@ -159,6 +164,20 @@ export function validateOwnerQuery(raw) {
   return { ok: true, value: raw };
 }
 
+/**
+ * Best-effort fan-out to a board's websocket room. A dead socket or a missing
+ * hub must never fail a write that is already persisted.
+ */
+function notifyRoom(fastify, boardId, envelope) {
+  const hub = fastify.hub;
+  if (!hub || typeof hub.broadcast !== 'function') return;
+  try {
+    hub.broadcast(boardId, envelope, null);
+  } catch {
+    // The next snapshot read resyncs anyone who missed it.
+  }
+}
+
 export default async function boardsRoutes(fastify, opts) {
   const opts_ = opts || {};
   const prefix = opts_.prefix || '';
@@ -302,6 +321,9 @@ export default async function boardsRoutes(fastify, opts) {
     if (!board) {
       return sendError(reply, 404, 'NOT_FOUND', `board ${id} not found`);
     }
+    // Everyone in the room, the caller's own socket included: REST writes
+    // are not tied to a socket, and applying a board payload twice is harmless.
+    notifyRoom(fastify, id, { type: WS_MSG.BOARD, boardId: id, board });
     return reply.send(board);
   });
 

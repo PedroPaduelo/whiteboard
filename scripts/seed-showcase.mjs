@@ -7,33 +7,40 @@
  * I handed over earlier 404'd. The script prints the id it just made, and
  * callers must use THAT.
  */
-const BASE = 'http://localhost:3001/api';
+// Override with API_URL=http://host:port/api to seed another instance.
+const BASE = (process.env.API_URL || 'http://localhost:3001/api').replace(/\/+$/, '');
 const TITLE = 'Whiteboard — demonstração';
 
+/* Excalidraw palette (apps/web/src/editor/constants.js). */
+const SKETCH = { roughness: 1, strokeWidth: 2, strokeStyle: 'solid', opacity: 1 };
+const LABEL = { fontFamily: 'hand', fontSize: 20, align: 'center' };
+const shape = (stroke, fill, extra = {}) => ({ ...SKETCH, stroke, fill, fillStyle: 'hachure', ...LABEL, ...extra });
+const arrow = (stroke, extra = {}) => ({
+  ...SKETCH, stroke, fill: 'none', roundness: 'round', startArrowhead: 'none', endArrowhead: 'arrow', ...extra,
+});
+
+// The model since the Excalidraw-style editor: text lives INSIDE shapes as
+// `label` (no separate text elements laid over them), arrows are bound with
+// startId/endId (the server puts their ends on the shapes' outlines), and
+// every element carries a fixed roughjs `seed` so it always draws the same.
 const ELEMENTS = [
-  { id: 'title', type: 'text', x: 60, y: 40, w: 640, h: 46, text: 'Como o board funciona', fontSize: 30, fill: 'none', stroke: 'none' },
+  { id: 'title', type: 'text', x: 60, y: 40, w: 422, h: 45, text: 'Como o quadro funciona', fontFamily: 'hand', fontSize: 36, align: 'left', stroke: '#1e1e1e', fill: 'none', seed: 101, roughness: 1 },
 
-  { id: 'c1', type: 'rect', x: 60, y: 130, w: 190, h: 100, stroke: '#3b82f6', fill: '#bfdbfe', strokeWidth: 2 },
-  { id: 'c1t', type: 'text', x: 95, y: 160, w: 130, h: 40, text: 'Desenhe', fontSize: 20, fill: 'none', stroke: '#1e3a8a' },
+  { id: 'c1', type: 'rect', x: 60, y: 130, w: 190, h: 100, ...shape('#1971c2', '#a5d8ff', { roundness: 'round' }), label: 'Desenhe', seed: 201 },
+  { id: 'c2', type: 'rect', x: 330, y: 130, w: 190, h: 100, ...shape('#6741d9', '#d0bfff', { roundness: 'round' }), label: 'Conecte', seed: 202 },
+  { id: 'c3', type: 'cylinder', x: 600, y: 124, w: 190, h: 112, ...shape('#2f9e44', '#b2f2bb', { roundness: 'sharp' }), label: 'Persista', seed: 203 },
 
-  { id: 'c2', type: 'rect', x: 330, y: 130, w: 190, h: 100, stroke: '#8b5cf6', fill: '#e9d5ff', strokeWidth: 2 },
-  { id: 'c2t', type: 'text', x: 355, y: 160, w: 150, h: 40, text: 'Conecte', fontSize: 20, fill: 'none', stroke: '#4c1d95' },
-
-  { id: 'c3', type: 'cylinder', x: 600, y: 130, w: 190, h: 100, stroke: '#22c55e', fill: '#bbf7d0', strokeWidth: 2 },
-  { id: 'c3t', type: 'text', x: 640, y: 162, w: 130, h: 40, text: 'Persista', fontSize: 20, fill: 'none', stroke: '#14532d' },
-
-  { id: 'd1', type: 'diamond', x: 160, y: 320, w: 180, h: 120, stroke: '#eab308', fill: '#fed7aa', strokeWidth: 2 },
-  { id: 'd1t', type: 'text', x: 195, y: 362, w: 110, h: 34, text: 'Salvo?', fontSize: 18, fill: 'none', stroke: '#78350f', align: 'center' },
+  { id: 'd1', type: 'diamond', x: 140, y: 320, w: 220, h: 140, ...shape('#f08c00', '#ffec99', { roundness: 'round' }), label: 'Salvo?', seed: 301 },
 
   {
-    id: 's1', type: 'sticky', x: 450, y: 310, w: 210, h: 170,
-    fill: '#fde68a', stroke: '#eab308', strokeWidth: 1,
-    label: 'Dois cliques num texto edita. Arraste as formas. Delete apaga e Ctrl+Z desfaz.',
+    id: 's1', type: 'sticky', x: 450, y: 310, w: 230, h: 200,
+    fill: '#ffec99', fontFamily: 'hand', fontSize: 20, align: 'left', seed: 401, roughness: 1,
+    label: 'Dois cliques numa forma escreve nela. Arraste as formas: as setas acompanham. Delete apaga e Ctrl+Z desfaz.',
   },
 
-  { id: 'a1', type: 'arrow', x: 0, y: 0, w: 0, h: 0, points: [{ x: 250, y: 180 }, { x: 330, y: 180 }], startId: 'c1', endId: 'c2', stroke: '#3b82f6', strokeWidth: 2, strokeStyle: 'solid' },
-  { id: 'a2', type: 'arrow', x: 0, y: 0, w: 0, h: 0, points: [{ x: 520, y: 180 }, { x: 600, y: 180 }], startId: 'c2', endId: 'c3', stroke: '#8b5cf6', strokeWidth: 2, strokeStyle: 'solid' },
-  { id: 'a3', type: 'arrow', x: 0, y: 0, w: 0, h: 0, points: [{ x: 340, y: 380 }, { x: 450, y: 395 }], startId: 'd1', endId: 's1', stroke: '#eab308', strokeWidth: 2, strokeStyle: 'dashed' },
+  { id: 'a1', type: 'arrow', x: 0, y: 0, w: 0, h: 0, points: [{ x: 254, y: 180 }, { x: 326, y: 180 }], startId: 'c1', endId: 'c2', ...arrow('#1971c2'), seed: 501 },
+  { id: 'a2', type: 'arrow', x: 0, y: 0, w: 0, h: 0, points: [{ x: 524, y: 180 }, { x: 596, y: 180 }], startId: 'c2', endId: 'c3', ...arrow('#6741d9'), seed: 502 },
+  { id: 'a3', type: 'arrow', x: 0, y: 0, w: 0, h: 0, points: [{ x: 364, y: 390 }, { x: 446, y: 395 }], startId: 'd1', endId: 's1', ...arrow('#f08c00', { strokeStyle: 'dashed' }), seed: 503 },
 ];
 
 const req = async (path, init) => {

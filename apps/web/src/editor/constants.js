@@ -76,8 +76,8 @@ export const DEFAULT_STYLE = Object.freeze({
   stickyFill: '#ffec99',
 });
 
-/** Padding between a container's edge and its label, board units. */
-export const LABEL_PADDING = 10;
+/** Padding between a container's edge and its label, board units (Excalidraw's BOUND_TEXT_PADDING). */
+export const LABEL_PADDING = 5;
 
 /** Sticky notes: inner padding and default size. */
 export const STICKY_PADDING = 14;

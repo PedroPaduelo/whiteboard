@@ -33,6 +33,25 @@ import {
 /** Op kinds that can change an element's geometry, and so need re-resolving. */
 const GEOMETRY_KINDS = new Set(['create', 'update', 'delete', 'clear']);
 
+/**
+ * `err.code`s applyOpBatch throws when it REFUSES a batch (the client's
+ * fault, nothing written). Anything else thrown by a store is an
+ * infrastructure failure (a locked database, a closed store) and must be
+ * reported as ours, never as a bad request.
+ */
+export const REJECTION_CODES = Object.freeze(['DUPLICATE_ELEMENT', 'TOO_MANY_ELEMENTS', 'INVALID_OP']);
+
+/**
+ * Classify a store throw: the contract code for a refused batch
+ * (`VALIDATION_FAILED` for an element that fails validateElement), or null
+ * for an infrastructure failure.
+ */
+export function rejectionCode(err) {
+  if (err && REJECTION_CODES.includes(err.code)) return err.code;
+  if (err && err.name === 'InvalidElement') return 'VALIDATION_FAILED';
+  return null;
+}
+
 function fail(msg, extra = {}) {
   const err = new Error(msg);
   Object.assign(err, extra);
@@ -43,6 +62,8 @@ function fail(msg, extra = {}) {
 /**
  * Apply one op to the working element list, in place.
  * Throws on a contract violation; silently skips benign races.
+ * `index` is the op's position in the batch AS SENT, so an error message
+ * names the op the client actually wrote even after dedupe dropped some.
  */
 function applyOne(op, list, index, maxEls) {
   const at = `ops[${index}]`;
@@ -116,6 +137,15 @@ function applyOne(op, list, index, maxEls) {
 /**
  * The 7 rules, in order. See docs/API_CONTRACT.md "applyOps semantics".
  *
+ * Result shape (OpResult in @whiteboard/shared):
+ *   applied    {status:'applied',   rev, applied, appliedOps, elements}
+ *   duplicate  {status:'duplicate', rev, applied, appliedOps: []}
+ *   conflict   {status:'conflict',  rev, applied: [], appliedOps: [], message}
+ *   missing    {status:'missing',   rev: 0, applied: [], appliedOps: [], message}
+ * `applied` lists every opId of the batch the server now holds (applied now,
+ * or by an earlier delivery of the same opId), so a client can drop exactly
+ * those from its outbox; `appliedOps` is only what took effect THIS time.
+ *
  * @param {Object} io
  * @param {Object[]} io.ops
  * @param {string} [io.actorId]
@@ -149,14 +179,17 @@ export function applyOpBatch(io) {
 
   // Rule 4: a missing board short-circuits before anything is read or written.
   if (boardMissing) {
-    return { status: 'missing', rev: 0, appliedOps: [], message: 'board not found' };
+    return { status: 'missing', rev: 0, applied: [], appliedOps: [], message: 'board not found' };
   }
 
-  const list = (Array.isArray(ops) ? ops : []).map((op) => ({
+  // `index` remembers each op's position in the batch as sent (see applyOne);
+  // it is stripped again before the ops leave this function.
+  const list = (Array.isArray(ops) ? ops : []).map((op, index) => ({
     ...op,
-    boardId: op.boardId,
     actorId: op.actorId ?? actorId,
+    index,
   }));
+  const allIds = list.map((op) => op.opId);
 
   // Opportunistic TTL sweep: keeps seen_ops bounded without a cron.
   prune();
@@ -164,7 +197,7 @@ export function applyOpBatch(io) {
   // Rule 2: DEDUPE. Only when EVERY opId is already recorded is this a retry.
   // A partially-seen batch is NOT a retry — its new ops must still take effect.
   if (list.length > 0 && list.every((op) => isSeen(op.opId))) {
-    return { status: 'duplicate', rev: currentRev, appliedOps: [] };
+    return { status: 'duplicate', rev: currentRev, applied: allIds, appliedOps: [] };
   }
 
   // An opId is an idempotency key, so a re-sent opId must have NO effect even
@@ -182,6 +215,7 @@ export function applyOpBatch(io) {
       return {
         status: 'conflict',
         rev: currentRev,
+        applied: [],
         appliedOps: [],
         message: 'board moved; resync',
       };
@@ -194,7 +228,7 @@ export function applyOpBatch(io) {
   let geometryTouched = false;
   for (let i = 0; i < fresh.length; i++) {
     if (GEOMETRY_KINDS.has(fresh[i].kind)) geometryTouched = true;
-    applyOne(fresh[i], elements, i, maxEls);
+    applyOne(fresh[i], elements, fresh[i].index, maxEls);
   }
 
   if (geometryTouched) {
@@ -216,7 +250,8 @@ export function applyOpBatch(io) {
   // Rule 7: record opIds so a client retrying after a network timeout is deduped.
   recordSeen(fresh.map((op) => op.opId));
 
-  return { status: 'applied', rev: newRev, appliedOps: fresh, elements };
+  const appliedOps = fresh.map(({ index, ...op }) => op);
+  return { status: 'applied', rev: newRev, applied: allIds, appliedOps, elements };
 }
 
-export default { applyOpBatch };
+export default { applyOpBatch, rejectionCode, REJECTION_CODES };

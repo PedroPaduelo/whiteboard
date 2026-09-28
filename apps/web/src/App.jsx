@@ -1,50 +1,49 @@
 /**
- * App.jsx — page composition and nothing else.
+ * App.jsx — page composition and the few things that belong to the page:
  *
- * The responsibilities that genuinely belong here, and nowhere else:
- *   - resolve a board id out of the URL (`?board=<id>` or `/b/:id`) and write
- *     it back on change. A hand-rolled resolver, not a router: this app has
- *     exactly two routes and a router dependency would be ~15KB for a regex.
- *   - mount `useRealtime` once per board, and seed the store from the HTTP
- *     snapshot so the first paint has something to draw before the socket's
- *     `ready` lands
- *   - install the global keyboard handler from `shortcuts.js` exactly once,
- *     and provide the `ui` intents its handlers call
- *   - apply `data-theme` on <html>
- *   - keep an error boundary around the canvas region only
+ *   - resolve a board id from the URL (`?board=<id>`, `/b/:id` or a bare
+ *     `/:id`) and write it back — a hand-rolled resolver, not a router: two
+ *     routes do not need a dependency;
+ *   - the nickname gate BEFORE routing (no name, no list, no board);
+ *   - the board list at the root URL (it never auto-creates a board);
+ *   - per board: mount `useRealtime` with the NICKNAME as the presence name,
+ *     seed the store from the HTTP snapshot exactly once (inside `withRemote`,
+ *     so hydration is not echoed back as create ops), apply the board's theme
+ *     only as a default;
+ *   - install the global keyboard handler and the copy/cut/paste listeners
+ *     exactly once; they call the shared shortcut table and editor actions;
+ *   - keep an error boundary around the canvas only.
  *
- * Everything else lives in a component.
+ * The drawing surface is editor/Canvas.jsx; every island over it is
+ * ui/EditorUI.jsx.
  */
 
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useBoardSnapshot } from './api/queries.js';
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useBoardSnapshot, useNickname } from './api/queries.js';
 import { useRealtime } from './realtime/useRealtime.js';
 import { withRemote } from './realtime/sync.js';
 import { useBoardStore, useStoreHandle } from './store/index.js';
-import PenUnderlay from './canvas/PenUnderlay.jsx';
-import FlowLayer from './flow/FlowLayer.jsx';
-import { DndProvider } from './dnd/DndProvider.jsx';
-import PresetPalette from './dnd/PresetPalette.jsx';
-import { useDropOnCanvas } from './dnd/useDropOnCanvas.js';
+import Canvas from './editor/Canvas.jsx';
+import { actions, screenToBoardPoint } from './editor/actions.js';
 
 import { BoardList } from './ui/BoardList.jsx';
+import { EditorUI } from './ui/EditorUI.jsx';
 import { ErrorBoundary } from './ui/ErrorBoundary.jsx';
-import { ExportDialog } from './ui/ExportDialog.jsx';
-import { HelpOverlay } from './ui/HelpOverlay.jsx';
 import { NicknameGate } from './ui/NicknameGate.jsx';
-import { StatusBar } from './ui/StatusBar.jsx';
-import { Toaster, toast, resetToasts } from './ui/Toasts.jsx';
-import { Toolbar } from './ui/Toolbar.jsx';
-import { TopBar, applyTheme, readStoredTheme } from './ui/TopBar.jsx';
-import { isTypingTarget, matchesEvent, runShortcut } from './ui/shortcuts.js';
-import { useNickname } from './api/queries.js';
+import { Toaster } from './ui/Toaster.jsx';
+import { resetToasts, toast } from './ui/toast.js';
+import { useUi } from './ui/uiStore.js';
+import { applyTheme, hasStoredTheme } from './ui/theme.js';
+import { isTypingTarget, runShortcut } from './ui/shortcuts.js';
+import { openBoardFile } from './ui/commands.js';
+import { t } from './ui/strings.js';
 
 /* --- routing ---------------------------------------------------------------- */
 
 /**
  * Board id out of the URL, in priority order:
  *   ?board=<id>   the canonical form we write
- *   /b/<id>        the share-link form (what the Share button copies)
+ *   /b/<id>       the share-link form (what the Share button copies)
  *   /<id>         tolerated, so a bare pasted id still opens
  * Returns null for the board list.
  */
@@ -71,9 +70,13 @@ export function resolveBoardId(href = window.location.href) {
   return null;
 }
 
-/** Write the board id into the address bar without adding a history entry. */
+/**
+ * The address-bar URL for a board: `/b/<id>?board=<id>` (other query params
+ * kept). For null, the root — the list — so a reload does not reopen the
+ * board that was just left.
+ */
 export function boardUrl(boardId) {
-  if (!boardId) return `${window.location.pathname}`;
+  if (!boardId) return '/';
   const url = new URL(window.location.href);
   url.pathname = `/b/${boardId}`;
   url.searchParams.set('board', boardId);
@@ -84,289 +87,169 @@ function navigateTo(boardId) {
   window.history.replaceState({}, '', boardUrl(boardId));
 }
 
-/* --- clipboard, shared by the shortcuts and the Share button ---------------- */
+/* --- the keyboard / clipboard bridge ------------------------------------------ */
 
-let clipboard = [];
+/** What shortcut handlers get as `ui`: always-live calls into the UI store. */
+const uiHandle = {
+  closeTopOverlay: () => useUi.getState().closeTopOverlay(),
+  open: (key) => useUi.getState().open(key),
+  toggle: (key) => useUi.getState().toggle(key),
+  toggleTheme: () => useUi.getState().toggleTheme(),
+  openFile: () => void openBoardFile(),
+};
 
-function cloneElements(list) {
-  return list.map((el) => ({ ...el }));
+/** Is there a text selection on the page (help dialog, title…) the user means to copy? */
+function hasPageSelection() {
+  const sel = typeof window !== 'undefined' ? window.getSelection?.() : null;
+  return Boolean(sel && !sel.isCollapsed && sel.toString());
+}
+
+/**
+ * Global keydown + copy/cut/paste, installed once per board view. Letters,
+ * digits and chords all resolve through ui/shortcuts.js; a key no binding
+ * handled keeps its browser default.
+ */
+function useGlobalInput(store) {
+  const pointer = useRef(null); // last pointer over the canvas, client px
+
+  useEffect(() => {
+    const onKeyDown = (event) => {
+      if (event.defaultPrevented) return;
+      // A modal dialog owns the keyboard (Tab, Enter, typing); only Escape,
+      // which closes it, goes through the map.
+      const ui = useUi.getState();
+      if ((ui.helpOpen || ui.exportOpen || ui.confirm || ui.nicknameOpen) && event.key !== 'Escape') return;
+      const id = runShortcut(event, { store, ui: uiHandle, actions });
+      if (id) event.preventDefault();
+    };
+
+    const onPointerMove = (e) => {
+      const canvas = e.target instanceof Element ? e.target.closest('[data-testid="canvas"]') : null;
+      pointer.current = canvas ? { x: e.clientX, y: e.clientY, canvas } : null;
+    };
+
+    /** Board point under the pointer, when it is over the canvas. */
+    const pastePoint = () => {
+      const p = pointer.current;
+      if (!p || !p.canvas.isConnected) return null;
+      const r = p.canvas.getBoundingClientRect();
+      return screenToBoardPoint({ x: p.x - r.left, y: p.y - r.top }, useBoardStore.getState().view);
+    };
+
+    const onCopy = (e) => {
+      if (isTypingTarget(e.target) || hasPageSelection()) return;
+      const text = actions.selectionClipboardText();
+      if (!text || !e.clipboardData) return;
+      e.clipboardData.setData('text/plain', text);
+      e.preventDefault();
+    };
+
+    const onCut = (e) => {
+      if (isTypingTarget(e.target) || hasPageSelection() || !e.clipboardData) return;
+      const text = actions.cutSelection();
+      if (!text) return;
+      e.clipboardData.setData('text/plain', text);
+      e.preventDefault();
+    };
+
+    const onPaste = (e) => {
+      // The Canvas takes image files first (capture phase) and prevents default.
+      if (e.defaultPrevented || isTypingTarget(e.target)) return;
+      const text = e.clipboardData?.getData('text/plain') ?? '';
+      if (!text) return;
+      e.preventDefault();
+      void actions.paste(text, pastePoint());
+    };
+
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('pointermove', onPointerMove, { capture: true, passive: true });
+    document.addEventListener('copy', onCopy);
+    document.addEventListener('cut', onCut);
+    document.addEventListener('paste', onPaste);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('pointermove', onPointerMove, { capture: true });
+      document.removeEventListener('copy', onCopy);
+      document.removeEventListener('cut', onCut);
+      document.removeEventListener('paste', onPaste);
+    };
+  }, [store]);
 }
 
 /* --- the board view --------------------------------------------------------- */
 
-function BoardView({ boardId, onNavigate, ui, theme, onToggleTheme }) {
-  const store = useBoardStore;
+/** Rejected edits are rolled back by the realtime layer; say so, but not in a burst. */
+let lastRejectToast = 0;
+function onRealtimeError(message, info) {
+  if (info?.kind !== 'ops' || info?.code === 'REV_CONFLICT') return;
+  const now = Date.now();
+  if (now - lastRejectToast < 5000) return;
+  lastRejectToast = now;
+  toast.error(t.toast.rejected);
+}
 
-  /* --- the canvas droppable -------------------------------------------
-     This is the ONE registrar: `register: true` puts the canvas element into
-     dnd-kit's container map under the id `canvas`, and the `setNodeRef` below
-     is attached to that element.
+function BoardView({ boardId, nickname, theme }) {
+  const store = useStoreHandle();
 
-     The distinction matters because `PresetPalette` also uses
-     `useDropOnCanvas` (for its click-to-place) and does NOT own an element. dnd-kit
-     keys droppables by id and the LAST registration wins, so a second
-     registration from the palette would overwrite this one with a null node —
-     no measurable rect, no collision, and dragging a preset onto the board
-     would silently do nothing while clicking it worked. One registrar, one
-     node, and both paths provably share this instance's `onDrop` through the
-     module singleton.
-     -------------------------------------------------------------------- */
-  const { setNodeRef: setCanvasRef, isOver: isOverCanvas } = useDropOnCanvas({
-    register: true,
-  });
-
-  // A stable identity for this browser on this board. The realtime client
-  // already persists one per board id; this is only used to name the local
-  // peer, so a short stable string is enough.
-  const peerName = useMemo(() => {
-    const key = 'whiteboard:peer-name';
-    try {
-      const saved = localStorage.getItem(key);
-      if (saved) return saved;
-      const generated = `Guest ${Math.floor(Math.random() * 900 + 100)}`;
-      localStorage.setItem(key, generated);
-      return generated;
-    } catch {
-      return 'Guest';
-    }
-  }, []);
-
-  useRealtime(boardId, { name: peerName });
-
-  /* --- seed the store from HTTP before the socket says `ready` ---------- */
-  const { data: snapshot } = useBoardSnapshot(boardId);
-  const seededRef = useRef(null);
-  const onBoardTheme = ui.onBoardTheme;
-  useEffect(() => {
-    if (!snapshot?.board || !Array.isArray(snapshot.elements)) return;
-    // Seed once per board. After that the socket owns the truth; re-seeding
-    // on every query refetch would clobber an in-flight local edit.
-    if (seededRef.current === boardId) return;
-    seededRef.current = boardId;
-    const s = store.getState();
-    // Hydrating the board is NOT a local edit. Without this the sync bridge
-    // sees the store go from empty to "14 elements" and ships the whole board
-    // back as 14 `create` ops on every page load — which the server rejects,
-    // because those elements already exist. The symptom is a board that looks
-    // right and silently never syncs: presence connects, cursors arrive, and
-    // no actual change ever reaches anyone else.
-    withRemote(() => {
-      s.setSnapshot({ board: snapshot.board, elements: snapshot.elements, rev: snapshot.rev });
-    });
-    // The board's own theme is a DEFAULT: an explicit user choice, persisted
-    // in localStorage, always wins. Only surface the board's theme on a first
-    // visit with no stored preference.
-    if (snapshot.board.theme) {
-      let hasChoice = true;
-      try {
-        hasChoice = Boolean(localStorage.getItem('whiteboard:theme'));
-      } catch {
-        hasChoice = false;
-      }
-      if (!hasChoice) onBoardTheme(snapshot.board.theme);
-    }
-  }, [snapshot, boardId, store, onBoardTheme]);
-
-  /* --- clipboard intent, backed by the board store --------------------- */
-  const copySelection = useCallback(() => {
-    const s = store.getState();
-    const ids = new Set(s.selection);
-    const picked = s.elements.filter((e) => ids.has(e.id));
-    clipboard = cloneElements(picked);
-    if (picked.length) toast.success(`Copied ${picked.length} ${picked.length === 1 ? 'element' : 'elements'}`);
-    return clipboard;
-  }, [store]);
-
-  const cutSelection = useCallback(() => {
-    const s = store.getState();
-    const ids = [...s.selection];
-    if (!ids.length) return;
-    copySelection();
-    s.commit('cut');
-    s.removeElements(ids);
-  }, [store, copySelection]);
-
-  const pasteClipboard = useCallback(() => {
-    if (!clipboard.length) {
-      toast.info('Nothing to paste');
-      return;
-    }
-    const s = store.getState();
-    const stamp = Date.now().toString(36);
-    const copies = clipboard.map((el, i) => ({
-      ...el,
-      id: `${el.id}-p${stamp}${i}`,
-      x: el.x + 24,
-      y: el.y + 24,
-    }));
-    s.commit('paste');
-    s.addElements(copies);
-    s.select(copies.map((e) => e.id));
-  }, [store]);
-
-  const duplicateSelection = useCallback(() => {
-    const s = store.getState();
-    const ids = new Set(s.selection);
-    const picked = s.elements.filter((e) => ids.has(e.id));
-    if (!picked.length) {
-      toast.info('Nothing selected to duplicate');
-      return;
-    }
-    const stamp = Date.now().toString(36);
-    const copies = picked.map((el, i) => ({
-      ...el,
-      id: `${el.id}-d${stamp}${i}`,
-      x: el.x + 24,
-      y: el.y + 24,
-    }));
-    s.commit('duplicate');
-    s.addElements(copies);
-    s.select(copies.map((e) => e.id));
-  }, [store]);
-
-  /* --- the intents shortcuts.js calls --------------------------------- */
-  const zoomStep = useCallback(
-    (dir) => {
-      // Zoom about the viewport centre. Zooming about (0,0) throws the board
-      // off-screen, which is the single most common way to get lost on a
-      // canvas, and the store's zoomAtScreen already clamps to ZOOM_LIMITS.
-      const s = store.getState();
-      const rect = document.querySelector('.canvas-host')?.getBoundingClientRect();
-      s.zoomAtScreen(
-        { x: rect ? rect.width / 2 : window.innerWidth / 2, y: rect ? rect.height / 2 : window.innerHeight / 2 },
-        dir > 0 ? 1.2 : 1 / 1.2,
-      );
-    },
-    [store],
-  );
-
-  const copyShareLink = useCallback(async () => {
-    const url = `${location.origin}/b/${boardId}`;
-    try {
-      await navigator.clipboard.writeText(url);
-      toast.success('Share link copied');
-    } catch {
-      window.prompt('Copy this link', url);
+  // A different board than the store holds: start empty rather than drawing
+  // the previous board's elements until the snapshot lands. Under withRemote,
+  // so the sync bridge does not ship the wipe as deletes.
+  useLayoutEffect(() => {
+    const s = useBoardStore.getState();
+    if (s.boardId !== boardId) {
+      withRemote(() => {
+        s.setSnapshot({ elements: [], rev: 0 }, { force: true });
+        s.setBoard(null);
+        s.setBoardId(boardId);
+      });
+      s.setView({ zoom: 1, panX: 0, panY: 0 });
     }
   }, [boardId]);
 
-  // The ui facade is rebuilt when any of its members change, but the keyboard
-  // effect reads it from a ref so installing the listener never re-binds.
-  const uiRef = useRef();
-  uiRef.current = {
-    ...ui,
-    duplicateSelection,
-    copySelection,
-    cutSelection,
-    pasteClipboard,
-    zoomStep,
-    copyShareLink,
-  };
+  useRealtime(boardId, { name: nickname, onError: onRealtimeError });
 
-  /* --- hydrate the store's boardId whenever it changes ----------------- */
+  /* --- seed from HTTP before the socket says `ready`, once per board ------ */
+  const { data: snapshot } = useBoardSnapshot(boardId);
+  const seededRef = useRef(null);
   useEffect(() => {
-    const s = store.getState();
-    if (s.boardId !== boardId) s.setBoardId(boardId);
-  }, [boardId, store]);
+    if (!snapshot?.board || !Array.isArray(snapshot.elements)) return;
+    if (seededRef.current === boardId) return;
+    seededRef.current = boardId;
+    // Hydration is NOT a local edit: without withRemote the sync bridge would
+    // ship the whole board back as creates the server rejects.
+    withRemote(() => {
+      useBoardStore.getState().setSnapshot({ board: snapshot.board, elements: snapshot.elements, rev: snapshot.rev });
+    });
+    // The board's theme is a default: a stored user choice always wins.
+    if (snapshot.board.theme && !hasStoredTheme()) useUi.getState().setTheme(snapshot.board.theme);
+  }, [snapshot, boardId]);
 
-  /* --- pan-cursor state (middle mouse / space) ------------------------- */
-  const [panning, setPanning] = useState(false);
-  useEffect(() => {
-    const down = (e) => {
-      if (e.button === 1 || e.getModifierState?.('Space')) setPanning(true);
-    };
-    const up = () => setPanning(false);
-    window.addEventListener('pointerdown', down, true);
-    window.addEventListener('pointerup', up, true);
-    return () => {
-      window.removeEventListener('pointerdown', down, true);
-      window.removeEventListener('pointerup', up, true);
-    };
+  useGlobalInput(store);
+
+  const onContextMenu = useCallback((info) => {
+    if (!info) return;
+    // Client px place the menu; the canvas fills the window, so its own
+    // x/y are the fallback if a Canvas build does not report client px.
+    useUi.getState().openContextMenu({
+      x: info.clientX ?? info.x,
+      y: info.clientY ?? info.y,
+      targetId: info.targetId ?? null,
+      at: screenToBoardPoint({ x: info.x, y: info.y }, useBoardStore.getState().view),
+    });
+  }, []);
+
+  const onRequestImage = useCallback((at) => {
+    void actions.insertImage(at);
   }, []);
 
   return (
-    <div className="app-shell" data-panning={panning ? 'true' : 'false'}>
-      <div
-        className="canvas-host"
-        data-tool={store.getState().tool}
-        ref={setCanvasRef}
-        data-canvas-droppable="canvas"
-        data-drop-over={isOverCanvas ? 'true' : 'false'}
-      >
-        <ErrorBoundary
-          title="The canvas hit a problem"
-          message="The board surface could not be drawn, but the rest of the app is still working. Reloading usually fixes it; your changes are saved on the server."
-        >
-          {/* The pen underlay. It is BELOW the flow layer and only takes
-              pointer events while the pen tool is active, because a freehand
-              stroke is not a node and cannot live in React Flow's model. It
-              draws nothing but the strokes. */}
-          <PenUnderlay />
-          <FlowLayer />
+    <div className="app-shell">
+      <div className="canvas-host">
+        <ErrorBoundary title={t.errors.canvasTitle} message={t.errors.canvasMessage}>
+          <Canvas theme={theme} onContextMenu={onContextMenu} onRequestImage={onRequestImage} />
         </ErrorBoundary>
       </div>
-
-      {/* The preset palette. It was written, tested and never imported — which
-          is why the feature read as missing rather than broken.
-
-          It sits immediately RIGHT of the toolbar rail, not in the top-right
-          corner: `.toast-area` is anchored top-right (360px wide, z-index 70)
-          and grows downward, so a panel there is buried by the first four
-          toasts — and each toast row takes pointer events, so it would swallow
-          the very clicks the palette exists to receive. Left of the toasts and
-          clear of the toolbar, it overlaps nothing.
-
-          The wrapper is `pointer-events: none` and the palette sets its own
-          `auto`, so only the panel's own tiles and search field intercept
-          gestures; the rest of the board stays fully draggable underneath. */}
-      <div
-        style={{
-          position: 'absolute',
-          top: 'calc(var(--topbar-height) + var(--sp-4))',
-          // RIGHT, not left. Beside the tool rail it sat directly over the
-          // top-left corner of the board, which is exactly where a board's
-          // content starts: it swallowed the resize handles of anything placed
-          // there, and dragging a handle silently added a preset instead.
-          right: 'calc(var(--sp-3) + var(--sp-2))',
-          bottom: 'calc(var(--statusbar-height) + var(--sp-4))',
-          zIndex: 'var(--z-panels)',
-          display: 'flex',
-          alignItems: 'flex-start',
-          // The WRAPPER is transparent to the mouse; the panel opts back in
-          // for its own tiles. A wrapper that caught events would make the
-          // whole gutter a dead zone for the board underneath.
-          pointerEvents: 'none',
-        }}
-      >
-        <PresetPalette
-          onPlaced={(elements) => {
-            // Select what was just placed: the user placed it, so it is the
-            // thing they want to move, edit or delete next. A multi-element
-            // preset lands as one selection, so Delete removes the whole thing
-            // in a single step.
-            //
-            // Deliberately no toast here. The element appearing on the board
-            // and the status bar's count ticking up ARE the confirmation, and a
-            // toast per placement stacks four deep over the board — the third
-            // piece of the UI in this app that covered the thing you are
-            // trying to click.
-            const s = store.getState();
-            s.select(elements.map((e) => e.id));
-          }}
-        />
-      </div>
-
-      <TopBar
-        onNavigate={onNavigate}
-        onOpenExport={ui.openExport}
-        onOpenHelp={ui.openHelp}
-        theme={theme}
-        onToggleTheme={onToggleTheme}
-      />
-      <Toolbar />
-      <StatusBar />
-      <HelpOverlay open={ui.helpOpen} onClose={ui.closeHelp} />
-      <ExportDialog open={ui.exportOpen} onClose={ui.closeExport} />
+      <EditorUI />
     </div>
   );
 }
@@ -374,69 +257,15 @@ function BoardView({ boardId, onNavigate, ui, theme, onToggleTheme }) {
 /* --- the app ---------------------------------------------------------------- */
 
 export default function App() {
-  // A facade for the imperative call sites: the global keydown listener, the
-  // shortcut table, the dnd drop path. It reads the LIVE state and forwards
-  // every action to it, so `store.commit(...)` and `store.removeElements(...)`
-  // are real calls.
-  //
-  // This indirection exists because the actions live INSIDE the state object,
-  // not on the hook function — `useBoardStore` only carries `getState`. Code
-  // that received the bare hook got `undefined` for every action, and the
-  // `try/catch` inside `runShortcut` swallowed the TypeError, so the shortcut
-  // matched, ran, and did nothing. That is why Delete appeared dead: the key
-  // was reaching the app the whole time.
-  const store = useStoreHandle();
-  const [boardId, setBoardId] = useState(() => resolveBoardId());
-  const [helpOpen, setHelpOpen] = useState(false);
-  const [exportOpen, setExportOpen] = useState(false);
-
-  /* --- the nickname gate ---------------------------------------------
-     No name means no board list, and the board page is a link away. So the
-     gate is checked BEFORE the routing branch and returns instead of
-     overlaying: the list is never mounted, never fetched and never in the DOM
-     behind it. An overlay you can click through, or a list rendered under a
-     dim layer, is a gate in appearance only.
-
-     It also gates the board page, not just the list. `?board=<id>` is a URL
-     you can paste, so without this a nameless visitor lands straight on a
-     canvas with no name to file their work under.
-     ------------------------------------------------------------------ */
   const nickname = useNickname();
+  const theme = useUi((s) => s.theme);
+  const [boardId, setBoardId] = useState(() => resolveBoardId());
 
-  /* --- theme --------------------------------------------------------- */
-  const [theme, setTheme] = useState(readStoredTheme);
-  const themeRef = useRef('stored');
-  useEffect(() => {
-    // `themeRef` distinguishes "came from a board" (session only) from "the
-    // user pressed the toggle" (remembered).
-    applyTheme(theme, themeRef.current !== 'board');
+  // <html data-theme>: applied on every change, persisted only by a user toggle.
+  useLayoutEffect(() => {
+    applyTheme(theme);
   }, [theme]);
-  const toggleTheme = useCallback(() => {
-    setTheme((t) => {
-      const next = t === 'dark' ? 'light' : 'dark';
-      themeRef.current = 'user';
-      applyTheme(next, true);
-      return next;
-    });
-  }, []);
 
-  /* --- the root URL shows the board list; it never creates one --------- */
-  //
-  // This used to auto-seed "My first board" and navigate into it whenever the
-  // URL carried no board id. That made the root URL unusable: you landed in a
-  // brand-new EMPTY board instead of the list of boards you already had, and
-  // every reload made another one — the demo server collected 15 of them. It
-  // also raced the real user, creating boards for people who only wanted to
-  // look at the list.
-  //
-  // Creating a board is a decision a person makes, so it happens when they
-  // click "New board" on the list (BoardList.jsx), not as a side effect of
-  // loading a page. The root now simply renders that list.
-  useEffect(() => {
-    // Intentionally empty — see above.
-  }, [boardId]);
-
-  /* --- back/forward between boards ---------------------------------- */
   useEffect(() => {
     const onPop = () => setBoardId(resolveBoardId());
     window.addEventListener('popstate', onPop);
@@ -445,98 +274,17 @@ export default function App() {
 
   const onNavigate = useCallback((next) => {
     resetToasts();
-    navigateTo(next);
+    useUi.getState().closeAll();
+    navigateTo(next ?? null);
     setBoardId(next ?? null);
   }, []);
 
-  const openHelp = useCallback(() => setHelpOpen(true), []);
-  const closeHelp = useCallback(() => setHelpOpen(false), []);
-  const openExport = useCallback(() => setExportOpen(true), []);
-  const closeExport = useCallback(() => setExportOpen(false), []);
-  const toggleExport = useCallback(() => setExportOpen((v) => !v), []);
-  const toggleHelp = useCallback(() => setHelpOpen((v) => !v), []);
-  const goToBoardList = useCallback(() => onNavigate(null), []);
-
-  /**
-   * Dismiss the topmost overlay, or report that nothing is open. Ordered by
-   * what is visually on top: the export dialog is z-60, the help sheet the
-   * same, but the user opened whichever is later, so the LAST opened wins.
-   */
-  const closeTopOverlay = useCallback(() => {
-    if (exportOpenRef.current) {
-      setExportOpen(false);
-      return true;
-    }
-    if (helpOpenRef.current) {
-      setHelpOpen(false);
-      return true;
-    }
-    return false;
-  }, []);
-  const exportOpenRef = useRef(exportOpen);
-  const helpOpenRef = useRef(helpOpen);
-  exportOpenRef.current = exportOpen;
-  helpOpenRef.current = helpOpen;
-
-  /* --- the global keyboard handler, installed exactly once ------------ */
-  const uiRef = useRef();
-  uiRef.current = {
-    closeTopOverlay,
-    toggleHelp,
-    toggleExport,
-    goToBoardList,
-    toggleTheme,
-    copyShareLink: () => {
-      const id = store.getState().boardId;
-      if (!id) return;
-      const url = `${location.origin}/b/${id}`;
-      navigator.clipboard?.writeText(url).then(
-        () => toast.success('Share link copied'),
-        () => window.prompt('Copy this link', url),
-      );
-    },
-  };
-
   useEffect(() => {
-    const onKeyDown = (event) => {
-      // Space is a pan modifier, not a command: it must not scroll the page
-      // and must not be swallowed while someone is typing a sticky note.
-      if (isTypingTarget(event.target) && event.key !== 'Escape') {
-        // Still let Escape through — the text editor and the dialogs both
-        // rely on it — but nothing else fires from inside a text field.
-        if (!matchesEvent(event, ['Escape'], { allowInInput: true })) return;
-      }
-      if (event.key === ' ' && !isTypingTarget(event.target)) {
-        // Held-space pan: block the page scroll without consuming the event,
-        // so the canvas's own handler still sees it.
-        event.preventDefault();
-      }
-      const id = runShortcut(event, { store, ui: uiRef.current });
-      if (id) event.preventDefault();
-    };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, [store]);
+    useUi.setState({ navigate: onNavigate });
+  }, [onNavigate]);
 
-  /* --- keep the store's boardId in step with the URL ------------------ */
-  useEffect(() => {
-    const s = store.getState();
-    if (s.boardId !== boardId) s.setBoardId(boardId ?? null);
-  }, [boardId, store]);
-
-  // The board's own theme seeds App's theme only when the user has never
-  // chosen one; see BoardView's snapshot effect.
-  const onBoardTheme = useCallback((boardTheme) => {
-    // Not persisted: a board's theme is a default, not a user decision.
-    if (boardTheme !== 'light' && boardTheme !== 'dark') return;
-    themeRef.current = 'board';
-    setTheme((current) => (current === boardTheme ? current : boardTheme));
-  }, []);
-  const ui = { openHelp, closeHelp, openExport, closeExport, onBoardTheme };
-
-  // The gate. Placed ahead of the routing branch, and it RETURNS: nothing
-  // below this line is mounted, so there is no board list in the DOM to peek
-  // at and no `useBoards` query to fire with an empty owner.
+  // The gate comes before routing and REPLACES the page: nothing below is
+  // mounted, fetched or reachable without a name.
   if (!nickname) {
     return (
       <>
@@ -557,26 +305,7 @@ export default function App() {
 
   return (
     <>
-      {/* `DndProvider` places a released preset itself: it reads the shared
-          canvas drop handle and calls `resolveCanvasDrop`, which ignores
-          anything that is not a drop on the canvas. This `onDragEnd` is only
-          for callers that want to observe the outcome, and it receives the
-          elements that were actually placed (null when nothing was). */}
-      <DndProvider
-        onDragEnd={(_event, placed) => {
-          if (!placed?.length) return;
-          const s = store.getState();
-          s.select(placed.map((e) => e.id));
-        }}
-      >
-        <BoardView
-          boardId={boardId}
-          onNavigate={onNavigate}
-          ui={ui}
-          theme={theme}
-          onToggleTheme={toggleTheme}
-        />
-      </DndProvider>
+      <BoardView key={boardId} boardId={boardId} nickname={nickname} theme={theme} />
       <Toaster />
     </>
   );

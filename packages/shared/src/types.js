@@ -33,6 +33,34 @@ export const ELEMENT_TYPES = Object.freeze([
 /** Line-ending styles, mirroring the reference whiteboard. */
 export const STROKE_STYLES = Object.freeze(['solid', 'dashed', 'dotted']);
 
+/*
+ * Hand-drawn style enums (the Excalidraw look). Every one of these fields is
+ * OPTIONAL on an element, so boards saved before they existed stay valid; the
+ * renderer supplies the documented default when a field is absent.
+ */
+
+/** roughjs fill patterns. Absent = 'solid' (legacy fills were solid). */
+export const FILL_STYLES = Object.freeze(['hachure', 'cross-hatch', 'solid', 'zigzag']);
+
+/** Corner style. Absent = 'sharp'. */
+export const ROUNDNESS = Object.freeze(['sharp', 'round']);
+
+/** Font family KEYS stored on the element; the web maps them to CSS stacks.
+ *  'hand' is the handwritten Virgil font. Absent = 'hand'. */
+export const FONT_FAMILY_KEYS = Object.freeze(['hand', 'normal', 'code']);
+
+/** Horizontal text alignment, for text elements and labels inside shapes. */
+export const TEXT_ALIGNS = Object.freeze(['left', 'center', 'right']);
+
+/** Connector end decorations. Absent: arrow = none -> arrow, line = none -> none. */
+export const ARROWHEADS = Object.freeze(['none', 'arrow', 'triangle', 'bar', 'dot']);
+
+/** roughjs `roughness` range: 0 architect, 1 artist, 2 cartoonist. Absent = 1. */
+export const ROUGHNESS_RANGE = Object.freeze({ min: 0, max: 2 });
+
+/** roughjs `seed` range: a non-negative 31-bit integer. Absent = FNV-1a(id). */
+export const SEED_MAX = 2147483647;
+
 /** Shape fills offered by the UI. `none` is a first-class value, not absence. */
 export const FILL_PRESETS = Object.freeze([
   'none',
@@ -94,37 +122,56 @@ export const DEFAULT_PALETTE = Object.freeze({
  * @property {number} [strokeWidth]
  * @property {'solid'|'dashed'|'dotted'} [strokeStyle]
  * @property {number} [opacity] 0..1
+ * @property {boolean} [locked]
+ * @property {string} [groupId]   Opaque group key; same key = select/move/delete together.
+ * @property {number} [seed]      roughjs seed, integer 0..SEED_MAX.
+ * @property {number} [roughness] 0..2 (0 architect, 1 artist, 2 cartoonist).
+ * @property {'hachure'|'cross-hatch'|'solid'|'zigzag'} [fillStyle]
+ * @property {'sharp'|'round'} [roundness]
  * @property {string} [authorId]
  * @property {number} [createdAt] Unix ms.
  * @property {number} [updatedAt] Unix ms.
  */
 
 /**
- * @typedef {ElementBase & {type:'rect'|'ellipse'|'diamond'|'cylinder'}} ShapeElement
- *   `cylinder` is a database drum. No extra fields.
+ * Text styling carried by text elements AND by shapes that show a label.
+ * @typedef {Object} TextStyle
+ * @property {'hand'|'normal'|'code'} [fontFamily]
+ * @property {number} [fontSize]  4..512
+ * @property {'left'|'center'|'right'} [align]
  */
 
-/** @typedef {ElementBase & {type:'sticky', label: string}} StickyElement */
-/** @typedef {ElementBase & {type:'text', text: string, fontSize: number, align?:'left'|'center'|'right'}} TextElement */
+/**
+ * @typedef {ElementBase & TextStyle & {type:'rect'|'ellipse'|'diamond'|'cylinder', label?: string}} ShapeElement
+ *   `cylinder` is a database drum. `label` is the text shown INSIDE the shape
+ *   (double-click to edit), laid out with the TextStyle fields; `fontSize` has
+ *   no default here, the renderer picks one.
+ */
+
+/** @typedef {ElementBase & TextStyle & {type:'sticky', label: string}} StickyElement */
+/** @typedef {ElementBase & TextStyle & {type:'text', text: string, fontSize: number}} TextElement */
 /** @typedef {ElementBase & {type:'pen', points: Point[]}} PenElement */
 /** @typedef {ElementBase & {type:'image', src: string, naturalWidth?: number, naturalHeight?: number}} ImageElement */
 
 /**
- * Connectors. Endpoints live in `points` as [start, end] rather than in
- * dedicated fields so both pen and connector code paths share one "polyline"
- * reader. The bounding box is derived from those points, which is why a
- * connector can have `w`/`h` of 0 (a perfectly horizontal line) and why a
- * connector's `x` is NOT necessarily 0.
+ * Connectors. The path lives in `points` (2..LIMITS.MAX_POINTS, ABSOLUTE board
+ * coordinates, first = start, last = end) rather than in dedicated fields so
+ * both pen and connector code paths share one "polyline" reader. The bounding
+ * box is derived from those points, which is why a connector can have `w`/`h`
+ * of 0 (a perfectly horizontal line) and why a connector's `x` is NOT
+ * necessarily 0.
  *
- * When `startId`/`endId` are set the endpoint follows that element's edge as
- * it moves — the reference board's defining behaviour, and the reason
- * connectors carry a box at all.
+ * When `startId`/`endId` are set the first/last point follows that element's
+ * outline as it moves (see `resolveConnectors`); interior points never move
+ * by binding. In an update patch `startId: null` / `endId: null` unbinds.
  *
  * @typedef {ElementBase & {
  *   type:'arrow'|'line',
- *   points: [Point, Point],
+ *   points: Point[],
  *   startId?: string,
  *   endId?: string,
+ *   startArrowhead?: 'none'|'arrow'|'triangle'|'bar'|'dot',
+ *   endArrowhead?: 'none'|'arrow'|'triangle'|'bar'|'dot',
  * }} ConnectorElement
  */
 
@@ -133,7 +180,8 @@ export const DEFAULT_PALETTE = Object.freeze({
 /** @typedef {ElementType} Tool
  *   The active drawing tool. `select` and `hand` are modes, not element kinds.
  *   `eraser` deletes on click/drag.
- *   The nine drawing tools map 1:1 onto element types.
+ *   The ten drawing tools map 1:1 onto element types (`image` places a picked
+ *   file). The server only records presence `activity` tools listed here.
  */
 
 export const TOOLS = Object.freeze([
@@ -149,6 +197,7 @@ export const TOOLS = Object.freeze([
   'arrow',
   'line',
   'eraser',
+  'image',
 ]);
 
 /** Tools that place a new element of their own kind (i.e. not modes). */
@@ -182,9 +231,11 @@ export const DRAWING_TOOLS = Object.freeze(
  * The unit of mutation and of replication. Ops are small, ordered, and
  * idempotent-by-id: applying the same op twice is a no-op.
  *
- * `rev` is assigned by the SERVER on persist; the client sends `baseRev` and
- * the server rejects the batch if the board moved underneath it, so a stale
- * client can resync instead of silently clobbering.
+ * `rev` is assigned by the SERVER on persist. `baseRev` is OPTIONAL: an op
+ * that carries it is rejected (with the whole batch) if the board moved
+ * underneath it; an op without it is last-writer-wins per element, which is
+ * safe because an update is a shallow merge of the fields it names. Realtime
+ * edits omit it.
  *
  * @typedef {Object} Op
  * @property {string} opId      Client-generated unique id; the server dedupes on it.
@@ -201,17 +252,36 @@ export const DRAWING_TOOLS = Object.freeze(
 
 /** Server's answer to a batch of ops. */
 export const OP_RESULT = Object.freeze({
+  /** The batch was persisted (rev bumped once). */
   APPLIED: 'applied',
+  /** Every opId had already been applied: a harmless retry, rev unchanged. */
   DUPLICATE: 'duplicate',
+  /** An op carried a stale `baseRev`; nothing changed. Resync. */
   CONFLICT: 'conflict',
+  /** The board does not exist (deleted under you). */
+  MISSING: 'missing',
+  /** The batch was rejected (invalid op, duplicate id, limit, server fault);
+   *  nothing changed. WebSocket acks only — REST answers with an HTTP error. */
+  ERROR: 'error',
 });
 
 /**
+ * The answer to one op batch: the `result` of a WS `ack`, and the body of
+ * `POST /boards/:id/ops` (REST adds `elements`).
+ *
  * @typedef {Object} OpResult
- * @property {typeof OP_RESULT} status
- * @property {number} rev      The board's rev AFTER the batch.
- * @property {string[]} [applied]  opIds the server accepted.
- * @property {Element[]} [elements] Elements touched, for clients to re-sync.
+ * @property {'applied'|'duplicate'|'conflict'|'missing'|'error'} status  One of OP_RESULT.
+ * @property {number} [rev]         The board's rev AFTER the batch (current rev on conflict).
+ * @property {string[]} [applied]   opIds of this batch the server now holds — applied
+ *   by this batch OR by an earlier delivery of the same opId. Present on
+ *   'applied' and 'duplicate'; a client drops exactly these from its outbox.
+ * @property {Op[]} [appliedOps]    The ops that took effect in THIS batch (validated,
+ *   `actorId` filled in); [] on duplicate/conflict/missing.
+ * @property {Element[]} [elements] REST only: the board's full element list after
+ *   the batch. The WS ack omits it (it would cost O(board) per drag frame).
+ * @property {string} [message]     Human-readable reason, for conflict/missing/error.
+ * @property {string} [code]        Machine-readable reason, for 'error'
+ *   ('VALIDATION_FAILED', 'DUPLICATE_ELEMENT', 'TOO_MANY_ELEMENTS', 'INVALID_OP', 'INTERNAL').
  */
 
 /** Real-time protocol. Envelope shared by server and client. */
@@ -222,7 +292,8 @@ export const WS_MSG = Object.freeze({
   READY: 'ready',
   /** client -> server: a batch of ops to persist and fan out. */
   OPS: 'ops',
-  /** server -> client: ops from another peer (or your own echo). */
+  /** server -> client: ops from another peer (your own are never echoed over
+   *  WS; ops written over REST reach every socket in the room). */
   OP_BROADCAST: 'op',
   /** server -> client: result of your own batch. */
   OP_ACK: 'ack',
@@ -236,8 +307,14 @@ export const WS_MSG = Object.freeze({
   PRESENCE: 'presence',
   /** client -> server: I am alive. Server drops peers silent past a TTL. */
   PING: 'ping',
-  /** server -> client: you missed ops; resync via GET. */
+  /** server -> client: your batch conflicted or the board is gone; resync via
+   *  GET. Sent ONLY to the peer whose batch failed, never to the room. */
   RESYNC: 'resync',
+  /** server -> client: board metadata changed (title/theme/owner), payload
+   *  `{type:'board', boardId, board}`. */
+  BOARD: 'board',
+  /** server -> client: a protocol-level failure, `{type:'error', text, code?}`. */
+  ERROR: 'error',
   /** either way: the connection is going away. */
   BYE: 'bye',
 });
@@ -260,6 +337,8 @@ export const WS_MSG = Object.freeze({
  * @property {OpResult} [result]
  * @property {{x:number,y:number}} [cursor]   Board units, not screen pixels.
  * @property {Peer[]} [peers]
+ * @property {Board} [board]      `ready` and `board` messages.
+ * @property {number} [rev]
  * @property {string} [text]
  * @property {number} [at]
  */

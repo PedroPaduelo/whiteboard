@@ -39,12 +39,13 @@ export default defineConfig({
     target: 'es2022',
     rollupOptions: {
       output: {
-        // Three chunks that only change when a dependency changes, so a normal
+        // Chunks that only change when a dependency changes, so a normal
         // deploy leaves them byte-identical and the browser reuses the cache.
+        // `draw` is the hand-drawn renderer's two libraries.
         manualChunks: {
           vendor: ['react', 'react-dom', 'zustand'],
           query: ['@tanstack/react-query'],
-          flow: ['reactflow', '@dnd-kit/core', '@dnd-kit/sortable', '@dnd-kit/modifiers'],
+          draw: ['roughjs', 'perfect-freehand'],
         },
       },
     },

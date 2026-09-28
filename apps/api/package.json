@@ -17,6 +17,7 @@
     "@fastify/websocket": "^11.0.1",
     "@whiteboard/shared": "*",
     "fastify": "^5.2.0",
+    "fastify-plugin": "^5.0.1",
     "ws": "^8.18.0"
   }
 }

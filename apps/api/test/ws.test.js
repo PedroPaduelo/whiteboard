@@ -15,10 +15,11 @@ import assert from 'node:assert/strict';
 import Fastify from 'fastify';
 import WebSocket from 'ws';
 
-import { WS_MSG, colorForPeer } from '@whiteboard/shared';
+import { WS_MSG, OP_RESULT, colorForPeer } from '@whiteboard/shared';
 import { Hub } from '../src/ws/hub.js';
-import wsPlugin from '../src/ws/plugin.js';
+import wsPlugin, { wsPath } from '../src/ws/plugin.js';
 import { createMemoryStore } from '../src/store/index.js';
+import { buildApp } from '../src/app.js';
 
 /* ------------------------------------------------------------------ helpers */
 
@@ -241,6 +242,10 @@ test('hub: touch keeps a peer alive, and reports a real tool change', () => {
   assert.equal(hub.touch(peer.id, { tool: peer.tool }).toolChanged, false);
   assert.equal(hub.touch(peer.id, { tool: 'pen' }).toolChanged, true);
   assert.equal(peer.tool, 'pen');
+  // The image tool is a real tool now (shared TOOLS), so presence shows it.
+  assert.equal(hub.touch(peer.id, { tool: 'image' }).toolChanged, true);
+  assert.equal(peer.tool, 'image');
+  assert.equal(hub.touch(peer.id, { tool: 'pen' }).toolChanged, true);
   // Junk is ignored rather than rendered.
   assert.equal(hub.touch(peer.id, { tool: 'not-a-tool' }).toolChanged, false);
   assert.equal(peer.tool, 'pen');
@@ -300,7 +305,7 @@ test('hub: seat moves a peer between rooms keeping its id and colour', () => {
  * and the hub are built by the caller and handed to the plugin, and the route
  * lands on the root scope under the API prefix.
  */
-async function serve(t, { now } = {}) {
+async function serve(t, { now, apiPrefix = '/api' } = {}) {
   const store = createMemoryStore();
   const board = await store.createBoard({ title: 'Test board' });
   const hub = new Hub({ peerTtlMs: 30_000, cursorRateMs: 33, now });
@@ -308,14 +313,32 @@ async function serve(t, { now } = {}) {
 
   app.decorate('store', store);
   app.decorate('hub', hub);
-  await app.register(wsPlugin, { config: { apiPrefix: '/api' }, store, hub, now });
+  await app.register(wsPlugin, { config: { apiPrefix }, store, hub, now });
   await app.listen({ port: 0, host: '127.0.0.1' });
   t.after(async () => {
     await app.close();
     await store.close();
   });
-  return { app, store, hub, board, url: `ws://127.0.0.1:${app.server.address().port}/api/ws` };
+  const origin = `ws://127.0.0.1:${app.server.address().port}`;
+  return { app, store, hub, board, origin, url: `${origin}${apiPrefix}/ws` };
 }
+
+/** Connect and join; resolves with the client and its `ready`. */
+async function joined(t, url, boardId, name) {
+  const c = client(url);
+  t.after(() => c.close());
+  await c.open;
+  c.send({ type: WS_MSG.JOIN, boardId, peer: { name } });
+  const ready = await c.waitFor(WS_MSG.READY);
+  return { c, ready };
+}
+
+/** Let in-flight frames land before asserting that something did NOT arrive. */
+const settle = (ms = 60) => new Promise((r) => setTimeout(r, ms));
+
+const rectOp = (opId, id, extra = {}) => ({
+  opId, kind: 'create', element: { id, type: 'rect', x: 0, y: 0, w: 10, h: 10 }, ...extra,
+});
 
 test('protocol: join returns ready with the snapshot and the roster', async (t) => {
   const { url, board } = await serve(t);
@@ -397,6 +420,12 @@ test('protocol: ops are acked to the sender and broadcast to the other, never ec
   const ack = await a.waitFor(WS_MSG.OP_ACK);
   assert.equal(ack.result.status, 'applied');
   assert.equal(ack.result.rev, 1);
+  // The client drains its outbox by opId, from `applied`.
+  assert.deepEqual(ack.result.applied, ['op-1']);
+  assert.equal(ack.result.appliedOps.length, 1);
+  assert.equal(ack.result.appliedOps[0].opId, 'op-1');
+  // The ack never carries the whole board: that is O(board) per drag frame.
+  assert.equal('elements' in ack.result, false, 'the WS ack omits elements');
 
   // The heart of it: the sender is acked, and NOT sent its own op back.
   await b.waitFor(WS_MSG.OP_BROADCAST);
@@ -432,13 +461,239 @@ test('protocol: a malformed op batch is acked with an error and changes nothing'
   });
 
   const ack = await a.waitFor(WS_MSG.OP_ACK);
-  assert.equal(ack.result.status, 'error');
+  assert.equal(ack.result.status, OP_RESULT.ERROR);
   assert.match(ack.result.message, /kind/);
+  assert.equal(ack.result.code, 'VALIDATION_FAILED');
+  assert.deepEqual(ack.result.applied, []);
   assert.equal(a.ofType(WS_MSG.OP_BROADCAST).length, 0, 'nothing is fanned out');
 
   const snapshot = await store.getSnapshot(board.id);
   assert.deepEqual(snapshot.elements, [], 'the board is untouched');
   assert.equal(snapshot.rev, 0, 'and the rev did not move');
+});
+
+test('protocol: a batch the STORE refuses is acked with an error, and the socket keeps working', async (t) => {
+  const { url, board, store } = await serve(t);
+  const { c: a } = await joined(t, url, board.id, 'Ada');
+  const { c: b } = await joined(t, url, board.id, 'Bob');
+
+  a.send({ type: WS_MSG.OPS, ops: [rectOp('w-1', 'dup')] });
+  await a.waitFor(WS_MSG.OP_ACK);
+
+  // Passes validateOps (it cannot know the board) but the store throws
+  // DUPLICATE_ELEMENT. Before the fix this batch was never acked at all.
+  const from = a.log.length;
+  a.send({ type: WS_MSG.OPS, ops: [rectOp('w-2', 'fresh'), rectOp('w-3', 'dup')] });
+  const ack = await a.waitFor(WS_MSG.OP_ACK, { from });
+  assert.equal(ack.result.status, OP_RESULT.ERROR);
+  assert.equal(ack.result.code, 'DUPLICATE_ELEMENT');
+  assert.match(ack.result.message, /already exists/);
+  assert.match(ack.result.message, /ops\[1\]/, 'names the offending op');
+  assert.deepEqual(ack.result.applied, []);
+
+  const snap = await store.getSnapshot(board.id);
+  assert.deepEqual(snap.elements.map((e) => e.id), ['dup'], 'the whole batch rolled back');
+  assert.equal(snap.rev, 1);
+
+  // An update whose MERGED element is invalid is refused the same way.
+  const from2 = a.log.length;
+  a.send({ type: WS_MSG.OPS, ops: [{ opId: 'w-4', kind: 'update', elementId: 'dup', patch: { opacity: 5 } }] });
+  const ack2 = await a.waitFor(WS_MSG.OP_ACK, { from: from2 });
+  assert.equal(ack2.result.status, OP_RESULT.ERROR);
+  assert.equal(ack2.result.code, 'VALIDATION_FAILED');
+  assert.match(ack2.result.message, /opacity/);
+
+  // The connection is healthy: the next good batch applies and fans out.
+  const from3 = a.log.length;
+  a.send({ type: WS_MSG.OPS, ops: [rectOp('w-5', 'after')] });
+  const ok = await a.waitFor(WS_MSG.OP_ACK, { from: from3 });
+  assert.equal(ok.result.status, OP_RESULT.APPLIED);
+  assert.deepEqual(ok.result.applied, ['w-5']);
+  const seen = await b.waitFor(WS_MSG.OP_BROADCAST);
+  assert.equal(seen.ops[0].opId, 'w-1', 'b saw the first good batch');
+  await settle();
+  assert.deepEqual(b.ofType(WS_MSG.OP_BROADCAST).map((m) => m.ops[0].opId), ['w-1', 'w-5'],
+    'the refused batches were never fanned out');
+});
+
+test('protocol: an infrastructure failure in the store is acked as INTERNAL', async (t) => {
+  const { url, board, store } = await serve(t);
+  const { c: a } = await joined(t, url, board.id, 'Ada');
+  store.applyOps = async () => {
+    throw new Error('database is locked');
+  };
+  a.send({ type: WS_MSG.OPS, ops: [rectOp('x-1', 'x')] });
+  const ack = await a.waitFor(WS_MSG.OP_ACK);
+  assert.equal(ack.result.status, OP_RESULT.ERROR);
+  assert.equal(ack.result.code, 'INTERNAL');
+  assert.match(ack.result.message, /locked/);
+
+  // A driver error that carries its OWN code (node:sqlite does) is still ours,
+  // not a contract rejection the client could fix.
+  store.applyOps = async () => {
+    throw Object.assign(new Error('disk I/O error'), { code: 'ERR_SQLITE_ERROR' });
+  };
+  const from = a.log.length;
+  a.send({ type: WS_MSG.OPS, ops: [rectOp('x-2', 'y')] });
+  const ack2 = await a.waitFor(WS_MSG.OP_ACK, { from });
+  assert.equal(ack2.result.code, 'INTERNAL');
+});
+
+test('protocol: a duplicate batch acks the same opIds and is not re-broadcast', async (t) => {
+  const { url, board } = await serve(t);
+  const { c: a } = await joined(t, url, board.id, 'Ada');
+  const { c: b } = await joined(t, url, board.id, 'Bob');
+  const batch = { type: WS_MSG.OPS, ops: [rectOp('d-1', 'd1'), rectOp('d-2', 'd2')] };
+  a.send(batch);
+  await a.waitFor(WS_MSG.OP_ACK);
+  const from = a.log.length;
+  a.send(batch);
+  const again = await a.waitFor(WS_MSG.OP_ACK, { from });
+  assert.equal(again.result.status, OP_RESULT.DUPLICATE);
+  assert.deepEqual(again.result.applied, ['d-1', 'd-2']);
+  await settle();
+  assert.equal(b.ofType(WS_MSG.OP_BROADCAST).length, 1);
+});
+
+test('protocol: a conflict resyncs ONLY the sender, never the room', async (t) => {
+  const { url, board } = await serve(t);
+  const { c: a } = await joined(t, url, board.id, 'Ada');
+  const { c: b } = await joined(t, url, board.id, 'Bob');
+
+  a.send({ type: WS_MSG.OPS, ops: [rectOp('c-1', 'c1')] });
+  await a.waitFor(WS_MSG.OP_ACK);
+
+  // A stale baseRev: the board is at rev 1.
+  const from = a.log.length;
+  a.send({ type: WS_MSG.OPS, ops: [rectOp('c-2', 'c2', { baseRev: 0 })] });
+  const ack = await a.waitFor(WS_MSG.OP_ACK, { from });
+  assert.equal(ack.result.status, OP_RESULT.CONFLICT);
+  assert.equal(ack.result.rev, 1);
+  assert.deepEqual(ack.result.applied, []);
+  const resync = await a.waitFor(WS_MSG.RESYNC, { from });
+  assert.equal(resync.rev, 1);
+  assert.equal(resync.boardId, board.id);
+
+  await settle();
+  assert.equal(b.ofType(WS_MSG.RESYNC).length, 0, 'the innocent peer keeps its outbox');
+});
+
+test('protocol: ops without baseRev are last-writer-wins, never a conflict', async (t) => {
+  const { url, board, store } = await serve(t);
+  const { c: a } = await joined(t, url, board.id, 'Ada');
+  const { c: b } = await joined(t, url, board.id, 'Bob');
+  a.send({ type: WS_MSG.OPS, ops: [rectOp('l-1', 'shared')] });
+  await a.waitFor(WS_MSG.OP_ACK);
+  // Both peers move the same element "at once"; neither knows the other's rev.
+  a.send({ type: WS_MSG.OPS, ops: [{ opId: 'l-2', kind: 'update', elementId: 'shared', patch: { x: 10 } }] });
+  b.send({ type: WS_MSG.OPS, ops: [{ opId: 'l-3', kind: 'update', elementId: 'shared', patch: { y: 20 } }] });
+  const [ackA, ackB] = await Promise.all([
+    a.waitFor(WS_MSG.OP_ACK, { from: 2 }),
+    b.waitFor(WS_MSG.OP_ACK),
+  ]);
+  assert.equal(ackA.result.status, OP_RESULT.APPLIED);
+  assert.equal(ackB.result.status, OP_RESULT.APPLIED);
+  const el = (await store.getSnapshot(board.id)).elements[0];
+  assert.deepEqual([el.x, el.y], [10, 20], 'per-field merge keeps both edits');
+});
+
+test('protocol: a batch for a board deleted under you resyncs only you', async (t) => {
+  const { url, board, store } = await serve(t);
+  const { c: a } = await joined(t, url, board.id, 'Ada');
+  const { c: b } = await joined(t, url, board.id, 'Bob');
+  await store.deleteBoard(board.id);
+  a.send({ type: WS_MSG.OPS, ops: [rectOp('g-1', 'g')] });
+  const ack = await a.waitFor(WS_MSG.OP_ACK);
+  assert.equal(ack.result.status, OP_RESULT.MISSING);
+  await a.waitFor(WS_MSG.RESYNC);
+  await settle();
+  assert.equal(b.ofType(WS_MSG.RESYNC).length, 0);
+});
+
+test('ws path: the route is ${apiPrefix}/ws', async (t) => {
+  assert.equal(wsPath('/api'), '/api/ws');
+  assert.equal(wsPath('/v1'), '/v1/ws');
+  assert.equal(wsPath('/v1/'), '/v1/ws');
+  assert.equal(wsPath(''), '/ws', 'an empty prefix mounts at the root');
+  assert.equal(wsPath(undefined), '/api/ws', 'no config: the default prefix');
+
+  const { url, origin, board } = await serve(t, { apiPrefix: '/v1' });
+  assert.ok(url.endsWith('/v1/ws'));
+  const { ready } = await joined(t, url, board.id, 'Ada');
+  assert.equal(ready.board.id, board.id, 'served at /v1/ws, not /v1/api/ws');
+
+  const wrong = new WebSocket(`${origin}/v1/api/ws`);
+  const outcome = await new Promise((resolve) => {
+    wrong.once('open', () => resolve('open'));
+    wrong.once('error', (err) => resolve(err.message));
+  });
+  assert.match(outcome, /404/, 'the old doubled path is gone');
+});
+
+test('ws: an upgrade to a wrong path is answered and never blocks shutdown', async () => {
+  // Before the plugin was registered unencapsulated, the 404'd upgrade socket
+  // stayed half-open and app.close() waited on it forever.
+  const store = createMemoryStore();
+  const app = await buildApp({
+    store,
+    hub: new Hub(),
+    config: { apiPrefix: '/api', bodyLimit: 1024 * 1024, logLevel: 'silent', isProduction: false, corsOrigin: ['*'] },
+  });
+  await app.listen({ port: 0, host: '127.0.0.1' });
+  const origin = `ws://127.0.0.1:${app.server.address().port}`;
+  const stray = new WebSocket(`${origin}/api/nope`);
+  const outcome = await new Promise((resolve) => {
+    stray.once('open', () => resolve('open'));
+    stray.once('error', (err) => resolve(err.message));
+  });
+  assert.match(outcome, /404/);
+  let timer;
+  const closed = await Promise.race([
+    app.close().then(() => 'closed'),
+    new Promise((resolve) => { timer = setTimeout(() => resolve('hung'), 3000); }),
+  ]);
+  clearTimeout(timer);
+  assert.equal(closed, 'closed', 'app.close() must not wait on the stray socket');
+});
+
+test('app: PATCH /boards/:id and DELETE /boards/:id/elements reach every socket in the room', async (t) => {
+  const store = createMemoryStore();
+  const hub = new Hub();
+  const app = await buildApp({
+    store,
+    hub,
+    config: { apiPrefix: '/api', bodyLimit: 1024 * 1024, logLevel: 'silent', isProduction: false, corsOrigin: ['*'] },
+  });
+  await app.listen({ port: 0, host: '127.0.0.1' });
+  t.after(() => app.close());
+  const board = await store.createBoard({ title: 'Antes' });
+  const url = `ws://127.0.0.1:${app.server.address().port}/api/ws`;
+  const { c: a } = await joined(t, url, board.id, 'Ada');
+  const { c: b } = await joined(t, url, board.id, 'Bob');
+
+  const res = await app.inject({ method: 'PATCH', url: `/api/boards/${board.id}`, payload: { title: 'Depois' } });
+  assert.equal(res.statusCode, 200);
+  for (const c of [a, b]) {
+    const msg = await c.waitFor(WS_MSG.BOARD);
+    assert.equal(msg.boardId, board.id);
+    assert.equal(msg.board.title, 'Depois');
+    assert.equal(msg.board.id, board.id);
+  }
+
+  a.send({ type: WS_MSG.OPS, ops: [rectOp('e-1', 'e1')] });
+  await a.waitFor(WS_MSG.OP_ACK);
+  await b.waitFor(WS_MSG.OP_BROADCAST);
+
+  const cleared = await app.inject({ method: 'DELETE', url: `/api/boards/${board.id}/elements` });
+  assert.equal(cleared.statusCode, 200);
+  const from = b.log.length;
+  const op = await b.waitFor(WS_MSG.OP_BROADCAST, { from });
+  assert.equal(op.ops.length, 1);
+  assert.equal(op.ops[0].kind, 'clear', 'a REAL clear op, which clients apply');
+  assert.equal(op.ops[0].opId, cleared.json().applied[0]);
+  assert.equal(op.rev, cleared.json().rev);
+  const opA = await a.waitFor(WS_MSG.OP_BROADCAST);
+  assert.equal(opA.ops[0].kind, 'clear', 'REST writes reach the whole room');
 });
 
 test('protocol: joining an unknown board is rejected and the socket closes', async (t) => {

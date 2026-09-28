@@ -1,46 +1,60 @@
 /**
- * The board store — the single source of truth every other frontend agent
+ * The board store — the single source of truth every other frontend module
  * codes against.
  *
- * Four invariants hold this together, and everything else follows from them:
+ * Five invariants hold this together, and everything else follows from them:
  *
  *  1. **`elements` IS the z-order.** Index 0 paints first (furthest back);
  *     the last index paints on top. There is no separate `z` field, and no
- *     action may mutate the array in place — every one returns a new array.
- *     In-place mutation is invisible to `subscribe`, which is exactly what
+ *     action may mutate the array (or an element) in place — every one
+ *     returns a new array with new objects for what changed. In-place
+ *     mutation is invisible to `subscribe`, which is exactly what
  *     `realtime/sync.js` watches, so an in-place push would never reach other
- *     peers and would still break React rendering.
+ *     peers and would still break rendering caches keyed by element object.
  *
  *  2. **`commit(label)` is called BEFORE mutating.** It snapshots the current
  *     elements onto a bounded undo stack, so the snapshot is the state
  *     *before* the change and `undo` is just `replaceAll(top of past)`.
- *     Two commits with the same label inside 500ms coalesce into one entry,
- *     which is what turns "a drag emitted 60 updates" into one Ctrl+Z rather
- *     than sixty.
+ *     Two commits with the same label inside 500ms coalesce into one entry;
+ *     gesture code uses a unique label per gesture (`move:<gestureId>`) and
+ *     property edits one label per control (`style:stroke`), so a slider drag
+ *     is one undo step and two quick drags are two.
  *
- *  3. **Selection is a `Set<string>` that only ever holds live ids.** Every
+ *  3. **Undo only ever undoes YOUR edits.** Remote ops are applied to the
+ *     present AND rebased into every undo/redo snapshot (`rebaseEntry`), so
+ *     restoring a snapshot changes only what this user changed since it was
+ *     taken. Without that, a Ctrl+Z would delete every element a collaborator
+ *     created after your last commit — the diff would faithfully ship those
+ *     deletes to everyone.
+ *
+ *  4. **Selection is a `Set<string>` that only ever holds live ids.** Every
  *     action that removes elements prunes the selection in the same pass.
- *     A selection pointing at a deleted id draws a selection box around
- *     nothing, at coordinates nobody can explain.
  *
- *  4. **Connectors never dangle.** Removing an element strips `startId`/
- *     `endId` from any connector that referenced it. A connector anchored to
- *     a ghost id is a permanent rendering bug: it can never be repositioned,
- *     because every resolve pass looks up an id that does not exist.
+ *  5. **Connectors never dangle.** Removing an element strips `startId`/
+ *     `endId` from any connector that referenced it, locally and for remote
+ *     batches alike (the server does the same in `applyOpBatch`).
+ *
+ * Patch semantics (local `updateElement(s)` and remote `update` ops alike): a
+ * value of `null` (or `undefined`) DELETES that key from the element. That is
+ * how a connector end is unbound (`{startId: null}`) and how an element
+ * leaves its group (`{groupId: null}`); the sync diff turns the missing key
+ * back into `null` on the wire, which the server treats the same way.
  */
 
 import { create } from 'zustand';
 import {
-  GRID,
   IDENTITY_VIEW,
   ZOOM_LIMITS,
   TOOLS,
-  DEFAULT_PALETTE,
+  GRID,
   reboxPolyline,
+  resolveConnectors,
   fitViewCompat,
   zoomAt,
   clampZoom,
 } from '@whiteboard/shared';
+import { DEFAULT_STYLE, GRID_SIZE } from '../editor/constants.js';
+import { TOOL_BY_ID } from '../editor/tools.js';
 
 const HISTORY_LIMIT = 50;
 const COALESCE_MS = 500;
@@ -48,15 +62,14 @@ const COALESCE_MS = 500;
 /** How long a remote cursor survives without an update. Peers leave silently. */
 export const CURSOR_TTL_MS = 30_000;
 
+/** Mirrors `RealtimeClient.status`. The UI renders a dot/label per value. */
+export const CONNECTION_STATES = Object.freeze(['idle', 'connecting', 'connected', 'offline', 'disconnected']);
+
 /**
- * Bumped by `replaceAll` and `setSnapshot` — the two wholesale replacements.
- *
- * `realtime/sync.js` needs to tell "the user undid something" apart from
- * "the user nudged a shape", and the two are indistinguishable by looking at
- * the elements array alone. A plain diff would actually be correct for an
- * undo, but the contract asks for an explicit clear+create there, and a
- * counter is the cheapest way to say so. It is deliberately NOT store state:
- * nothing renders from it, so it must not trigger a re-render.
+ * Bumped by `replaceAll` (undo, redo, import). Informational only: the sync
+ * bridge used to encode an epoch change as `clear` + re-create, which wiped
+ * collaborators' work, and now diffs every transition the same way. Kept so
+ * code that wants to know "was that a wholesale swap" still can.
  */
 export const historyEpoch = { value: 0 };
 
@@ -72,18 +85,25 @@ export function initialState() {
     rev: 0,
     status: 'idle',
     error: null,
+    /** Mirrors the realtime client's status: idle|connecting|connected|offline|disconnected. */
+    connection: 'idle',
 
     // interaction
     tool: 'select',
-    style: { ...DEFAULT_PALETTE },
+    /** Excalidraw's tool lock (Q): keep the drawing tool after creating an element. */
+    toolLocked: false,
+    style: { ...DEFAULT_STYLE },
     view: { ...IDENTITY_VIEW },
-    gridSize: GRID.defaultSize,
-    snapEnabled: true,
+    /** CSS px of the canvas element, reported by the Canvas' ResizeObserver. */
+    viewportSize: { w: 0, h: 0 },
+    gridSize: GRID_SIZE,
+    /** Grid mode is off by default, like Excalidraw. */
+    snapEnabled: false,
 
     selection: new Set(),
     hoveredId: null,
     editingId: null,
-  resizingId: null,
+    resizingId: null,
     marquee: null,
 
     // collaborators
@@ -102,7 +122,11 @@ export function initialState() {
   };
 }
 
-/** Map of id -> element, for O(1) membership tests. Rebuilt per action. */
+/* ========================================================================
+   Pure helpers (exported for tests and for the realtime bridge)
+   ======================================================================== */
+
+/** Map of id -> element, for O(1) membership tests. */
 function indexById(elements) {
   const m = new Map();
   for (let i = 0; i < elements.length; i++) m.set(elements[i].id, elements[i]);
@@ -114,6 +138,44 @@ function indexById(elements) {
  * Only these rebox; for everything else x/y/w/h is the truth.
  */
 const isPolyline = (el) => el.type === 'pen' || el.type === 'arrow' || el.type === 'line';
+const isConnector = (el) => el.type === 'arrow' || el.type === 'line';
+
+/** Keys whose change moves a polyline's box, so the box must be re-derived. */
+const BOX_KEYS = ['points', 'x', 'y', 'w', 'h'];
+
+/** Is `tool` one the app knows? Shared TOOLS plus the editor's TOOLBAR ids. */
+function isKnownTool(tool) {
+  return typeof tool === 'string' && (TOOLS.includes(tool) || Boolean(TOOL_BY_ID[tool]));
+}
+
+/**
+ * Merge a patch onto an element, returning a NEW element (or the same one when
+ * the patch changes nothing). `null`/`undefined` values delete the key; `id`
+ * and `type` are identity and never patched. A polyline whose points or box
+ * were touched is re-boxed from its points — exactly what the server's
+ * `validateElement` does, so local and server agree on the box.
+ */
+export function mergePatch(el, patch) {
+  if (!patch || typeof patch !== 'object') return el;
+  let out = null;
+  let touchedBox = false;
+  for (const k of Object.keys(patch)) {
+    if (k === 'id' || k === 'type') continue;
+    const v = patch[k];
+    if (v === null || v === undefined) {
+      if (!(k in el)) continue;
+      if (!out) out = { ...el };
+      delete out[k];
+    } else {
+      if (el[k] === v) continue;
+      if (!out) out = { ...el };
+      out[k] = v;
+    }
+    if (BOX_KEYS.includes(k)) touchedBox = true;
+  }
+  if (!out) return el;
+  return isPolyline(out) && touchedBox && Array.isArray(out.points) ? reboxPolyline(out) : out;
+}
 
 /** Drop selection/hover/edit ids that no longer exist. Returns the SAME Set if nothing changed. */
 function pruneSelection(selection, liveIds) {
@@ -126,10 +188,20 @@ function pruneSelection(selection, liveIds) {
   return changed ? next : selection;
 }
 
+/** The selection/hover/edit fields, pruned against a new element list. */
+function prunedInteraction(s, elements) {
+  const live = indexById(elements);
+  return {
+    selection: pruneSelection(s.selection, live),
+    hoveredId: s.hoveredId !== null && live.has(s.hoveredId) ? s.hoveredId : null,
+    editingId: s.editingId !== null && live.has(s.editingId) ? s.editingId : null,
+  };
+}
+
 /**
  * Reorder to match `orderedIds`. Unknown ids are ignored and any element the
- * caller forgot keeps its relative position at the end — a reorder that
- * silently dropped elements would be data loss wearing a sorting hat.
+ * caller forgot keeps its relative position at the end — the same rule the
+ * server's `reorder` op follows, so both sides land on the same order.
  */
 function orderBy(elements, orderedIds) {
   const byId = indexById(elements);
@@ -142,7 +214,15 @@ function orderBy(elements, orderedIds) {
     next.push(el);
   }
   for (const el of elements) if (!seen.has(el.id)) next.push(el);
-  return next;
+  return sameSequence(next, elements) ? elements : next;
+}
+
+/** Same element objects in the same order? (Reference equality per slot.) */
+function sameSequence(a, b) {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
 }
 
 /**
@@ -150,11 +230,11 @@ function orderBy(elements, orderedIds) {
  * survives — an arrow whose end-box vanished is still a line the user drew;
  * only the *reference* is stripped.
  *
- * @returns {{elements: Element[], removed: Element[], detached: number}}
+ * @returns {{elements: object[], removed: object[]}}
  */
 function removeAndDetach(elements, ids) {
   const gone = ids instanceof Set ? ids : new Set(ids);
-  if (gone.size === 0) return { elements, removed: [], detached: 0 };
+  if (gone.size === 0) return { elements, removed: [] };
 
   const removed = [];
   const kept = [];
@@ -162,30 +242,358 @@ function removeAndDetach(elements, ids) {
     if (gone.has(el.id)) removed.push(el);
     else kept.push(el);
   }
-  if (removed.length === 0) return { elements, removed, detached: 0 };
+  if (removed.length === 0) return { elements, removed };
+  return { elements: detachDangling(kept), removed };
+}
 
-  let detached = 0;
-  const next = kept.map((el) => {
-    if (el.type !== 'arrow' && el.type !== 'line') return el;
-    const hitStart = Boolean(el.startId) && gone.has(el.startId);
-    const hitEnd = Boolean(el.endId) && gone.has(el.endId);
-    if (!hitStart && !hitEnd) return el;
-    detached += 1;
+/**
+ * Strip `startId`/`endId` that point at ids not on the board. Non-mutating
+ * twin of shared `detachMissingConnectors`. Returns the SAME array when
+ * nothing dangles.
+ */
+function detachDangling(elements) {
+  let live = null;
+  let out = null;
+  for (let i = 0; i < elements.length; i++) {
+    const el = elements[i];
+    if (!isConnector(el) || (!el.startId && !el.endId)) continue;
+    if (!live) live = new Set(elements.map((e) => e.id));
+    const badStart = Boolean(el.startId) && !live.has(el.startId);
+    const badEnd = Boolean(el.endId) && !live.has(el.endId);
+    if (!badStart && !badEnd) continue;
     const patched = { ...el };
-    if (hitStart) delete patched.startId;
-    if (hitEnd) delete patched.endId;
-    return patched;
+    if (badStart) delete patched.startId;
+    if (badEnd) delete patched.endId;
+    if (!out) out = elements.slice();
+    out[i] = patched;
+  }
+  return out ?? elements;
+}
+
+/**
+ * Detach dangling connectors, then re-resolve bound ones with the shared
+ * `resolveConnectors` — the same two steps, in the same order, as the
+ * server's `applyOpBatch`, so a remote batch lands identically here and there.
+ * Element objects that did not change keep their identity.
+ */
+export function settleConnectors(elements) {
+  const detached = detachDangling(elements);
+  const resolved = resolveConnectors(detached);
+  if (!Array.isArray(resolved) || resolved === detached) return detached;
+  return sameSequence(resolved, detached) ? detached : resolved;
+}
+
+/**
+ * Apply a list of ops (create/update/delete/reorder/clear) to an element
+ * list with the server's semantics: creates are idempotent by id and append
+ * on top, updates of missing elements are skipped, unknown ids in a reorder
+ * are ignored. Pure; returns the SAME array when nothing changed.
+ *
+ * `rebase: true` is for re-applying this client's UNACKNOWLEDGED ops on top
+ * of newer server state: the server has not appended those creates yet and
+ * will do so after everything it already holds, so a create whose element is
+ * already here is moved to the top (keeping the local object) instead of
+ * being skipped. Without it, two people adding a shape at the same moment
+ * would each see their own on top.
+ *
+ * @param {object[]} elements
+ * @param {object[]} ops
+ * @param {{rebase?: boolean}} [opts]
+ * @returns {{elements: object[], geometry: boolean}} `geometry` is true when
+ *   a create/update/delete/clear touched the list (connectors need settling)
+ */
+export function applyOpsToElements(elements, ops, { rebase = false } = {}) {
+  let work = elements;
+  let copied = false;
+  let index = null;
+  let geometry = false;
+
+  const own = () => {
+    if (!copied) {
+      work = work.slice();
+      copied = true;
+    }
+  };
+  const positions = () => {
+    if (!index) {
+      index = new Map();
+      for (let i = 0; i < work.length; i++) index.set(work[i].id, i);
+    }
+    return index;
+  };
+
+  for (const op of ops) {
+    if (!op || typeof op !== 'object') continue;
+    switch (op.kind) {
+      case 'create': {
+        const el = op.element;
+        if (!el || !el.id) break;
+        const at = positions().get(el.id);
+        if (at !== undefined) {
+          if (!rebase || at === work.length - 1) break;
+          own();
+          const [existing] = work.splice(at, 1);
+          work.push(existing);
+          index = null;
+          break;
+        }
+        own();
+        index.set(el.id, work.length);
+        work.push(el);
+        geometry = true;
+        break;
+      }
+      case 'update': {
+        const i = op.elementId ? positions().get(op.elementId) : undefined;
+        if (i === undefined) break;
+        const merged = mergePatch(work[i], op.patch);
+        if (merged === work[i]) break;
+        own();
+        work[i] = merged;
+        geometry = true;
+        break;
+      }
+      case 'delete': {
+        const i = op.elementId ? positions().get(op.elementId) : undefined;
+        if (i === undefined) break;
+        own();
+        work.splice(i, 1);
+        index = null;
+        geometry = true;
+        break;
+      }
+      case 'reorder': {
+        if (!Array.isArray(op.order)) break;
+        const next = orderBy(work, op.order);
+        if (next === work) break;
+        work = next;
+        copied = true;
+        index = null;
+        break;
+      }
+      case 'clear': {
+        if (work.length === 0) break;
+        work = [];
+        copied = true;
+        index = null;
+        geometry = true;
+        break;
+      }
+      default:
+        break;
+    }
+  }
+  return { elements: work, geometry };
+}
+
+/* ------------------------------------------------------------ history rebase */
+
+/**
+ * Describe the transition `prev -> next` (a remote batch, a resync) so it can
+ * be replayed onto undo/redo snapshots. Changes are found by object identity,
+ * which is cheap and exact because nothing mutates in place.
+ *
+ * @returns {null | {created: object[], changed: Map<string,{before:object, after:object}>,
+ *   deleted: Set<string>, order: string[]|null}}
+ */
+export function describeTransition(prev, next) {
+  if (prev === next) return null;
+  const before = indexById(prev);
+  const after = indexById(next);
+  const created = [];
+  const changed = new Map();
+  for (const el of next) {
+    const old = before.get(el.id);
+    if (!old) created.push(el);
+    else if (old !== el) changed.set(el.id, { before: old, after: el });
+  }
+  const deleted = new Set();
+  for (const el of prev) if (!after.has(el.id)) deleted.add(el.id);
+
+  // Did the relative order of the survivors change? (Creates append on top
+  // and deletes just vanish; neither is a reorder by itself.)
+  let reordered = false;
+  let j = 0;
+  for (const el of prev) {
+    if (!after.has(el.id)) continue;
+    while (j < next.length && !before.has(next[j].id)) j++;
+    if (j >= next.length || next[j].id !== el.id) {
+      reordered = true;
+      break;
+    }
+    j++;
+  }
+
+  if (created.length === 0 && changed.size === 0 && deleted.size === 0 && !reordered) return null;
+  return { created, changed, deleted, order: reordered ? next.map((el) => el.id) : null };
+}
+
+/**
+ * Replay a remote field-level change onto an older version of an element:
+ * every key the remote changed takes the remote value (or disappears), and
+ * every key it did not touch keeps the snapshot's value.
+ */
+function applyDelta(el, before, after) {
+  let out = null;
+  for (const k of Object.keys(after)) {
+    if (after[k] === before[k] || el[k] === after[k]) continue;
+    if (!out) out = { ...el };
+    out[k] = after[k];
+  }
+  for (const k of Object.keys(before)) {
+    if (k in after || !(k in el)) continue;
+    if (!out) out = { ...el };
+    delete out[k];
+  }
+  if (!out) return el;
+  return isPolyline(out) && Array.isArray(out.points) ? reboxPolyline(out) : out;
+}
+
+/** Positions of ids in a history snapshot, cached per (immutable) array. */
+const positionCache = new WeakMap();
+function positionsIn(entry) {
+  let m = positionCache.get(entry);
+  if (!m) {
+    m = new Map();
+    for (let i = 0; i < entry.length; i++) m.set(entry[i].id, i);
+    positionCache.set(entry, m);
+  }
+  return m;
+}
+
+/**
+ * Rebase one undo/redo snapshot over a remote transition. Returns the SAME
+ * array when the transition does not touch it. An element the snapshot shares
+ * with the pre-transition present (unchanged locally since the snapshot) is
+ * swapped for the post-transition object itself, so identity-based "is this
+ * entry a no-op?" checks keep working.
+ */
+export function rebaseEntry(entry, t) {
+  if (!t) return entry;
+
+  // Fast path — updates only, the shape of a remote drag. O(changed) plus a
+  // memcpy, instead of a full scan of every snapshot on every frame.
+  if (t.created.length === 0 && t.deleted.size === 0 && !t.order) {
+    const pos = positionsIn(entry);
+    let out = null;
+    for (const [id, ch] of t.changed) {
+      const i = pos.get(id);
+      if (i === undefined) continue;
+      const el = entry[i];
+      const nextEl = el === ch.before ? ch.after : applyDelta(el, ch.before, ch.after);
+      if (nextEl === el) continue;
+      if (!out) out = entry.slice();
+      out[i] = nextEl;
+    }
+    if (!out) return entry;
+    positionCache.set(out, pos);
+    return out;
+  }
+
+  let out = [];
+  let changed = false;
+  for (const el of entry) {
+    if (t.deleted.has(el.id)) {
+      changed = true;
+      continue;
+    }
+    const ch = t.changed.get(el.id);
+    const nextEl = !ch ? el : el === ch.before ? ch.after : applyDelta(el, ch.before, ch.after);
+    if (nextEl !== el) changed = true;
+    out.push(nextEl);
+  }
+  if (t.created.length > 0) {
+    const have = new Set(out.map((el) => el.id));
+    for (const el of t.created) {
+      if (have.has(el.id)) continue;
+      out.push(el);
+      changed = true;
+    }
+  }
+  if (t.order) {
+    const ordered = orderBy(out, t.order);
+    if (ordered !== out) {
+      out = ordered;
+      changed = true;
+    }
+  }
+  return changed ? out : entry;
+}
+
+/** Rebase both history stacks; returns only the fields that changed. */
+function rebaseHistory(s, t) {
+  if (!t || (s._past.length === 0 && s._future.length === 0)) return {};
+  const past = s._past.map((e) => rebaseEntry(e, t));
+  const future = s._future.map((e) => rebaseEntry(e, t));
+  const out = {};
+  if (past.some((e, i) => e !== s._past[i])) out._past = past;
+  if (future.some((e, i) => e !== s._future[i])) out._future = future;
+  return out;
+}
+
+/** Structural equality for plain JSON values (element payloads). */
+function jsonEqual(a, b) {
+  if (a === b) return true;
+  if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  if (Array.isArray(a)) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (!jsonEqual(a[i], b[i])) return false;
+    return true;
+  }
+  const ka = Object.keys(a);
+  const kb = Object.keys(b);
+  if (ka.length !== kb.length) return false;
+  for (const k of ka) {
+    if (!Object.prototype.hasOwnProperty.call(b, k)) return false;
+    if (!jsonEqual(a[k], b[k])) return false;
+  }
+  return true;
+}
+
+/**
+ * Swap each incoming element for the local object when they are equal, so a
+ * snapshot that confirms what we already have changes no identities: render
+ * caches keep their drawables and the history rebase sees no change.
+ */
+function reuseEqual(local, incoming) {
+  const byId = indexById(local);
+  let same = incoming.length === local.length;
+  const out = incoming.map((el, i) => {
+    const mine = byId.get(el.id);
+    const pick = mine && jsonEqual(mine, el) ? mine : el;
+    if (pick !== local[i]) same = false;
+    return pick;
   });
-
-  return { elements: next, removed, detached };
+  return same ? local : out;
 }
 
-/** A viewport size, with a DOM fallback for code running before mount. */
-function viewportSize(override) {
-  const vw = override?.vw ?? (typeof window !== 'undefined' ? window.innerWidth : 1440);
-  const vh = override?.vh ?? (typeof window !== 'undefined' ? window.innerHeight : 900);
-  return { vw, vh };
+/** A viewport size: explicit, else the canvas' reported size, else the window. */
+function viewportFor(override, reported) {
+  const vw = override?.vw ?? override?.w ?? (reported?.w > 0 ? reported.w : undefined);
+  const vh = override?.vh ?? override?.h ?? (reported?.h > 0 ? reported.h : undefined);
+  return {
+    vw: vw ?? (typeof window !== 'undefined' ? window.innerWidth : 1440),
+    vh: vh ?? (typeof window !== 'undefined' ? window.innerHeight : 900),
+  };
 }
+
+/** The empty-history fields (hydration of a different board). Fresh objects per call. */
+function noHistory() {
+  return {
+    canUndo: false,
+    canRedo: false,
+    pastDepth: 0,
+    futureDepth: 0,
+    _past: [],
+    _future: [],
+    _lastCommit: { label: null, at: 0 },
+  };
+}
+
+/* ========================================================================
+   The store
+   ======================================================================== */
 
 export const useBoardStore = create((set, get) => ({
   ...initialState(),
@@ -196,35 +604,84 @@ export const useBoardStore = create((set, get) => ({
     set({ boardId: id ?? null });
   },
 
+  /**
+   * Board metadata changed (rename, theme) — from a PATCH response or a
+   * `{type:'board'}` broadcast. Merges onto the current board when it is the
+   * same one.
+   */
   setBoard(board) {
-    set((s) => ({ board: board ?? null, boardId: board ? board.id : s.boardId }));
+    set((s) => {
+      if (!board) return { board: null };
+      const merged = s.board && s.board.id === board.id ? { ...s.board, ...board } : { ...board };
+      return { board: merged, boardId: board.id ?? s.boardId };
+    });
   },
 
   /**
-   * Hydrate from a `BoardSnapshot`. This is the one place a whole board
-   * arrives from the network, so it is also the one place history is
-   * dropped — a resync must never become undoable.
+   * Hydrate from a `BoardSnapshot` (first load, board switch). Wipes history:
+   * a hydration is never undoable.
+   *
+   * A snapshot OLDER than what this board already holds (same board id, lower
+   * rev) is ignored unless `force` is set: the HTTP seed can land after the
+   * socket's newer `ready`, and applying it would roll the board back.
+   * Callers that need the live session's pending edits re-applied on top use
+   * `resyncSnapshot` instead (the realtime bridge does).
    */
-  setSnapshot({ board, elements, rev } = {}) {
+  setSnapshot({ board, elements, rev } = {}, { force = false } = {}) {
+    const cur = get();
+    if (
+      !force &&
+      board &&
+      cur.board &&
+      cur.boardId === board.id &&
+      typeof rev === 'number' &&
+      rev < cur.rev
+    ) {
+      return;
+    }
     const els = Array.isArray(elements) ? elements.slice() : [];
+    set((s) => ({
+      board: board ?? s.board,
+      boardId: board ? board.id : s.boardId,
+      elements: els,
+      rev: typeof rev === 'number' ? rev : s.rev,
+      ...prunedInteraction(s, els),
+      ...noHistory(),
+    }));
+  },
+
+  /**
+   * Converge on the server's snapshot while keeping this user's pending edits:
+   * the new present is `snapshot + pendingOps` (ops not yet acknowledged,
+   * re-applied in order on top, then one connector-settling pass). For the
+   * SAME board the transition is treated like a remote batch — the undo/redo
+   * stacks are rebased, not wiped — so a reconnect does not cost the user
+   * their history. For a different board it is a plain hydration.
+   *
+   * Must run inside `withRemote` (it is the network's state, not an edit).
+   */
+  resyncSnapshot({ board, elements, rev } = {}, pendingOps = []) {
     set((s) => {
-      const liveIds = indexById(els);
-      return {
-        board: board ?? s.board,
+      const sameBoard = Boolean(board) && s.boardId === board.id;
+      let target = Array.isArray(elements) ? elements : [];
+      if (Array.isArray(pendingOps) && pendingOps.length > 0) {
+        target = applyOpsToElements(target, pendingOps, { rebase: true }).elements;
+      }
+      target = settleConnectors(target);
+      if (sameBoard) target = reuseEqual(s.elements, target);
+      else target = target.slice();
+
+      const base = {
+        board: board ? (s.board && s.board.id === board.id ? { ...s.board, ...board } : board) : s.board,
         boardId: board ? board.id : s.boardId,
-        elements: els,
         rev: typeof rev === 'number' ? rev : s.rev,
-        selection: pruneSelection(s.selection, liveIds),
-        hoveredId: s.hoveredId !== null && liveIds.has(s.hoveredId) ? s.hoveredId : null,
-        editingId: s.editingId !== null && liveIds.has(s.editingId) ? s.editingId : null,
-        canUndo: false,
-        canRedo: false,
-        pastDepth: 0,
-        futureDepth: 0,
-        _past: [],
-        _future: [],
-        _lastCommit: { label: null, at: 0 },
       };
+      if (!sameBoard) {
+        return { ...base, elements: target, ...prunedInteraction(s, target), ...noHistory() };
+      }
+      if (target === s.elements) return base;
+      const history = rebaseHistory(s, describeTransition(s.elements, target));
+      return { ...base, elements: target, ...prunedInteraction(s, target), ...history };
     });
   },
 
@@ -236,10 +693,16 @@ export const useBoardStore = create((set, get) => ({
     set({ error: error ?? null });
   },
 
+  /** Realtime connection status, pushed by the realtime bridge. */
+  setConnection(status) {
+    if (!CONNECTION_STATES.includes(status)) return;
+    if (get().connection === status) return;
+    set({ connection: status });
+  },
+
   /**
-   * Advance the board rev without touching elements. Called on every ack and
-   * on every remote broadcast, so `baseRev` on the next outgoing batch is the
-   * one the server actually has.
+   * The board rev last seen from the server (ready, ack, broadcast, resync).
+   * Informational: WS ops are last-writer-wins and carry no `baseRev`.
    */
   setRev(rev) {
     const n = Number(rev);
@@ -255,68 +718,60 @@ export const useBoardStore = create((set, get) => ({
   // -------------------------------------------------------------- elements
 
   /**
-   * Add one element on TOP of the z-order (end of the array).
+   * Add one element on TOP of the z-order (end of the array). An id already
+   * on the board is ignored: the server would reject the create as a
+   * duplicate, and the batch with it.
    *
-   * Callers commit FIRST (`commit('add')` then `addElement(el)`), per the
-   * contract. These actions deliberately do NOT commit themselves: the
-   * canvas's `interaction` reducer emits `commit` and `addElement` as
-   * separate effects, and a hidden commit here would add a second history
-   * entry per gesture, so one Ctrl+Z would undo only half a drag.
+   * Callers commit FIRST (`commit('add')` then `addElement(el)`). These
+   * actions deliberately do NOT commit themselves: a hidden commit would add a
+   * second history entry per gesture, so one Ctrl+Z would undo half of it.
    */
   addElement(el) {
     if (!el || !el.id) return;
-    set((s) => ({ elements: [...s.elements, el] }));
+    set((s) => (s.elements.some((e) => e.id === el.id) ? {} : { elements: [...s.elements, el] }));
   },
 
-  /** Add many as ONE history entry — a preset drop is one undo. */
+  /** Add many in one render (a preset drop, a paste). Commit first for one undo step. */
   addElements(els) {
     const list = Array.isArray(els) ? els.filter((e) => e && e.id) : [];
     if (list.length === 0) return;
-    set((s) => ({ elements: [...s.elements, ...list] }));
-  },
-
-  /**
-   * Shallow-merge `patch` onto one element, then REBOX if the patch moved a
-   * POLYLINE's points. The rebox is the whole reason this is not just
-   * `{...el, ...patch}`: a pen stroke's box is derived from its points, so
-   * appending a point without recomputing leaves the box behind the ink —
-   * unselectable, unsnappable, unhit-testable.
-   *
-   * Only pen/arrow/line rebox. For every other type x/y/w/h *is* the truth,
-   * so a stray `points` key in a patch must not overwrite it.
-   */
-  updateElement(id, patch) {
-    if (!id || !patch) return;
     set((s) => {
-      let touched = false;
-      const next = s.elements.map((el) => {
-        if (el.id !== id) return el;
-        touched = true;
-        // id and type are identity, not style: a patch can never change them.
-        const merged = { ...el, ...patch, id: el.id, type: el.type };
-        return isPolyline(el) && 'points' in patch ? reboxPolyline(merged) : merged;
-      });
-      return touched ? { elements: next } : {};
+      const have = new Set(s.elements.map((e) => e.id));
+      const fresh = [];
+      for (const el of list) {
+        if (have.has(el.id)) continue;
+        have.add(el.id);
+        fresh.push(el);
+      }
+      return fresh.length === 0 ? {} : { elements: [...s.elements, ...fresh] };
     });
   },
 
   /**
-   * Apply many patches as ONE history entry and one render. A multi-select
-   * drag is a single Ctrl+Z, not one per element, and re-walks the z-order
-   * once instead of once per element.
+   * Merge `patch` onto one element (see `mergePatch`: null deletes a key,
+   * polylines re-box from their points). To move a pen/arrow/line, patch its
+   * `points`; its box follows.
    */
+  updateElement(id, patch) {
+    if (!id || !patch) return;
+    get().updateElements([{ id, patch }]);
+  },
+
+  /** Apply many patches in one render. A multi-select drag is one store write per frame. */
   updateElements(patches) {
     const list = Array.isArray(patches) ? patches.filter((p) => p && p.id && p.patch) : [];
     if (list.length === 0) return;
     set((s) => {
-      const byId = new Map(list.map((p) => [p.id, p.patch]));
+      const byId = new Map();
+      // Several patches for one id in a batch merge in order.
+      for (const p of list) byId.set(p.id, byId.has(p.id) ? { ...byId.get(p.id), ...p.patch } : p.patch);
       let touched = false;
       const next = s.elements.map((el) => {
         const patch = byId.get(el.id);
         if (!patch) return el;
-        touched = true;
-        const merged = { ...el, ...patch, id: el.id, type: el.type };
-        return isPolyline(el) && 'points' in patch ? reboxPolyline(merged) : merged;
+        const merged = mergePatch(el, patch);
+        if (merged !== el) touched = true;
+        return merged;
       });
       return touched ? { elements: next } : {};
     });
@@ -329,80 +784,64 @@ export const useBoardStore = create((set, get) => ({
     set((s) => {
       const { elements, removed } = removeAndDetach(s.elements, list);
       if (removed.length === 0) return {};
-      const live = indexById(elements);
-      return {
-        elements,
-        selection: pruneSelection(s.selection, live),
-        hoveredId: s.hoveredId !== null && live.has(s.hoveredId) ? s.hoveredId : null,
-        editingId: s.editingId !== null && live.has(s.editingId) ? s.editingId : null,
-      };
+      return { elements, ...prunedInteraction(s, elements) };
     });
   },
 
   /** Set the full z-order. See `orderBy` for how unknown ids are handled. */
   reorder(orderedIds) {
     if (!Array.isArray(orderedIds)) return;
-    set((s) => ({ elements: orderBy(s.elements, orderedIds) }));
-  },
-
-  /**
-   * Wholesale replacement, used by undo/redo and by resync. It must NOT
-   * touch history (it IS the history) and it must prune the selection.
-   */
-  replaceAll(els) {
-    const next = Array.isArray(els) ? els.slice() : [];
-    // Signal to the sync bridge that this is a wholesale swap (undo/redo),
-    // not an incremental edit.
-    historyEpoch.value += 1;
     set((s) => {
-      const live = indexById(next);
-      return {
-        elements: next,
-        selection: pruneSelection(s.selection, live),
-        hoveredId: s.hoveredId !== null && live.has(s.hoveredId) ? s.hoveredId : null,
-        editingId: s.editingId !== null && live.has(s.editingId) ? s.editingId : null,
-      };
+      const next = orderBy(s.elements, orderedIds);
+      return next === s.elements ? {} : { elements: next };
     });
   },
 
   /**
-   * Apply one op that arrived from a remote peer. Like `replaceAll` this
-   * bypasses history: someone else's edit is not something you Ctrl+Z.
+   * Wholesale replacement: undo/redo and file import. It must NOT touch
+   * history (it IS the history) and it must prune the selection. The sync
+   * bridge ships it as a normal diff — creates, updates, deletes and a
+   * reorder only when the order really differs.
    */
+  replaceAll(els) {
+    const next = Array.isArray(els) ? els.slice() : [];
+    historyEpoch.value += 1;
+    set((s) => ({ elements: next, ...prunedInteraction(s, next) }));
+  },
+
+  /**
+   * Apply a batch of ops that arrived from the network, in order, then ONE
+   * connector-settling pass (detach + resolveConnectors, like the server).
+   * Never creates history entries — someone else's edit is not something you
+   * Ctrl+Z — but it IS replayed onto the undo/redo snapshots, so your own
+   * undo does not revert it. Must run inside `withRemote`.
+   *
+   * `pendingOps` are this client's own ops the server has not acknowledged
+   * yet. The server will apply them AFTER the batch being received, so they
+   * are re-applied on top (`rebase` semantics) before connectors settle:
+   * without that, a peer's move of a shape I am dragging would win here
+   * while mine wins on the server.
+   */
+  applyRemoteOps(ops, pendingOps = []) {
+    const list = Array.isArray(ops) ? ops.filter((op) => op && typeof op === 'object' && op.kind) : [];
+    if (list.length === 0) return;
+    const mine = Array.isArray(pendingOps) ? pendingOps : [];
+    set((s) => {
+      const first = applyOpsToElements(s.elements, list);
+      const second = mine.length > 0 ? applyOpsToElements(first.elements, mine, { rebase: true }) : first;
+      const applied = second.elements;
+      const geometry = first.geometry || second.geometry;
+      const next = geometry ? settleConnectors(applied) : applied;
+      if (next === s.elements) return {};
+      const history = rebaseHistory(s, describeTransition(s.elements, next));
+      return { elements: next, ...prunedInteraction(s, next), ...history };
+    });
+  },
+
+  /** One remote op. Same as `applyRemoteOps([op])`. */
   applyRemoteOp(op) {
-    if (!op || typeof op !== 'object') return;
-    const { kind } = op;
-    if (kind === 'create' && op.element) {
-      set((s) =>
-        s.elements.some((el) => el.id === op.element.id)
-          ? {}
-          : { elements: [...s.elements, op.element] },
-      );
-    } else if (kind === 'update' && op.elementId) {
-      set((s) => ({
-        elements: s.elements.map((el) => {
-          if (el.id !== op.elementId) return el;
-          const merged = { ...el, ...op.patch, id: el.id, type: el.type };
-          return isPolyline(el) && 'points' in (op.patch ?? {}) ? reboxPolyline(merged) : merged;
-        }),
-      }));
-    } else if (kind === 'delete' && op.elementId) {
-      set((s) => {
-        const { elements, removed } = removeAndDetach(s.elements, [op.elementId]);
-        if (removed.length === 0) return {};
-        const live = indexById(elements);
-        return {
-          elements,
-          selection: pruneSelection(s.selection, live),
-          hoveredId: s.hoveredId !== null && live.has(s.hoveredId) ? s.hoveredId : null,
-          editingId: s.editingId !== null && live.has(s.editingId) ? s.editingId : null,
-        };
-      });
-    } else if (kind === 'reorder' && Array.isArray(op.order)) {
-      set((s) => ({ elements: orderBy(s.elements, op.order) }));
-    } else if (kind === 'clear') {
-      set({ elements: [], selection: new Set(), hoveredId: null, editingId: null });
-    }
+    if (!op) return;
+    get().applyRemoteOps([op]);
   },
 
   // -------------------------------------------------------------- selection
@@ -438,15 +877,7 @@ export const useBoardStore = create((set, get) => ({
     set({ hoveredId: next });
   },
 
-  /**
-   * Which node is mid-resize, if any.
-   *
-   * The store tracks only the id: React Flow owns the live measurement, and
-   * the node model drops its pinned width/height for this node so the
-   * measurement is what paints. Storing the measured size here instead would
-   * write to the board on every pointermove of a resize — an op per frame and a
-   * resync for every peer watching.
-   */
+  /** Legacy (React Flow NodeResizer). Kept until the old layer is removed. */
   setResizing(id) {
     set({ resizingId: id ?? null });
   },
@@ -461,25 +892,50 @@ export const useBoardStore = create((set, get) => ({
 
   // ------------------------------------------------------------ tool & style
 
+  /**
+   * Switch tools, Excalidraw-style: always ends any in-place text edit, and
+   * picking anything other than `select`/`hand` clears the selection (you are
+   * about to draw, not to edit what was selected). Unknown tools are ignored.
+   */
   setTool(tool) {
-    if (!TOOLS.includes(tool)) return;
-    set({ tool });
+    if (!isKnownTool(tool)) return;
+    set((s) => {
+      const out = { tool, editingId: null };
+      if (tool !== 'select' && tool !== 'hand' && s.selection.size > 0) out.selection = new Set();
+      return out;
+    });
   },
 
+  setToolLocked(locked) {
+    set({ toolLocked: Boolean(locked) });
+  },
+
+  toggleToolLocked() {
+    set((s) => ({ toolLocked: !s.toolLocked }));
+  },
+
+  /** Merge into the current drawing style. `undefined` values are ignored. */
   setStyle(patch) {
-    if (!patch) return;
-    set((s) => ({ style: { ...s.style, ...patch } }));
+    if (!patch || typeof patch !== 'object') return;
+    set((s) => {
+      const next = { ...s.style };
+      for (const [k, v] of Object.entries(patch)) if (v !== undefined) next[k] = v;
+      return { style: next };
+    });
   },
 
   setGridSize(n) {
     const size = Number(n);
     if (!Number.isFinite(size)) return;
-    // 0 is legal and means "snapping off".
-    set({ gridSize: size < 0 ? 0 : Math.min(size, GRID.max) });
+    set({ gridSize: size <= 0 ? 0 : Math.min(Math.max(size, GRID.min), GRID.max) });
   },
 
   toggleSnap() {
     set((s) => ({ snapEnabled: !s.snapEnabled }));
+  },
+
+  setSnapEnabled(on) {
+    set({ snapEnabled: Boolean(on) });
   },
 
   // ------------------------------------------------------------------- view
@@ -520,14 +976,24 @@ export const useBoardStore = create((set, get) => ({
     set((s) => ({ view: zoomAt(s.view, { x: Number(screenPt?.x) || 0, y: Number(screenPt?.y) || 0 }, f) }));
   },
 
+  /** The canvas' CSS size, from its ResizeObserver. Ignored when unchanged. */
+  setViewportSize(size) {
+    const w = Math.max(0, Number(size?.w) || 0);
+    const h = Math.max(0, Number(size?.h) || 0);
+    const cur = get().viewportSize;
+    if (cur.w === w && cur.h === h) return;
+    set({ viewportSize: { w, h } });
+  },
+
   /**
-   * Frame every element. Needs a viewport size, so it takes an optional
-   * `{vw, vh}` and falls back to the window — the toolbar button has to work
-   * before the canvas has reported its size.
+   * Frame every element. Uses `{vw, vh}` (or `{w, h}`) when given, else the
+   * canvas size the Canvas reported, else the window.
    */
   fitToContent(size) {
-    const { vw, vh } = viewportSize(size);
-    set((s) => ({ view: fitViewCompat(s.elements, vw, vh) }));
+    set((s) => {
+      const { vw, vh } = viewportFor(size, s.viewportSize);
+      return { view: fitViewCompat(s.elements, vw, vh) };
+    });
   },
 
   resetView() {
@@ -539,15 +1005,12 @@ export const useBoardStore = create((set, get) => ({
   /**
    * Snapshot the CURRENT elements so the next mutation is undoable. Call
    * this BEFORE mutating. Two calls with the same label within 500ms merge
-   * into one entry — the difference between one undo step for a drag and
-   * sixty for the same drag.
+   * into one entry (the older snapshot is kept).
    */
   commit(label = 'edit') {
     set((s) => {
       const t = now();
       const coalesce = s._lastCommit.label === label && t - s._lastCommit.at < COALESCE_MS && s._past.length > 0;
-      // When coalescing we KEEP the older snapshot: it is the state before
-      // the whole gesture, which is the only one worth restoring.
       const past = coalesce ? s._past : [...s._past, s.elements.slice()];
       const trimmed = past.length > HISTORY_LIMIT ? past.slice(past.length - HISTORY_LIMIT) : past;
       return {
@@ -562,22 +1025,31 @@ export const useBoardStore = create((set, get) => ({
     });
   },
 
+  /**
+   * Restore the previous snapshot. Entries identical to the present (a commit
+   * that was never followed by a change, e.g. a click without a drag) are
+   * skipped, so Ctrl+Z never "does nothing".
+   */
   undo() {
     const s = get();
-    if (s._past.length === 0) return;
-    const previous = s._past[s._past.length - 1];
+    let past = s._past;
+    while (past.length > 0 && sameSequence(past[past.length - 1], s.elements)) past = past.slice(0, -1);
+    if (past.length === 0) {
+      if (past !== s._past) {
+        set({ _past: past, canUndo: false, pastDepth: 0, _lastCommit: { label: null, at: 0 } });
+      }
+      return;
+    }
+    const previous = past[past.length - 1];
     const future = [...s._future, s.elements.slice()];
     const trimmed = future.length > HISTORY_LIMIT ? future.slice(future.length - HISTORY_LIMIT) : future;
-    // Through `replaceAll`, not a direct write: that bumps the history epoch
-    // so the sync bridge encodes an undo as clear+create rather than
-    // guessing a diff, and it prunes the selection.
     get().replaceAll(previous);
     set({
-      _past: s._past.slice(0, -1),
+      _past: past.slice(0, -1),
       _future: trimmed,
-      canUndo: s._past.length > 1,
+      canUndo: past.length > 1,
       canRedo: true,
-      pastDepth: s._past.length - 1,
+      pastDepth: past.length - 1,
       futureDepth: trimmed.length,
       // Break coalescing, or the next commit would merge into the entry we
       // just consumed and undo would appear to do nothing.
@@ -587,18 +1059,23 @@ export const useBoardStore = create((set, get) => ({
 
   redo() {
     const s = get();
-    if (s._future.length === 0) return;
-    const next = s._future[s._future.length - 1];
+    let future = s._future;
+    while (future.length > 0 && sameSequence(future[future.length - 1], s.elements)) future = future.slice(0, -1);
+    if (future.length === 0) {
+      if (future !== s._future) set({ _future: future, canRedo: false, futureDepth: 0 });
+      return;
+    }
+    const next = future[future.length - 1];
     const past = [...s._past, s.elements.slice()];
     const trimmed = past.length > HISTORY_LIMIT ? past.slice(past.length - HISTORY_LIMIT) : past;
     get().replaceAll(next);
     set({
       _past: trimmed,
-      _future: s._future.slice(0, -1),
+      _future: future.slice(0, -1),
       canUndo: true,
-      canRedo: s._future.length > 1,
+      canRedo: future.length > 1,
       pastDepth: trimmed.length,
-      futureDepth: s._future.length - 1,
+      futureDepth: future.length - 1,
       _lastCommit: { label: null, at: 0 },
     });
   },
@@ -609,19 +1086,39 @@ export const useBoardStore = create((set, get) => ({
     set({ myPeerId: id ?? null });
   },
 
+  /**
+   * Replace the roster. Cursors of peers no longer on it are dropped in the
+   * same write — a peer that left must not leave its arrow on the board.
+   */
   setPeers(peers) {
-    set({ peers: Array.isArray(peers) ? peers : [] });
+    const list = Array.isArray(peers) ? peers : [];
+    set((s) => {
+      const out = { peers: list };
+      if (s.remoteCursors.size > 0) {
+        const ids = new Set(list.map((p) => p && p.id));
+        let changed = false;
+        const next = new Map();
+        for (const [id, cur] of s.remoteCursors) {
+          if (ids.has(id)) next.set(id, cur);
+          else changed = true;
+        }
+        if (changed) out.remoteCursors = next;
+      }
+      return out;
+    });
   },
 
+  /** A remote pointer, in BOARD units, with the peer's name and colour. */
   upsertCursor(peerId, cur) {
     if (!peerId) return;
     set((s) => {
+      const prev = s.remoteCursors.get(peerId);
       const next = new Map(s.remoteCursors);
       next.set(peerId, {
         x: Number(cur?.x) || 0,
         y: Number(cur?.y) || 0,
-        name: cur?.name ?? null,
-        color: cur?.color ?? null,
+        name: cur?.name ?? prev?.name ?? null,
+        color: cur?.color ?? prev?.color ?? null,
         at: Number(cur?.at) || now(),
       });
       return { remoteCursors: next };
@@ -654,5 +1151,5 @@ export function subscribe(listener) {
   return useBoardStore.subscribe(listener);
 }
 
-/** Read the whole state outside React — canvas exports, tests, the sync bridge. */
+/** Read the whole state outside React — canvas, exports, tests, the sync bridge. */
 export const getState = () => useBoardStore.getState();

@@ -11,7 +11,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { useBoardStore } from '../store/boardStore.js';
-import { StoreSync, withRemote, diffElements, collapseOps } from './sync.js';
+import { StoreSync, withRemote, diffElements, collapseOps, clearedValue } from './sync.js';
 
 const s = () => useBoardStore.getState();
 const wait = () => new Promise((r) => setTimeout(r, 80));
@@ -195,13 +195,37 @@ test('diffElements: create, update, delete, reorder, no-op', () => {
   assert.deepEqual(diffElements([a, b], [b, a], makeOp).ops.map((o) => o.kind), ['reorder']);
 });
 
-test('diffElements: a reorder alongside an edit ships only the update', () => {
-  // The creates/deletes already carry the new order; a second reorder op
-  // would be redundant traffic.
+test('diffElements: a reorder alongside an edit ships the update AND the reorder', () => {
+  // The old encoding dropped the reorder whenever anything else changed, so
+  // an undo that restored both a colour and a z-order lost the z-order.
   const a = rect('a');
   const b = rect('b');
   const { ops } = diffElements([a, b], [rect('b', { x: 9 }), a], makeOp);
-  assert.deepEqual(ops.map((o) => o.kind), ['update']);
+  assert.deepEqual(ops.map((o) => o.kind), ['update', 'reorder']);
+  assert.deepEqual(ops[1].order, ['b', 'a']);
+});
+
+test('diffElements: creates that land on top need no reorder', () => {
+  const a = rect('a');
+  const { ops } = diffElements([a], [a, rect('b'), rect('c')], makeOp);
+  assert.deepEqual(ops.map((o) => o.kind), ['create', 'create']);
+});
+
+test('diffElements: a create BELOW existing elements adds a reorder (undo of a delete)', () => {
+  // The server appends a create on top; restoring an element in place needs
+  // the order too, or the undone element comes back above everything.
+  const a = rect('a');
+  const c = rect('c');
+  const { ops } = diffElements([a, c], [a, rect('b'), c], makeOp);
+  assert.deepEqual(ops.map((o) => o.kind), ['create', 'reorder']);
+  assert.deepEqual(ops[1].order, ['a', 'b', 'c']);
+});
+
+test('diffElements: a delete alone needs no reorder', () => {
+  // New objects for a and c with identical content (a resync hands us fresh
+  // JSON): no update ships, only the delete.
+  const { ops } = diffElements([rect('a'), rect('b'), rect('c')], [rect('a'), rect('c')], makeOp);
+  assert.deepEqual(ops.map((o) => o.kind), ['delete']);
 });
 
 test('diffElements: a patch never carries id or type', () => {
@@ -219,36 +243,91 @@ test('diffElements: a points change sends points, not a stale box', () => {
   assert.equal(ops[0].patch.x, undefined, 'the box is re-derived server-side, not sent stale');
 });
 
-test('diffElements: forceFull encodes undo as clear + create', () => {
-  const a = rect('a');
-  const { ops, full } = diffElements([a, rect('b')], [a], makeOp, true);
-  assert.equal(full, true);
-  assert.equal(ops[0].kind, 'clear');
-  assert.deepEqual(ops.slice(1).map((o) => o.kind), ['create']);
+test('diffElements: a removed nullable key is sent as null (unbinding a connector end)', () => {
+  const arrow = (extra) => ({ id: 'ar', type: 'arrow', x: 0, y: 0, w: 10, h: 0, points: [{ x: 0, y: 0 }, { x: 10, y: 0 }], ...extra });
+  const { ops } = diffElements([arrow({ startId: 'a', endId: 'b' })], [arrow({ endId: 'b' })], makeOp);
+  assert.equal(ops.length, 1);
+  assert.deepEqual(ops[0].patch, { startId: null });
 });
 
-test('an undo is actually encoded as clear + create end to end', async () => {
-  // Undo/redo must go through `replaceAll` for the epoch to bump. If it
-  // wrote `elements` directly, the bridge would emit a `reorder` instead.
+test('diffElements: groupId removal is null too', () => {
+  const { ops } = diffElements([rect('a', { groupId: 'g1' })], [rect('a')], makeOp);
+  assert.deepEqual(ops[0].patch, { groupId: null });
+});
+
+test('diffElements: keys the server cannot null get their default (undo of lock / first rotation)', () => {
+  const { ops } = diffElements([rect('a', { locked: true, rotation: 0.5 })], [rect('a')], makeOp);
+  assert.deepEqual(ops[0].patch, { locked: false, rotation: 0 });
+  assert.equal(clearedValue('endArrowhead', { type: 'arrow' }), 'arrow');
+  assert.equal(clearedValue('endArrowhead', { type: 'line' }), 'none');
+  assert.equal(clearedValue('createdAt', { type: 'rect' }), undefined, 'unexpressible keys are left alone');
+});
+
+test('diffElements: the patch never carries undefined or a stale key', () => {
+  const { ops } = diffElements([rect('a', { label: 'x' })], [rect('a', { label: undefined })], makeOp);
+  assert.deepEqual(ops[0].patch, { label: null });
+  assert.ok(!JSON.stringify(ops).includes('undefined'));
+});
+
+test('an undo ships a MINIMAL diff, never clear + create', async () => {
   const { client, sync } = harness();
   s().commit('add');
   s().addElements([rect('a'), rect('b')]);
   await wait();
   client.sent.length = 0;
 
-  // Undo once, back to empty. `clear` is still the right first op even with
-  // nothing to recreate — the other peers must be emptied either way.
   s().undo();
   await wait();
+  assert.deepEqual(client.sent.map((o) => o.kind).sort(), ['delete', 'delete'], 'exactly the two deletes');
+  assert.ok(!client.sent.some((o) => o.kind === 'clear'), 'no clear, ever');
 
-  assert.equal(client.sent[0].kind, 'clear', 'undo starts with a clear, not a reorder');
-
-  // Redo must come back as clear + create for both elements.
   client.sent.length = 0;
   s().redo();
   await wait();
-  assert.equal(client.sent[0].kind, 'clear');
-  assert.equal(client.sent.filter((o) => o.kind === 'create').length, 2, 'both elements are re-created');
+  assert.deepEqual(client.sent.map((o) => o.kind), ['create', 'create']);
+  sync.stop();
+});
+
+test("undo does NOT touch a collaborator's element created after the commit", async () => {
+  // The bug this replaces: undo was clear + re-create of the old snapshot,
+  // which deleted everything a peer had added since.
+  const { client, sync } = harness();
+  s().commit('add');
+  s().addElement(rect('mine'));
+  await wait();
+  withRemote(() => s().applyRemoteOps([{ kind: 'create', element: rect('theirs') }]));
+  withRemote(() => s().applyRemoteOps([{ kind: 'update', elementId: 'mine', patch: { fill: '#ffc9c9' } }]));
+  client.sent.length = 0;
+
+  s().undo();
+  await wait();
+  assert.deepEqual(client.sent.map((o) => [o.kind, o.elementId]), [['delete', 'mine']]);
+  assert.deepEqual(s().elements.map((e) => e.id), ['theirs'], 'their element survives locally too');
+
+  client.sent.length = 0;
+  s().redo();
+  await wait();
+  assert.deepEqual(client.sent.map((o) => o.kind), ['create', 'reorder'], 'mine comes back BELOW theirs, where it was');
+  assert.deepEqual(s().elements.map((e) => e.id), ['mine', 'theirs']);
+  assert.equal(s().elements[0].fill, '#ffc9c9', 'with the remote colour change it had received');
+  sync.stop();
+});
+
+test('undo of a move reverts only the moved field, keeping a remote recolour', async () => {
+  const { client, sync } = harness();
+  s().addElement(rect('a'));
+  await wait();
+  s().commit('move:1');
+  s().updateElement('a', { x: 50 });
+  await wait();
+  withRemote(() => s().applyRemoteOps([{ kind: 'update', elementId: 'a', patch: { stroke: '#e03131' } }]));
+  client.sent.length = 0;
+
+  s().undo();
+  await wait();
+  assert.equal(client.sent.length, 1);
+  assert.deepEqual(client.sent[0].patch, { x: 0 });
+  assert.equal(s().elements[0].stroke, '#e03131');
   sync.stop();
 });
 
@@ -293,4 +372,68 @@ test('collapseOps keeps everything when there is no clear', () => {
     { opId: '2', kind: 'update', elementId: 'a', patch: { x: 1 } },
   ];
   assert.equal(collapseOps(ops).length, 2);
+});
+
+test('collapseOps does NOT merge an update across a delete + re-create of the element', () => {
+  // undo (delete) then redo (create) inside one debounce window: merging the
+  // later update into the earlier one would apply it to the dead element.
+  const out = collapseOps([
+    { opId: '1', kind: 'update', elementId: 'a', patch: { x: 1 } },
+    { opId: '2', kind: 'delete', elementId: 'a' },
+    { opId: '3', kind: 'create', element: rect('a') },
+    { opId: '4', kind: 'update', elementId: 'a', patch: { x: 2 } },
+  ]);
+  assert.deepEqual(out.map((o) => o.opId), ['1', '2', '3', '4']);
+  assert.equal(out[3].patch.x, 2);
+});
+
+test('collapseOps never merges into or drops FROZEN (already sent) ops', () => {
+  const frozen = new Set(['1']);
+  const out = collapseOps(
+    [
+      { opId: '1', kind: 'update', elementId: 'a', patch: { x: 1 } },
+      { opId: '2', kind: 'update', elementId: 'a', patch: { x: 2 } },
+      { opId: '3', kind: 'update', elementId: 'a', patch: { y: 3 } },
+    ],
+    { frozen },
+  );
+  assert.deepEqual(out.map((o) => o.opId), ['1', '2'], '2 and 3 merge, 1 stays as sent');
+  assert.deepEqual(out[0].patch, { x: 1 });
+  assert.deepEqual(out[1].patch, { x: 2, y: 3 });
+});
+
+test('a board switch is never shipped as ops', async () => {
+  const { client, sync } = harness();
+  s().setBoardId('A');
+  await wait();
+  s().addElement(rect('a'));
+  await wait();
+  client.sent.length = 0;
+
+  // The App hydrates board B without withRemote (a mistake the bridge must survive).
+  s().setSnapshot({ board: { id: 'B' }, elements: [rect('b1')], rev: 3 });
+  s().reset();
+  await wait();
+  assert.equal(client.sent.length, 0, 'no delete of A elements, no create of B elements');
+  sync.stop();
+});
+
+test('the first edit after a bare board-id change IS shipped', async () => {
+  const { client, sync } = harness();
+  s().setBoardId('B'); // no element change at all (an empty board)
+  s().addElement(rect('first'));
+  await wait();
+  assert.deepEqual(client.sent.map((o) => o.kind), ['create']);
+  sync.stop();
+});
+
+test('pendingOps() exposes the debounce window without flushing it', async () => {
+  const { client, sync } = harness();
+  s().addElement(rect('a'));
+  assert.deepEqual(sync.pendingOps().map((o) => o.kind), ['create']);
+  assert.equal(client.sent.length, 0);
+  await wait();
+  assert.equal(sync.pendingOps().length, 0);
+  assert.equal(client.sent.length, 1);
+  sync.stop();
 });

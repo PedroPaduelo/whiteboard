@@ -14,7 +14,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { useBoardStore, initialState } from './boardStore.js';
+import { useBoardStore, initialState, applyOpsToElements, describeTransition, rebaseEntry, mergePatch } from './boardStore.js';
+import { DEFAULT_STYLE } from '../editor/constants.js';
 
 /** The store's actions, bound to a fresh reset. */
 const s = () => useBoardStore.getState();
@@ -609,7 +610,7 @@ test('setStyle merges without dropping the other keys', () => {
   s().setStyle({ strokeWidth: 8 });
   assert.equal(s().style.stroke, '#ff0000', 'the earlier change survived');
   assert.equal(s().style.strokeWidth, 8);
-  assert.equal(before, s().style.strokeWidth ? before : before);
+  assert.notEqual(before, 8, 'the width really changed');
 });
 
 test('subscribe fires on every mutation and can be torn down', () => {
@@ -643,4 +644,301 @@ test('the SAME label outside 500ms does NOT coalesce', async () => {
   s().updateElement('a', { x: 2 });
 
   assert.equal(s().pastDepth, depthBefore + 2, 'the window really is a window');
+});
+
+// ============================================================ editor rewrite
+
+test('initial state: Excalidraw defaults', () => {
+  const st = s();
+  assert.deepEqual(st.style, { ...DEFAULT_STYLE }, 'style starts from DEFAULT_STYLE');
+  assert.notEqual(st.style, DEFAULT_STYLE, 'a copy, never the frozen constant');
+  assert.equal(st.snapEnabled, false, 'grid mode is off by default');
+  assert.equal(st.gridSize, 20);
+  assert.equal(st.toolLocked, false);
+  assert.deepEqual(st.viewportSize, { w: 0, h: 0 });
+  assert.equal(st.connection, 'idle');
+});
+
+test('setTool clears editingId and, for drawing tools, the selection', () => {
+  s().addElements([rect('a'), rect('b')]);
+  s().select(['a', 'b']);
+  s().setEditing('a');
+
+  s().setTool('hand');
+  assert.equal(s().editingId, null, 'any tool change ends the text edit');
+  assert.equal(s().selection.size, 2, 'hand keeps the selection');
+
+  s().setTool('select');
+  assert.equal(s().selection.size, 2, 'select keeps the selection');
+
+  s().setTool('rect');
+  assert.equal(s().tool, 'rect');
+  assert.equal(s().selection.size, 0, 'a drawing tool clears the selection');
+});
+
+test('setTool accepts the image tool and rejects unknown ones', () => {
+  s().setTool('image');
+  assert.equal(s().tool, 'image');
+  s().setTool('laser-beam');
+  assert.equal(s().tool, 'image');
+});
+
+test('tool lock toggles', () => {
+  s().toggleToolLocked();
+  assert.equal(s().toolLocked, true);
+  s().setToolLocked(false);
+  assert.equal(s().toolLocked, false);
+});
+
+test('setViewportSize stores CSS px and fitToContent uses it', () => {
+  s().setViewportSize({ w: 1000, h: 1000 });
+  assert.deepEqual(s().viewportSize, { w: 1000, h: 1000 });
+  const same = s().viewportSize;
+  s().setViewportSize({ w: 1000, h: 1000 });
+  assert.equal(s().viewportSize, same, 'an unchanged size is not a store write');
+
+  s().addElements([rect('a', 0, 0, 100, 100), rect('b', 900, 900, 100, 100)]);
+  s().fitToContent();
+  const byStore = { ...s().view };
+  s().fitToContent({ vw: 1000, vh: 1000 });
+  assert.deepEqual(s().view, byStore, 'no argument = the reported canvas size');
+});
+
+test('setConnection accepts only the realtime states', () => {
+  s().setConnection('connected');
+  assert.equal(s().connection, 'connected');
+  s().setConnection('banana');
+  assert.equal(s().connection, 'connected');
+});
+
+test('a null patch value DELETES the key (unbinding, leaving a group)', () => {
+  s().addElements([rect('a'), rect('b'), arrow('link', { startId: 'a', endId: 'b' })]);
+  s().updateElement('link', { startId: null });
+  const link = s().elements.find((e) => e.id === 'link');
+  assert.ok(!('startId' in link), 'the key is gone, not set to null');
+  assert.equal(link.endId, 'b');
+
+  s().updateElements([{ id: 'a', patch: { groupId: 'g' } }]);
+  s().updateElements([{ id: 'a', patch: { groupId: null } }]);
+  assert.ok(!('groupId' in s().elements[0]));
+});
+
+test('a patch that changes nothing keeps the element identity', () => {
+  s().addElement(rect('a'));
+  const before = s().elements;
+  s().updateElement('a', { x: 0 });
+  assert.equal(s().elements, before, 'no new array, no sync diff, no re-render');
+  assert.equal(mergePatch(before[0], { y: 0, stroke: '#1f2937' }), before[0]);
+});
+
+test('a polyline re-boxes from its points even when only x/y were patched', () => {
+  s().addElement(pen('p', [{ x: 0, y: 0 }, { x: 10, y: 10 }]));
+  s().updateElement('p', { x: 500 });
+  assert.equal(s().elements[0].x, 0, 'the server re-derives the box from points; so do we');
+});
+
+test('addElement ignores an id that is already on the board', () => {
+  s().addElement(rect('a', 0));
+  s().addElement(rect('a', 99));
+  s().addElements([rect('a', 5), rect('b')]);
+  assert.deepEqual(ids(), ['a', 'b']);
+  assert.equal(s().elements[0].x, 0);
+});
+
+// --------------------------------------------------------- applyRemoteOps
+
+test('applyRemoteOps applies a batch in order, then ONE connector pass', () => {
+  s().addElements([rect('a', 0, 0, 100, 100), rect('b', 400, 0, 100, 100), arrow('link', { startId: 'a', endId: 'b', x: 100, y: 50, w: 300 })]);
+  const before = s().elements.find((e) => e.id === 'link').points;
+
+  let writes = 0;
+  const off = useBoardStore.subscribe(() => (writes += 1));
+  s().applyRemoteOps([
+    { kind: 'update', elementId: 'b', patch: { y: 300 } },
+    { kind: 'create', element: rect('c', 0, 600) },
+    { kind: 'update', elementId: 'c', patch: { x: 10 } },
+  ]);
+  off();
+
+  assert.equal(writes, 1, 'one store write for the whole batch');
+  assert.deepEqual(ids(), ['a', 'b', 'link', 'c']);
+  assert.equal(s().elements.find((e) => e.id === 'c').x, 10, 'a later op sees an earlier create');
+  const after = s().elements.find((e) => e.id === 'link').points;
+  assert.notDeepEqual(after, before, 'the bound arrow followed b, like the server does');
+  assert.equal(s().pastDepth, 0, 'remote ops never create history');
+});
+
+test('applyRemoteOps: create is idempotent, update of a missing id is skipped', () => {
+  s().addElement(rect('a', 0));
+  const before = s().elements;
+  s().applyRemoteOps([
+    { kind: 'create', element: rect('a', 999) },
+    { kind: 'update', elementId: 'ghost', patch: { x: 1 } },
+  ]);
+  assert.equal(s().elements, before, 'nothing changed, nothing written');
+});
+
+test('applyRemoteOps detaches a created connector bound to a missing element', () => {
+  s().applyRemoteOps([{ kind: 'create', element: arrow('link', { startId: 'nowhere' }) }]);
+  assert.ok(!('startId' in s().elements[0]));
+});
+
+test('applyRemoteOps: null patch deletes, delete prunes the selection, clear empties', () => {
+  s().addElements([rect('a', 0, 0, 10, 10, { groupId: 'g' }), rect('b')]);
+  s().select(['a', 'b']);
+  s().applyRemoteOps([{ kind: 'update', elementId: 'a', patch: { groupId: null } }, { kind: 'delete', elementId: 'b' }]);
+  assert.ok(!('groupId' in s().elements[0]));
+  assert.deepEqual(Array.from(s().selection), ['a']);
+  s().applyRemoteOps([{ kind: 'clear' }]);
+  assert.deepEqual(ids(), []);
+  assert.equal(s().selection.size, 0);
+});
+
+test('applyRemoteOps: reorder follows the server rule (unknown ids ignored, forgotten ones last)', () => {
+  s().addElements([rect('a'), rect('b'), rect('c')]);
+  s().applyRemoteOps([{ kind: 'reorder', order: ['c', 'ghost', 'a'] }]);
+  assert.deepEqual(ids(), ['c', 'a', 'b']);
+});
+
+test('applyOpsToElements is pure and returns the same array for a no-op batch', () => {
+  const els = [rect('a')];
+  const res = applyOpsToElements(els, [{ kind: 'delete', elementId: 'zzz' }]);
+  assert.equal(res.elements, els);
+  const res2 = applyOpsToElements(els, [{ kind: 'update', elementId: 'a', patch: { x: 3 } }]);
+  assert.equal(els[0].x, 0, 'input untouched');
+  assert.equal(res2.elements[0].x, 3);
+  assert.equal(res2.geometry, true);
+});
+
+// ------------------------------------------------------ history rebase
+
+test('undo does not delete an element a peer created after the commit', () => {
+  s().commit('add');
+  s().addElement(rect('mine'));
+  s().applyRemoteOps([{ kind: 'create', element: rect('theirs') }]);
+  s().undo();
+  assert.deepEqual(ids(), ['theirs']);
+  s().redo();
+  assert.deepEqual(ids(), ['mine', 'theirs'], 'redo restores mine in its old place');
+});
+
+test('undo keeps a remote change to another field and yields to a remote change of the same field', () => {
+  s().addElement(rect('a'));
+  s().commit('move:1');
+  s().updateElement('a', { x: 50, y: 50 });
+  s().applyRemoteOps([{ kind: 'update', elementId: 'a', patch: { stroke: '#e03131', y: 70 } }]);
+  s().undo();
+  const a = s().elements[0];
+  assert.equal(a.x, 0, 'my x move is undone');
+  assert.equal(a.y, 70, 'their later y wins over my undo');
+  assert.equal(a.stroke, '#e03131', 'their colour survives');
+});
+
+test('undo does not resurrect an element a peer deleted', () => {
+  s().addElements([rect('a'), rect('b')]);
+  s().commit('move:2');
+  s().updateElement('a', { x: 10 });
+  s().applyRemoteOps([{ kind: 'delete', elementId: 'b' }]);
+  s().undo();
+  assert.deepEqual(ids(), ['a']);
+  assert.equal(s().elements[0].x, 0);
+});
+
+test('undo skips commits that were never followed by a change', () => {
+  s().commit('add');
+  s().addElement(rect('a'));
+  s().commit('click-without-drag'); // no mutation follows
+  s().undo();
+  assert.deepEqual(ids(), [], 'one Ctrl+Z undoes the add, not the empty entry');
+  assert.equal(s().canUndo, false);
+});
+
+test('rebaseEntry: identity is preserved when the snapshot shares the element', () => {
+  const a = rect('a');
+  const b = rect('b');
+  const entry = [a, b];
+  const aNext = { ...a, x: 5 };
+  const t = describeTransition([a, b], [aNext, b]);
+  const rebased = rebaseEntry(entry, t);
+  assert.equal(rebased[0], aNext, 'the very same object, so no-op detection works');
+  assert.equal(rebased[1], b);
+  assert.equal(rebaseEntry(entry, null), entry);
+  assert.equal(describeTransition(entry, entry), null);
+});
+
+test('describeTransition detects a real reorder but not a create or delete', () => {
+  const a = rect('a');
+  const b = rect('b');
+  const c = rect('c');
+  assert.equal(describeTransition([a, b], [a, b, c]).order, null);
+  assert.equal(describeTransition([a, b, c], [a, c]).order, null);
+  assert.deepEqual(describeTransition([a, b], [b, a]).order, ['b', 'a']);
+});
+
+// -------------------------------------------------------------- snapshots
+
+test('setSnapshot ignores a snapshot OLDER than the board already shows', () => {
+  s().setSnapshot({ board: { id: 'b1' }, elements: [rect('new')], rev: 7 });
+  s().setSnapshot({ board: { id: 'b1' }, elements: [rect('old')], rev: 3 });
+  assert.deepEqual(ids(), ['new'], 'a late HTTP seed must not roll the board back');
+  s().setSnapshot({ board: { id: 'b1' }, elements: [rect('old')], rev: 3 }, { force: true });
+  assert.deepEqual(ids(), ['old']);
+  s().setSnapshot({ board: { id: 'b2' }, elements: [rect('other')], rev: 1 });
+  assert.deepEqual(ids(), ['other'], 'another board is always accepted');
+});
+
+test('resyncSnapshot re-applies pending ops and keeps (rebased) history on the same board', () => {
+  s().setSnapshot({ board: { id: 'b1' }, elements: [rect('a')], rev: 1 });
+  s().commit('move:3');
+  s().updateElement('a', { x: 40 });
+  // Server truth: a peer created 'p' and nobody has our move yet.
+  s().resyncSnapshot(
+    { board: { id: 'b1', title: 'T' }, elements: [rect('a'), rect('p')], rev: 5 },
+    [{ kind: 'update', elementId: 'a', patch: { x: 40 } }],
+  );
+  assert.deepEqual(ids(), ['a', 'p']);
+  assert.equal(s().elements[0].x, 40, 'our pending move is still visible');
+  assert.equal(s().rev, 5);
+  assert.equal(s().board.title, 'T');
+  assert.equal(s().canUndo, true, 'a reconnect does not cost the user their history');
+  s().undo();
+  assert.deepEqual(ids(), ['a', 'p'], "undo keeps the peer's element");
+  assert.equal(s().elements[0].x, 0);
+});
+
+test('resyncSnapshot keeps element identity for elements that did not change', () => {
+  s().setSnapshot({ board: { id: 'b1' }, elements: [rect('a'), rect('b')], rev: 1 });
+  const before = s().elements;
+  s().resyncSnapshot({ board: { id: 'b1' }, elements: [rect('a'), rect('b')], rev: 2 });
+  assert.equal(s().elements, before, 'fresh JSON with equal content changes nothing');
+});
+
+test('resyncSnapshot of ANOTHER board is a hydration (history wiped)', () => {
+  s().setSnapshot({ board: { id: 'b1' }, elements: [], rev: 1 });
+  s().commit('add');
+  s().addElement(rect('a'));
+  s().resyncSnapshot({ board: { id: 'b2' }, elements: [rect('z')], rev: 9 });
+  assert.equal(s().boardId, 'b2');
+  assert.deepEqual(ids(), ['z']);
+  assert.equal(s().canUndo, false);
+});
+
+// ------------------------------------------------------------------ peers
+
+test('setPeers drops the cursors of peers that left', () => {
+  s().upsertCursor('p1', { x: 1, y: 1, name: 'Ana', color: '#e03131' });
+  s().upsertCursor('p2', { x: 2, y: 2 });
+  s().setPeers([{ id: 'me' }, { id: 'p1' }]);
+  assert.deepEqual([...s().remoteCursors.keys()], ['p1']);
+});
+
+test('upsertCursor stores name and colour and keeps them on a bare move', () => {
+  s().upsertCursor('p1', { x: 1, y: 1, name: 'Ana', color: '#e03131' });
+  const mapBefore = s().remoteCursors;
+  s().upsertCursor('p1', { x: 5, y: 6 });
+  const cur = s().remoteCursors.get('p1');
+  assert.equal(cur.name, 'Ana');
+  assert.equal(cur.color, '#e03131');
+  assert.equal(cur.x, 5);
+  assert.notEqual(s().remoteCursors, mapBefore, 'a new Map, so useRemoteCursors re-renders');
 });

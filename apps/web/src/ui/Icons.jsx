@@ -1,437 +1,595 @@
 /**
- * Icons.jsx — the app's entire icon set, hand-written as inline SVG.
+ * Icons.jsx — the interface's icon set: clean 24×24 stroke icons in the
+ * spirit of Excalidraw's (round caps and joins, `currentColor`, no fills
+ * unless the glyph IS a fill), so they inherit the button colour in both
+ * themes and the active-tool violet.
  *
- * Why not a library: thirty 24x24 stroke glyphs are ~4KB of markup and zero
- * network weight, while a tree-shakeable icon package is either several times
- * that or a maintenance dependency. The icons are part of the product's
- * visual identity, so they live here where they can be tuned.
- *
- * House rules, applied to every icon below so the set reads as one family:
- *   - 24x24 viewBox, no width/height baked in (the `size` prop sets them)
- *   - fill: none, stroke: currentColor, strokeWidth 1.75
- *   - round caps and joins everywhere; `rx` of 2 or 3 on any corner
- *   - a glyph fits in a 20x20 box with >=2px of padding
- *
- * Every component takes `{ size = 20, className, ...rest }`.
+ * Each icon is a component `<IconName size={20} />`. `ICONS` maps the names
+ * used by editor/tools.js TOOLBAR (`icon: 'Square'`) to components, and
+ * `<Icon name="Square" />` renders by name.
  */
 
 import React from 'react';
 
-const base = {
-  xmlns: 'http://www.w3.org/2000/svg',
-  viewBox: '0 0 24 24',
-  fill: 'none',
-  stroke: 'currentColor',
-  strokeWidth: 1.75,
-  strokeLinecap: 'round',
-  strokeLinejoin: 'round',
-  'aria-hidden': true,
-  focusable: false,
-};
-
-/** Build an icon component from a static path spec. */
-function icon(displayName, paths) {
-  const Icon = ({ size = 20, className, ...rest }) => (
-    <svg {...base} width={size} height={size} className={className} {...rest}>
-      {paths}
-    </svg>
-  );
-  Icon.displayName = displayName;
+function make(name, children, { strokeWidth = 1.75 } = {}) {
+  function Icon({ size = 20, strokeWidth: sw = strokeWidth, className, style, title }) {
+    return (
+      <svg
+        className={className}
+        style={style}
+        width={size}
+        height={size}
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth={sw}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        aria-hidden={title ? undefined : 'true'}
+        role={title ? 'img' : undefined}
+        focusable="false"
+      >
+        {title ? <title>{title}</title> : null}
+        {children}
+      </svg>
+    );
+  }
+  Icon.displayName = `Icon${name}`;
   return Icon;
 }
 
-/* --- modes ---------------------------------------------------------------- */
+const P = (d) => <path d={d} />;
 
-export const IconSelect = icon('IconSelect', (
+/* --- tools ------------------------------------------------------------------ */
+
+export const IconHand = make('Hand', (
   <>
-    <path d="M5 3.5 18.5 12l-6.2 1.1-2.6 5.6z" />
+    {P('M8 13V5.5a1.5 1.5 0 0 1 3 0V12')}
+    {P('M11 5.5v-2a1.5 1.5 0 0 1 3 0V12')}
+    {P('M14 5.5a1.5 1.5 0 0 1 3 0V12')}
+    {P('M17 7.5a1.5 1.5 0 0 1 3 0V16a6 6 0 0 1-6 6h-2 .21a6 6 0 0 1-5.01-2.7l-.2-.3c-.31-.48-1.4-2.39-3.29-5.73a1.5 1.5 0 0 1 .54-2.02 1.87 1.87 0 0 1 2.28.28L8 13')}
   </>
 ));
 
-export const IconHand = icon('IconHand', (
+export const IconPointer = make('Pointer', (
   <>
-    <path d="M8.5 11V5.8a1.4 1.4 0 0 1 2.8 0V11" />
-    <path d="M11.3 10.6V4.9a1.4 1.4 0 0 1 2.8 0v5.7" />
-    <path d="M14.1 11V6.6a1.4 1.4 0 0 1 2.8 0V13" />
-    <path d="M16.9 12.2v-2a1.4 1.4 0 0 1 2.8 0v4.2a5.6 5.6 0 0 1-5.6 5.6h-.7a5 5 0 0 1-3.8-1.8l-3.3-3.9a1.5 1.5 0 0 1 2.2-2l1.5 1.4" />
+    {P('M7.9 17.56a1.2 1.2 0 0 0 2.23.31l2.09-3.09 4.9 4.9a1.07 1.07 0 0 0 1.51 0l1.05-1.04a1.07 1.07 0 0 0 0-1.51l-4.9-4.91 3.1-2.09a1.2 1.2 0 0 0-.3-2.23L4 4z')}
   </>
 ));
 
-/* --- drawing tools -------------------------------------------------------- */
+export const IconSquare = make('Square', <rect x="4" y="4" width="16" height="16" rx="2.5" />);
 
-export const IconPen = icon('IconPen', (
+export const IconDiamond = make('Diamond', (
+  P('M10.5 20.4l-6.9-6.9c-.78-.78-.78-2.22 0-3l6.9-6.9c.78-.78 2.22-.78 3 0l6.9 6.9c.78.78.78 2.22 0 3l-6.9 6.9c-.78.78-2.22.78-3 0z')
+));
+
+export const IconCircle = make('Circle', <circle cx="12" cy="12" r="8.5" />);
+
+export const IconArrowRight = make('ArrowRight', (
   <>
-    <path d="M4 20.2 4.9 16a2 2 0 0 1 .5-1L15.3 5a1.8 1.8 0 0 1 2.6 0l1.1 1.1a1.8 1.8 0 0 1 0 2.6L9 18.7a2 2 0 0 1-1 .5z" />
-    <path d="M14.2 6.2 17.8 9.8" />
+    {P('M5 12h14')}
+    {P('M13 6l6 6-6 6')}
   </>
 ));
 
-export const IconRect = icon('IconRect', (
+export const IconLine = make('Line', P('M5 12h14'));
+
+export const IconPencil = make('Pencil', (
   <>
-    <rect x="3.5" y="5.5" width="17" height="13" rx="2" />
+    {P('M4 20h4L18.5 9.5a2.83 2.83 0 0 0-4-4L4 16v4')}
+    {P('M13.5 6.5l4 4')}
   </>
 ));
 
-export const IconEllipse = icon('IconEllipse', (
+export const IconText = make('Text', (
   <>
-    <ellipse cx="12" cy="12" rx="8.5" ry="6.8" />
+    {P('M6 5h12')}
+    {P('M12 5v14')}
+    {P('M10 19h4')}
   </>
 ));
 
-export const IconDiamond = icon('IconDiamond', (
+export const IconImage = make('Image', (
   <>
-    <path d="M12 3.6 20.4 12 12 20.4 3.6 12z" />
+    <rect x="3.5" y="3.5" width="17" height="17" rx="3" />
+    {P('M15 8.5h.01')}
+    {P('M3.5 16l5-5c.93-.9 2.07-.9 3 0l5 5')}
+    {P('M14 14l1-1c.93-.9 2.07-.9 3 0l2.5 2.5')}
   </>
 ));
 
-export const IconCylinder = icon('IconCylinder', (
+export const IconEraser = make('Eraser', (
   <>
-    <ellipse cx="12" cy="6" rx="7" ry="2.8" />
-    <path d="M5 6v12c0 1.55 3.13 2.8 7 2.8s7-1.25 7-2.8V6" />
-    <path d="M5 12c0 1.55 3.13 2.8 7 2.8s7-1.25 7-2.8" />
+    {P('M19 20H8.5l-4.21-4.3a1 1 0 0 1 0-1.41l10-10a1 1 0 0 1 1.41 0l5 5a1 1 0 0 1 0 1.41L11.5 20')}
+    {P('M18 13.3L11.7 7')}
   </>
 ));
 
-export const IconSticky = icon('IconSticky', (
+export const IconSticky = make('Sticky', (
   <>
-    <path d="M4.5 5.2A1.7 1.7 0 0 1 6.2 3.5h11.6a1.7 1.7 0 0 1 1.7 1.7v8.6L14 19.5H6.2a1.7 1.7 0 0 1-1.7-1.7z" />
-    <path d="M19.5 13.5H15.6a1.6 1.6 0 0 0-1.6 1.6v4.4" />
-    <path d="M8 8.4h6M8 11.6h4" />
+    {P('M13 20l7-7')}
+    {P('M13 20v-6a1 1 0 0 1 1-1h6V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h7')}
   </>
 ));
 
-export const IconText = icon('IconText', (
+export const IconCylinder = make('Cylinder', (
   <>
-    <path d="M5 6.2V4.5h14v1.7" />
-    <path d="M12 4.8v14.4" />
-    <path d="M9 19.2h6" />
+    <ellipse cx="12" cy="6" rx="7.5" ry="2.75" />
+    {P('M4.5 6v12c0 1.52 3.36 2.75 7.5 2.75s7.5-1.23 7.5-2.75V6')}
   </>
 ));
 
-export const IconArrow = icon('IconArrow', (
+export const IconShapes = make('Shapes', (
   <>
-    <path d="M4.5 19 19 5" />
-    <path d="M12.4 4.8h6.9v6.9" />
+    <rect x="3.5" y="3.5" width="7" height="7" rx="1.5" />
+    <circle cx="17" cy="7" r="3.5" />
+    {P('M7 13.5l3.5 6.5h-7z')}
+    <rect x="13.5" y="13.5" width="7" height="7" rx="1.5" />
   </>
 ));
 
-export const IconLine = icon('IconLine', (
+/* --- chrome ------------------------------------------------------------------- */
+
+export const IconLock = make('Lock', (
   <>
-    <path d="M4.5 19.5 19.5 4.5" />
+    <rect x="5" y="11" width="14" height="10" rx="2" />
+    {P('M11 16a1 1 0 1 0 2 0 1 1 0 0 0-2 0')}
+    {P('M8 11V7a4 4 0 1 1 8 0v4')}
   </>
 ));
 
-export const IconEraser = icon('IconEraser', (
+export const IconUnlock = make('Unlock', (
   <>
-    <path d="m9.1 16.6-4.4-4.4a2 2 0 0 1 0-2.8l6-6a2 2 0 0 1 2.8 0l6 6a2 2 0 0 1 0 2.8l-6 6a2 2 0 0 1-2.8 0l-1.6-1.6" />
-    <path d="m8 9.4 6.6 6.6" />
-    <path d="M10.6 19.5h8.9" />
+    <rect x="5" y="11" width="14" height="10" rx="2" />
+    {P('M11 16a1 1 0 1 0 2 0 1 1 0 0 0-2 0')}
+    {P('M8 11V6a4 4 0 0 1 8 0')}
   </>
 ));
 
-/* --- history -------------------------------------------------------------- */
-
-export const IconUndo = icon('IconUndo', (
+export const IconMenu = make('Menu', (
   <>
-    <path d="M4 9.5h9.6a5.4 5.4 0 0 1 0 10.8H8.2" />
-    <path d="M7.8 5.3 3.6 9.5l4.2 4.2" />
+    {P('M4 6h16')}
+    {P('M4 12h16')}
+    {P('M4 18h16')}
   </>
 ));
 
-export const IconRedo = icon('IconRedo', (
+export const IconLibrary = make('Library', (
   <>
-    <path d="M20 9.5h-9.6a5.4 5.4 0 0 0 0 10.8h5.4" />
-    <path d="M16.2 5.3 20.4 9.5l-4.2 4.2" />
+    <rect x="4" y="4" width="4.5" height="16" rx="1" />
+    <rect x="8.5" y="4" width="4.5" height="16" rx="1" />
+    {P('M4 8h4.5')}
+    {P('M8.5 16H13')}
+    {P('M13.8 4.56l2.18-.53c.56-.14 1.13.19 1.28.73l3.7 13.42a1.02 1.02 0 0 1-.64 1.22l-.13.04-2.18.53c-.56.14-1.13-.19-1.28-.73L13.03 5.82a1.02 1.02 0 0 1 .64-1.22z')}
   </>
 ));
 
-/* --- view ----------------------------------------------------------------- */
-
-export const IconGrid = icon('IconGrid', (
+export const IconShare = make('Share', (
   <>
-    <path d="M3.8 9.4h16.4M3.8 14.6h16.4" />
-    <path d="M9.4 3.8v16.4M14.6 3.8v16.4" />
+    <circle cx="6" cy="12" r="2.75" />
+    <circle cx="18" cy="6" r="2.75" />
+    <circle cx="18" cy="18" r="2.75" />
+    {P('M8.5 10.75l7-3.5')}
+    {P('M8.5 13.25l7 3.5')}
   </>
 ));
 
-export const IconSnap = icon('IconSnap', (
+export const IconHelp = make('Help', (
   <>
-    <path d="M4 6.5v4.2a2 2 0 0 0 2 2h4.2" />
-    <path d="M20 6.5v4.2a2 2 0 0 1-2 2h-4.2" />
-    <path d="M4 17.5v-4.2a2 2 0 0 1 2-2h4.2" />
-    <path d="M20 17.5v-4.2a2 2 0 0 0-2-2h-4.2" />
-    <path d="M8 12h8M12 8v8" />
+    <circle cx="12" cy="12" r="9" />
+    {P('M12 17v.01')}
+    {P('M12 13.5a2 2 0 0 0 .91-3.78 1.98 1.98 0 0 0-2.41.48')}
   </>
 ));
 
-export const IconZoomIn = icon('IconZoomIn', (
+export const IconZoomIn = make('ZoomIn', (
   <>
-    <circle cx="10.8" cy="10.8" r="6.3" />
-    <path d="m15.4 15.4 4.1 4.1" />
-    <path d="M8.3 10.8h5M10.8 8.3v5" />
+    {P('M12 5v14')}
+    {P('M5 12h14')}
   </>
 ));
 
-export const IconZoomOut = icon('IconZoomOut', (
+export const IconZoomOut = make('ZoomOut', P('M5 12h14'));
+
+export const IconUndo = make('Undo', (
   <>
-    <circle cx="10.8" cy="10.8" r="6.3" />
-    <path d="m15.4 15.4 4.1 4.1" />
-    <path d="M8.3 10.8h5" />
+    {P('M9 14l-4-4 4-4')}
+    {P('M5 10h11a4 4 0 1 1 0 8h-1')}
   </>
 ));
 
-export const IconZoomFit = icon('IconZoomFit', (
+export const IconRedo = make('Redo', (
   <>
-    <path d="M3.8 8.8V4.6a.8.8 0 0 1 .8-.8h4.2" />
-    <path d="M20.2 8.8V4.6a.8.8 0 0 0-.8-.8h-4.2" />
-    <path d="M3.8 15.2v4.2a.8.8 0 0 0 .8.8h4.2" />
-    <path d="M20.2 15.2v4.2a.8.8 0 0 1-.8.8h-4.2" />
+    {P('M15 14l4-4-4-4')}
+    {P('M19 10H8a4 4 0 1 0 0 8h1')}
   </>
 ));
 
-/* --- chrome --------------------------------------------------------------- */
-
-export const IconHelp = icon('IconHelp', (
+export const IconTrash = make('Trash', (
   <>
-    <circle cx="12" cy="12" r="8.5" />
-    <path d="M9.6 9.4a2.5 2.5 0 0 1 4.85.83c0 1.67-2.45 2.5-2.45 2.5" />
-    <path d="M12 16.6h.01" />
+    {P('M4 7h16')}
+    {P('M10 11v6')}
+    {P('M14 11v6')}
+    {P('M5 7l1 12a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2l1-12')}
+    {P('M9 7V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v3')}
   </>
 ));
 
-export const IconDownload = icon('IconDownload', (
+export const IconDuplicate = make('Duplicate', (
   <>
-    <path d="M12 3.8v10.4" />
-    <path d="m8 10.6 4 4 4-4" />
-    <path d="M4.6 16.4v2.2a1.6 1.6 0 0 0 1.6 1.6h11.6a1.6 1.6 0 0 0 1.6-1.6v-2.2" />
+    <rect x="8" y="8" width="12" height="12" rx="2" />
+    {P('M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2')}
   </>
 ));
 
-export const IconPlus = icon('IconPlus', (
+export const IconGroup = make('Group', (
   <>
-    <path d="M12 5.2v13.6M5.2 12h13.6" />
+    {P('M3 7V5a2 2 0 0 1 2-2h2')}
+    {P('M17 3h2a2 2 0 0 1 2 2v2')}
+    {P('M21 17v2a2 2 0 0 1-2 2h-2')}
+    {P('M7 21H5a2 2 0 0 1-2-2v-2')}
+    <rect x="7" y="7" width="6" height="6" rx="1" />
+    <rect x="11" y="11" width="6" height="6" rx="1" />
   </>
 ));
 
-export const IconTrash = icon('IconTrash', (
+export const IconUngroup = make('Ungroup', (
   <>
-    <path d="M4.8 6.6h14.4" />
-    <path d="M9.4 6.6V5.2a1.4 1.4 0 0 1 1.4-1.4h2.4a1.4 1.4 0 0 1 1.4 1.4v1.4" />
-    <path d="M6.6 6.6 7.4 19a1.6 1.6 0 0 0 1.6 1.5h6a1.6 1.6 0 0 0 1.6-1.5l.8-12.4" />
-    <path d="M10.4 10.2v6.2M13.6 10.2v6.2" />
+    <rect x="4" y="4" width="7" height="7" rx="1" />
+    <rect x="13" y="13" width="7" height="7" rx="1" />
+    {P('M14 4h5a1 1 0 0 1 1 1v5')}
+    {P('M4 14v5a1 1 0 0 0 1 1h5')}
   </>
 ));
 
-export const IconCopy = icon('IconCopy', (
+export const IconBringForward = make('BringForward', (
   <>
-    <rect x="8.6" y="8.6" width="11.2" height="11.2" rx="2" />
-    <path d="M15.4 5.6a2 2 0 0 0-2-2H5.6a2 2 0 0 0-2 2v7.8a2 2 0 0 0 2 2" />
+    {P('M12 19V5')}
+    {P('M7 10l5-5 5 5')}
   </>
 ));
 
-export const IconLock = icon('IconLock', (
+export const IconSendBackward = make('SendBackward', (
   <>
-    <rect x="4.8" y="10.4" width="14.4" height="9.8" rx="2" />
-    <path d="M8.2 10.4V7.8a3.8 3.8 0 0 1 7.6 0v2.6" />
+    {P('M12 5v14')}
+    {P('M7 14l5 5 5-5')}
   </>
 ));
 
-export const IconEye = icon('IconEye', (
+export const IconBringToFront = make('BringToFront', (
   <>
-    <path d="M2.6 12S6 5.9 12 5.9 21.4 12 21.4 12 18 18.1 12 18.1 2.6 12 2.6 12" />
-    <circle cx="12" cy="12" r="2.9" />
+    {P('M5 4h14')}
+    {P('M12 20V9')}
+    {P('M7.5 13.5L12 9l4.5 4.5')}
   </>
 ));
 
-export const IconEyeOff = icon('IconEyeOff', (
+export const IconSendToBack = make('SendToBack', (
   <>
-    <path d="M9.6 6.3A8.7 8.7 0 0 1 12 5.9c6 0 9.4 6.1 9.4 6.1a17 17 0 0 1-2.8 3.5" />
-    <path d="M6.4 8.1A17.4 17.4 0 0 0 2.6 12S6 18.1 12 18.1a9 9 0 0 0 3.6-.75" />
-    <path d="M10 10a2.8 2.8 0 0 0 4 4" />
-    <path d="M4 4l16 16" />
+    {P('M5 20h14')}
+    {P('M12 4v11')}
+    {P('M7.5 10.5L12 15l4.5-4.5')}
   </>
 ));
 
-export const IconChevron = icon('IconChevron', (
+/* --- style glyphs ------------------------------------------------------------- */
+
+export const IconStrokeSolid = make('StrokeSolid', P('M4 12h16'), { strokeWidth: 2 });
+export const IconStrokeDashed = make('StrokeDashed', (
   <>
-    <path d="m9 5.5 6.5 6.5L9 18.5" />
+    {P('M4 12h3')}
+    {P('M10.5 12h3')}
+    {P('M17 12h3')}
+  </>
+), { strokeWidth: 2 });
+export const IconStrokeDotted = make('StrokeDotted', (
+  <>
+    {P('M4 12h.01')}
+    {P('M8 12h.01')}
+    {P('M12 12h.01')}
+    {P('M16 12h.01')}
+    {P('M20 12h.01')}
+  </>
+), { strokeWidth: 2.5 });
+
+export const IconWidthThin = make('WidthThin', P('M4 12h16'), { strokeWidth: 1.25 });
+export const IconWidthBold = make('WidthBold', P('M4 12h16'), { strokeWidth: 2.5 });
+export const IconWidthExtraBold = make('WidthExtraBold', P('M4 12h16'), { strokeWidth: 4 });
+
+export const IconFillHachure = make('FillHachure', (
+  <>
+    <rect x="4" y="4" width="16" height="16" rx="2" />
+    {P('M4 12l8-8')}
+    {P('M4 20L20 4')}
+    {P('M12 20l8-8')}
+  </>
+));
+export const IconFillCrossHatch = make('FillCrossHatch', (
+  <>
+    <rect x="4" y="4" width="16" height="16" rx="2" />
+    {P('M4 12l8-8')}
+    {P('M4 20L20 4')}
+    {P('M12 20l8-8')}
+    {P('M12 4l8 8')}
+    {P('M4 4l16 16')}
+    {P('M4 12l8 8')}
+  </>
+));
+export const IconFillSolid = make('FillSolid', <rect x="4" y="4" width="16" height="16" rx="2" fill="currentColor" />);
+export const IconFillZigzag = make('FillZigzag', (
+  <>
+    <rect x="4" y="4" width="16" height="16" rx="2" />
+    {P('M6 9l3 3 3-3 3 3 3-3')}
+    {P('M6 14l3 3 3-3 3 3 3-3')}
   </>
 ));
 
-export const IconChevronDown = icon('IconChevronDown', (
+export const IconSloppyArchitect = make('SloppyArchitect', P('M3 17c4-9 14-9 18 0'));
+export const IconSloppyArtist = make('SloppyArtist', (
   <>
-    <path d="m5.5 9 6.5 6.5L18.5 9" />
+    {P('M3 17.5c3.5-9.5 14-9.5 18-.5')}
+    {P('M3.5 16c4-8.5 13.5-9 17 1.5')}
+  </>
+));
+export const IconSloppyCartoonist = make('SloppyCartoonist', (
+  <>
+    {P('M3 18c1-2.5 2.2-5 4-6.4 1.3-1 2.3.6 3.4-.9 1.2-1.7 2.6-2.9 4.2-1.8 1.4 1 1.3 2.8 2.8 3.4 1.5.6 2.6 2.7 3.6 5.2')}
+    {P('M4 16.2c1.5-2.8 2.4-4.6 4.4-5.9 1.7-1.1 2.6.8 4-1.2 1.2-1.6 3.4-1.6 4.4.2.8 1.6 2 2.4 3.2 3.5')}
   </>
 ));
 
-export const IconClose = icon('IconClose', (
+export const IconEdgeSharp = make('EdgeSharp', P('M5 19V5h14'));
+export const IconEdgeRound = make('EdgeRound', P('M5 19v-8a6 6 0 0 1 6-6h8'));
+
+/** Arrowheads, drawn pointing right (flip for the start end). */
+export const IconArrowheadNone = make('ArrowheadNone', P('M4 12h16'));
+export const IconArrowheadArrow = make('ArrowheadArrow', (
   <>
-    <path d="m6.2 6.2 11.6 11.6M17.8 6.2 6.2 17.8" />
+    {P('M4 12h16')}
+    {P('M14 6l6 6-6 6')}
+  </>
+));
+export const IconArrowheadTriangle = make('ArrowheadTriangle', (
+  <>
+    {P('M4 12h10')}
+    <path d="M13 6.5l7 5.5-7 5.5z" fill="currentColor" />
+  </>
+));
+export const IconArrowheadBar = make('ArrowheadBar', (
+  <>
+    {P('M4 12h16')}
+    {P('M20 6v12')}
+  </>
+));
+export const IconArrowheadDot = make('ArrowheadDot', (
+  <>
+    {P('M4 12h11')}
+    <circle cx="17" cy="12" r="3" fill="currentColor" />
   </>
 ));
 
-export const IconCheck = icon('IconCheck', (
+export const IconAlignLeft = make('AlignLeft', (
   <>
-    <path d="m5 12.6 4.8 4.8L19 6.8" />
+    {P('M4 6h16')}
+    {P('M4 12h10')}
+    {P('M4 18h14')}
+  </>
+));
+export const IconAlignCenter = make('AlignCenter', (
+  <>
+    {P('M4 6h16')}
+    {P('M7 12h10')}
+    {P('M5 18h14')}
+  </>
+));
+export const IconAlignRight = make('AlignRight', (
+  <>
+    {P('M4 6h16')}
+    {P('M10 12h10')}
+    {P('M6 18h14')}
   </>
 ));
 
-export const IconShare = icon('IconShare', (
+export const IconFontHand = make('FontHand', (
   <>
-    <circle cx="17.6" cy="5.9" r="2.6" />
-    <circle cx="6.4" cy="12" r="2.6" />
-    <circle cx="17.6" cy="18.1" r="2.6" />
-    <path d="m8.7 10.7 6.6-3.4M8.7 13.3l6.6 3.4" />
+    {P('M4 17c1.5-3 2.5-10 4.5-10 1.8 0 .2 10 2.2 10 1.7 0 2-6 3.8-6 1.5 0 .7 5 2.5 5 1.2 0 1.8-1.8 3-2.5')}
+    {P('M4 20.5h16')}
+  </>
+));
+export const IconFontNormal = make('FontNormal', (
+  <>
+    {P('M6 20L12 4l6 16')}
+    {P('M8.25 14h7.5')}
+  </>
+));
+export const IconFontCode = make('FontCode', (
+  <>
+    {P('M7 8l-4 4 4 4')}
+    {P('M17 8l4 4-4 4')}
+    {P('M14 4l-4 16')}
   </>
 ));
 
-export const IconSun = icon('IconSun', (
+/* --- general ------------------------------------------------------------------ */
+
+export const IconSun = make('Sun', (
   <>
-    <circle cx="12" cy="12" r="4.2" />
-    <path d="M12 2.8v2.1M12 19.1v2.1M4.4 4.4l1.5 1.5M18.1 18.1l1.5 1.5M2.8 12h2.1M19.1 12h2.1M4.4 19.6l1.5-1.5M18.1 5.9l1.5-1.5" />
+    <circle cx="12" cy="12" r="4" />
+    {P('M3 12h1M12 3v1M20 12h1M12 20v1M5.6 5.6l.7.7M18.4 5.6l-.7.7M17.7 17.7l.7.7M6.3 17.7l-.7.7')}
+  </>
+));
+export const IconMoon = make('Moon', P('M12 3h.39a7.5 7.5 0 0 0 7.92 12.45A9 9 0 1 1 12 3z'));
+
+export const IconDownload = make('Download', (
+  <>
+    {P('M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2')}
+    {P('M7 11l5 5 5-5')}
+    {P('M12 4v12')}
+  </>
+));
+export const IconUpload = make('Upload', (
+  <>
+    {P('M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2')}
+    {P('M7 9l5-5 5 5')}
+    {P('M12 4v12')}
+  </>
+));
+export const IconFolder = make('Folder', P('M5 4h4l3 3h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2'));
+export const IconSave = make('Save', (
+  <>
+    {P('M6 4h10l4 4v10a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2')}
+    <circle cx="12" cy="14" r="2" />
+    {P('M14 4v4H8V4')}
+  </>
+));
+export const IconExportImage = make('ExportImage', (
+  <>
+    {P('M15 8h.01')}
+    {P('M12.5 21H6a3 3 0 0 1-3-3V6a3 3 0 0 1 3-3h12a3 3 0 0 1 3 3v6.5')}
+    {P('M3 16l5-5c.93-.9 2.07-.9 3 0l3.5 3.5')}
+    {P('M19 16v6')}
+    {P('M22 19l-3 3-3-3')}
+  </>
+));
+export const IconLink = make('Link', (
+  <>
+    {P('M9 15l6-6')}
+    {P('M11 6l.46-.54a5 5 0 0 1 7.07 7.08l-.53.46')}
+    {P('M13 18l-.4.53a5.07 5.07 0 0 1-7.12 0 4.97 4.97 0 0 1 0-7.07l.52-.46')}
+  </>
+));
+export const IconGrid = make('Grid', (
+  <>
+    <rect x="4" y="4" width="16" height="16" rx="1.5" />
+    {P('M4 9.33h16M4 14.67h16M9.33 4v16M14.67 4v16')}
+  </>
+));
+export const IconUsers = make('Users', (
+  <>
+    <circle cx="9" cy="7" r="4" />
+    {P('M3 21v-2a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v2')}
+    {P('M16 3.13a4 4 0 0 1 0 7.75')}
+    {P('M21 21v-2a4 4 0 0 0-3-3.85')}
+  </>
+));
+export const IconUser = make('User', (
+  <>
+    <circle cx="12" cy="8" r="4" />
+    {P('M6 21v-2a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v2')}
+  </>
+));
+export const IconBoards = make('Boards', (
+  <>
+    <rect x="4" y="4" width="6.5" height="6.5" rx="1.25" />
+    <rect x="13.5" y="4" width="6.5" height="6.5" rx="1.25" />
+    <rect x="4" y="13.5" width="6.5" height="6.5" rx="1.25" />
+    <rect x="13.5" y="13.5" width="6.5" height="6.5" rx="1.25" />
+  </>
+));
+export const IconClose = make('Close', (
+  <>
+    {P('M18 6L6 18')}
+    {P('M6 6l12 12')}
+  </>
+));
+export const IconChevronDown = make('ChevronDown', P('M6 9l6 6 6-6'));
+export const IconChevronUp = make('ChevronUp', P('M6 15l6-6 6 6'));
+export const IconChevronRight = make('ChevronRight', P('M9 6l6 6-6 6'));
+export const IconCheck = make('Check', P('M5 12l5 5L20 7'));
+export const IconAlert = make('Alert', (
+  <>
+    <circle cx="12" cy="12" r="9" />
+    {P('M12 8v4')}
+    {P('M12 16h.01')}
+  </>
+));
+export const IconInfo = make('Info', (
+  <>
+    <circle cx="12" cy="12" r="9" />
+    {P('M12 8h.01')}
+    {P('M11 12h1v4h1')}
+  </>
+));
+export const IconPlus = make('Plus', (
+  <>
+    {P('M12 5v14')}
+    {P('M5 12h14')}
+  </>
+));
+export const IconClipboard = make('Clipboard', (
+  <>
+    {P('M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2')}
+    <rect x="9" y="3" width="6" height="4" rx="1.5" />
+  </>
+));
+export const IconCut = make('Cut', (
+  <>
+    <circle cx="6" cy="7" r="3" />
+    <circle cx="6" cy="17" r="3" />
+    {P('M8.6 8.6L19 19')}
+    {P('M8.6 15.4L19 5')}
+  </>
+));
+export const IconSelectAll = make('SelectAll', (
+  <>
+    {P('M4 8V6a2 2 0 0 1 2-2h2M16 4h2a2 2 0 0 1 2 2v2M20 16v2a2 2 0 0 1-2 2h-2M8 20H6a2 2 0 0 1-2-2v-2')}
+    {P('M10 4h4M4 10v4M20 10v4M10 20h4')}
+  </>
+));
+export const IconFit = make('Fit', (
+  <>
+    {P('M4 8V6a2 2 0 0 1 2-2h2')}
+    {P('M4 16v2a2 2 0 0 0 2 2h2')}
+    {P('M16 4h2a2 2 0 0 1 2 2v2')}
+    {P('M16 20h2a2 2 0 0 0 2-2v-2')}
+    <rect x="8.5" y="8.5" width="7" height="7" rx="1" />
+  </>
+));
+export const IconEdit = make('Edit', (
+  <>
+    {P('M7 7H6a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h9a2 2 0 0 0 2-2v-1')}
+    {P('M20.39 6.59a2.1 2.1 0 0 0-2.98-2.98L9 12v3h3z')}
+    {P('M16 5l3 3')}
+  </>
+));
+export const IconPalette = make('Palette', (
+  <>
+    {P('M12 21a9 9 0 0 1 0-18c4.97 0 9 3.58 9 8a5 5 0 0 1-5 5h-2.5a1.5 1.5 0 0 0-1 2.62A1.5 1.5 0 0 1 12 21')}
+    {P('M8 10.5h.01M12 7.5h.01M16 10.5h.01')}
+  </>
+));
+export const IconSearch = make('Search', (
+  <>
+    <circle cx="10" cy="10" r="6.5" />
+    {P('M20 20l-5.2-5.2')}
   </>
 ));
 
-export const IconMoon = icon('IconMoon', (
-  <>
-    <path d="M20.1 14.4A8.4 8.4 0 0 1 9.6 3.9a8.5 8.5 0 1 0 10.5 10.5" />
-  </>
-));
+/** Components by the names editor/tools.js uses (`icon: 'Square'`). */
+export const ICONS = Object.freeze({
+  Hand: IconHand,
+  Pointer: IconPointer,
+  Square: IconSquare,
+  Diamond: IconDiamond,
+  Circle: IconCircle,
+  ArrowRight: IconArrowRight,
+  Line: IconLine,
+  Pencil: IconPencil,
+  Text: IconText,
+  Image: IconImage,
+  Eraser: IconEraser,
+  Sticky: IconSticky,
+  Cylinder: IconCylinder,
+  Shapes: IconShapes,
+  Lock: IconLock,
+  Unlock: IconUnlock,
+  Library: IconLibrary,
+});
 
-export const IconCloud = icon('IconCloud', (
-  <>
-    <path d="M7.2 18.4a3.9 3.9 0 0 1-.4-7.78 5.2 5.2 0 0 1 10-1.5 3.7 3.7 0 0 1-.6 9.28z" />
-  </>
-));
+/** Render an icon by name; unknown names render nothing rather than crash. */
+export function Icon({ name, ...rest }) {
+  const C = ICONS[name];
+  return C ? <C {...rest} /> : null;
+}
 
-export const IconWifiOff = icon('IconWifiOff', (
-  <>
-    <path d="M2.6 3.4 21.4 20.8" />
-    <path d="M5 11.2a11 11 0 0 1 3.6-2.1" />
-    <path d="M1.4 7.9A16 16 0 0 1 8 4.6" />
-    <path d="M22.6 7.9a16 16 0 0 0-9.9-4.1" />
-    <path d="M8.6 14.8a6 6 0 0 1 2.3-1.2" />
-    <path d="M15.4 14.8a6 6 0 0 0-1.4-.9" />
-    <path d="M12 18.6h.01" />
-  </>
-));
-
-export const IconUsers = icon('IconUsers', (
-  <>
-    <circle cx="9.2" cy="8.2" r="3.4" />
-    <path d="M2.9 19.4a6.3 6.3 0 0 1 12.6 0" />
-    <path d="M16 5.2a3.4 3.4 0 0 1 0 6.6" />
-    <path d="M17.6 13.8a6.3 6.3 0 0 1 3.5 5.6" />
-  </>
-));
-
-export const IconLayers = icon('IconLayers', (
-  <>
-    <path d="m12 3.4 8.4 4.4-8.4 4.4-8.4-4.4z" />
-    <path d="m3.6 12.2 8.4 4.4 8.4-4.4" />
-    <path d="m3.6 16.4 8.4 4.4 8.4-4.4" />
-  </>
-));
-
-export const IconList = icon('IconList', (
-  <>
-    <path d="M8.6 6.4h11.8M8.6 12h11.8M8.6 17.6h11.8" />
-    <path d="M4.2 6.4h.01M4.2 12h.01M4.2 17.6h.01" />
-  </>
-));
-
-export const IconPlusSquare = icon('IconPlusSquare', (
-  <>
-    <rect x="3.6" y="3.6" width="16.8" height="16.8" rx="2.4" />
-    <path d="M12 8.4v7.2M8.4 12h7.2" />
-  </>
-));
-
-export const IconUpload = icon('IconUpload', (
-  <>
-    <path d="M12 15.2V4.8" />
-    <path d="m8 8.4 4-4 4 4" />
-    <path d="M4.6 16.4v2.2a1.6 1.6 0 0 0 1.6 1.6h11.6a1.6 1.6 0 0 0 1.6-1.6v-2.2" />
-  </>
-));
-
-export const IconAlert = icon('IconAlert', (
-  <>
-    <path d="M10.6 4.2 2.9 17.4a1.5 1.5 0 0 0 1.3 2.2h15.6a1.5 1.5 0 0 0 1.3-2.2L13.4 4.2a1.5 1.5 0 0 0-2.8 0" />
-    <path d="M12 9.4v4M12 16.6h.01" />
-  </>
-));
-
-export const IconInfo = icon('IconInfo', (
-  <>
-    <circle cx="12" cy="12" r="8.5" />
-    <path d="M12 11v5M12 8.2h.01" />
-  </>
-));
-
-/* --- registries ------------------------------------------------------------ */
-
-/** Tool id → icon component, in the order TOOLS declares them. */
-export const TOOL_ICONS = {
-  select: IconSelect,
-  hand: IconHand,
-  pen: IconPen,
-  rect: IconRect,
-  ellipse: IconEllipse,
-  diamond: IconDiamond,
-  cylinder: IconCylinder,
-  sticky: IconSticky,
-  text: IconText,
-  arrow: IconArrow,
-  line: IconLine,
-  eraser: IconEraser,
-};
-
-/** Everything, keyed by name, for `Icons[name]` lookups. */
-export const Icons = {
-  IconSelect,
-  IconHand,
-  IconPen,
-  IconRect,
-  IconEllipse,
-  IconDiamond,
-  IconCylinder,
-  IconSticky,
-  IconText,
-  IconArrow,
-  IconLine,
-  IconEraser,
-  IconUndo,
-  IconRedo,
-  IconGrid,
-  IconSnap,
-  IconZoomIn,
-  IconZoomOut,
-  IconZoomFit,
-  IconHelp,
-  IconDownload,
-  IconUpload,
-  IconPlus,
-  IconTrash,
-  IconCopy,
-  IconLock,
-  IconEye,
-  IconEyeOff,
-  IconChevron,
-  IconChevronDown,
-  IconClose,
-  IconCheck,
-  IconShare,
-  IconSun,
-  IconMoon,
-  IconCloud,
-  IconWifiOff,
-  IconUsers,
-  IconLayers,
-  IconList,
-  IconPlusSquare,
-  IconAlert,
-  IconInfo,
-};
-
-export default Icons;
+export default ICONS;

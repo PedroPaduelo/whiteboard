@@ -42,9 +42,11 @@ export function styleKeysFor(type) {
   switch (type) {
     case 'rect':
     case 'diamond':
+      return ['stroke', 'fill', 'fillStyle', 'strokeWidth', 'strokeStyle', 'roughness', 'roundness', 'opacity', 'fontFamily', 'fontSize'];
     case 'ellipse':
     case 'cylinder':
-      return ['stroke', 'fill', 'fillStyle', 'strokeWidth', 'strokeStyle', 'roughness', 'roundness', 'opacity', 'fontFamily', 'fontSize'];
+      // No `roundness`: an ellipse has no corners, and a cylinder is always drawn with curved caps.
+      return ['stroke', 'fill', 'fillStyle', 'strokeWidth', 'strokeStyle', 'roughness', 'opacity', 'fontFamily', 'fontSize'];
     case 'sticky':
       return ['fill', 'opacity', 'fontFamily', 'fontSize', 'align'];
     case 'text':

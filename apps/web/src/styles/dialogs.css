@@ -1,0 +1,305 @@
+/* ==========================================================================
+   dialogs.css — the modal shell (ui/Dialog.jsx) and the dialogs in it:
+   help (keyboard map), export image, confirm, change name.
+   ========================================================================== */
+
+.dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-dialog);
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: var(--backdrop);
+  pointer-events: auto;
+  font-family: var(--ui-font);
+  animation: backdrop-in 160ms var(--ease);
+}
+
+.dialog {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-height: calc(100dvh - 32px);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--island-shadow-strong);
+  animation: dialog-in 180ms var(--ease);
+}
+
+.dialog--sm {
+  max-width: 440px;
+}
+
+.dialog--md {
+  max-width: 580px;
+}
+
+.dialog--lg {
+  max-width: 920px;
+}
+
+.dialog__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 18px 16px 6px 24px;
+}
+
+.dialog__title {
+  font-size: 20px;
+  font-weight: 700;
+  line-height: 1.3;
+}
+
+.dialog__body {
+  min-height: 0;
+  padding: 8px 24px 22px;
+  overflow: auto;
+}
+
+.dialog__foot {
+  display: flex;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 4px 24px 20px;
+}
+
+@keyframes backdrop-in {
+  from {
+    opacity: 0;
+  }
+}
+
+@keyframes dialog-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.985);
+  }
+}
+
+/* --- help ------------------------------------------------------------------------ */
+
+.help-intro {
+  margin-bottom: 12px;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.help-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  gap: 8px 36px;
+}
+
+.help-group__title {
+  margin: 10px 0 6px;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.help-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--divider);
+  font-size: 13px;
+}
+
+.help-row__label {
+  min-width: 0;
+}
+
+.help-row__keys {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+  max-width: 60%;
+}
+
+.help-row__or {
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+.help-foot {
+  color: var(--text-faint);
+  font-size: 12px;
+}
+
+/* --- export --------------------------------------------------------------------- */
+
+.export {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 250px;
+  gap: 20px;
+}
+
+.export__preview {
+  display: grid;
+  place-items: center;
+  height: 360px;
+  padding: 12px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--option-bg);
+  color: var(--text-faint);
+}
+
+.export__preview--transparent {
+  background-color: #ffffff;
+  background-image: linear-gradient(45deg, #ececf1 25%, transparent 25%, transparent 75%, #ececf1 75%),
+    linear-gradient(45deg, #ececf1 25%, transparent 25%, transparent 75%, #ececf1 75%);
+  background-position: 0 0, 8px 8px;
+  background-size: 16px 16px;
+}
+
+.export__preview img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+
+.export__side {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.export__options {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.export__scale {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.export__label {
+  font-size: 14px;
+}
+
+.export__size {
+  color: var(--text-faint);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.export__actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.export-empty {
+  padding: 32px 0;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+/* --- toggle switch --------------------------------------------------------------- */
+
+.toggle {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.toggle input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+}
+
+.toggle__track {
+  position: relative;
+  flex: none;
+  width: 36px;
+  height: 20px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--option-bg);
+  transition: background-color var(--dur) var(--ease), border-color var(--dur) var(--ease);
+}
+
+.toggle__thumb {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #ffffff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+  transition: transform var(--dur) var(--ease);
+}
+
+.toggle input:checked + .toggle__track {
+  border-color: var(--accent-strong);
+  background: var(--accent-strong);
+}
+
+.toggle input:checked + .toggle__track .toggle__thumb {
+  transform: translateX(16px);
+}
+
+.toggle input:focus-visible + .toggle__track {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* --- confirm --------------------------------------------------------------------- */
+
+.confirm-message {
+  color: var(--text-muted);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+/* --- phones ------------------------------------------------------------------------- */
+
+@media (max-width: 640px) {
+  .dialog-backdrop {
+    padding: 8px;
+  }
+
+  .dialog__head {
+    padding: 14px 10px 4px 16px;
+  }
+
+  .dialog__body {
+    padding: 6px 16px 16px;
+  }
+
+  .dialog__foot {
+    padding: 4px 16px 16px;
+  }
+
+  .help-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .export {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .export__preview {
+    height: 220px;
+  }
+}

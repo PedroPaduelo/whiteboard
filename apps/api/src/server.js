@@ -13,101 +13,127 @@ import { ELEMENT_TYPES } from '@whiteboard/shared';
 
 const SHUTDOWN_GRACE_MS = 10_000;
 
-const INK = '#1f2937';
-const SLATE = '#3b82f6';
-const MINT = '#22c55e';
-const AMBER = '#eab308';
+/* Excalidraw's default palette (apps/web/src/editor/constants.js), so the demo
+ * looks like what the colour pickers offer. */
+const INK = '#1e1e1e';
+const BLUE = '#1971c2';
+const BLUE_BG = '#a5d8ff';
+const ORANGE = '#f08c00';
+const YELLOW_BG = '#ffec99';
+const GREEN = '#2f9e44';
+const GREEN_BG = '#b2f2bb';
+const RED = '#e03131';
+const RED_BG = '#ffc9c9';
+const VIOLET = '#6741d9';
+
+/** The hand-drawn look every demo element shares. */
+const SKETCH = { roughness: 1, strokeWidth: 2, strokeStyle: 'solid', opacity: 1 };
+/** Text styling for shapes that carry a label. */
+const LABEL = { fontFamily: 'hand', fontSize: 20, align: 'center' };
+/** A filled shape: hachure fill, like Excalidraw's default. */
+const filled = (stroke, fill) => ({ ...SKETCH, stroke, fill, fillStyle: 'hachure' });
+/** Connector defaults: a plain arrow, bound ends are resolved by the store. */
+const ARROW = { ...SKETCH, stroke: INK, fill: 'none', roundness: 'round', startArrowhead: 'none', endArrowhead: 'arrow' };
+
+/** A short hand-drawn squiggle under the title (absolute board points). */
+function squiggle(x0, y0, width) {
+  const points = [];
+  for (let x = 0; x <= width; x += 8) {
+    points.push({ x: x0 + x, y: Math.round((y0 + Math.sin(x / 14) * 5 + (x / width) * 3) * 100) / 100 });
+  }
+  return points;
+}
 
 /**
  * A small, readable starter sketch. An empty canvas is a bad first impression:
  * a visitor cannot tell whether the app works, so they leave. This draws the
- * shape of the system itself (browser -> API -> SQLite) in the same vocabulary
- * the UI offers, which doubles as a worked example of every element kind.
+ * shape of the system itself (navegador -> API -> SQLite) in the same
+ * vocabulary the editor offers, which doubles as a worked example of every
+ * element kind: shapes with their text INSIDE (`label`), arrows BOUND to them
+ * (`startId`/`endId`, so they follow when a shape is dragged), a multi-point
+ * arrow, a sticky note, a freehand stroke and a free text title.
  *
  * Element ids are fixed rather than random so a re-seed is recognisable in a
- * log, and short because LIMITS.MAX_ID is 40.
+ * log, and short because LIMITS.MAX_ID is 40. Seeds are fixed too, so every
+ * re-seed draws exactly the same wobble. Arrow points only need to be roughly
+ * right: the store re-resolves every bound end onto its shape's outline.
+ * The text is Brazilian Portuguese, like the rest of the UI.
  */
 const DEMO_ELEMENTS = [
   {
+    // Measured in Virgil at 36px (421.3 x 45), as the editor's fitTextElement would.
     id: 'demo-title',
     type: 'text',
     x: 80,
-    y: 56,
-    w: 660,
-    h: 40,
-    text: 'Whiteboard demo - drag, draw, or edit anything you see',
-    fontSize: 30,
+    y: 48,
+    w: 422,
+    h: 45,
+    text: 'Como funciona o quadro',
+    fontFamily: 'hand',
+    fontSize: 36,
     align: 'left',
-    fill: INK,
+    stroke: INK,
+    fill: 'none',
+    seed: 1_402_117,
+    roughness: 1,
+    opacity: 1,
+  },
+  {
+    id: 'demo-squiggle',
+    type: 'pen',
+    x: 0,
+    y: 0,
+    w: 0,
+    h: 0,
+    points: squiggle(84, 104, 400),
+    stroke: RED,
+    fill: 'none',
+    strokeWidth: 2,
+    opacity: 1,
+    seed: 918_273,
+    roughness: 1,
   },
   // --- the happy path, left to right ---
   {
     id: 'demo-browser',
     type: 'rect',
     x: 80,
-    y: 200,
+    y: 180,
     w: 180,
     h: 96,
-    fill: '#ffffff',
-    stroke: INK,
-    strokeWidth: 2,
-  },
-  {
-    id: 'demo-browser-lbl',
-    type: 'text',
-    x: 96,
-    y: 236,
-    w: 148,
-    h: 26,
-    text: 'Browser',
-    fontSize: 20,
-    fill: INK,
+    ...filled(BLUE, BLUE_BG),
+    roundness: 'round',
+    ...LABEL,
+    label: 'Navegador',
+    seed: 1_968_452_133,
   },
   {
     id: 'demo-api',
     type: 'rect',
-    x: 360,
-    y: 200,
+    x: 380,
+    y: 180,
     w: 180,
     h: 96,
-    fill: '#bfdbfe',
-    stroke: SLATE,
-    strokeWidth: 2,
-  },
-  {
-    id: 'demo-api-lbl',
-    type: 'text',
-    x: 400,
-    y: 236,
-    w: 120,
-    h: 26,
-    text: 'API',
-    fontSize: 20,
-    fill: INK,
+    ...filled(ORANGE, YELLOW_BG),
+    roundness: 'round',
+    ...LABEL,
+    label: 'API (Fastify)',
+    seed: 305_419_896,
   },
   {
     id: 'demo-db',
     type: 'cylinder',
-    x: 640,
-    y: 200,
+    x: 680,
+    y: 172,
     w: 160,
-    h: 96,
-    fill: '#bbf7d0',
-    stroke: MINT,
-    strokeWidth: 2,
+    h: 112,
+    ...filled(GREEN, GREEN_BG),
+    roundness: 'sharp',
+    ...LABEL,
+    label: 'SQLite',
+    seed: 1_122_334_455,
   },
-  {
-    id: 'demo-db-lbl',
-    type: 'text',
-    x: 672,
-    y: 236,
-    w: 110,
-    h: 26,
-    text: 'SQLite',
-    fontSize: 20,
-    fill: INK,
-  },
-  // --- arrows, attached so they follow their boxes when you drag them ---
+  // --- arrows, bound so they follow their shapes when you drag them ---
   {
     id: 'demo-arrow-1',
     type: 'arrow',
@@ -116,13 +142,14 @@ const DEMO_ELEMENTS = [
     w: 0,
     h: 0,
     points: [
-      { x: 260, y: 248 },
-      { x: 360, y: 248 },
+      { x: 264, y: 228 },
+      { x: 376, y: 228 },
     ],
     startId: 'demo-browser',
     endId: 'demo-api',
-    stroke: SLATE,
-    strokeWidth: 2,
+    ...ARROW,
+    stroke: BLUE,
+    seed: 77_001,
   },
   {
     id: 'demo-arrow-2',
@@ -132,49 +159,28 @@ const DEMO_ELEMENTS = [
     w: 0,
     h: 0,
     points: [
-      { x: 540, y: 248 },
-      { x: 640, y: 248 },
+      { x: 564, y: 228 },
+      { x: 676, y: 228 },
     ],
     startId: 'demo-api',
     endId: 'demo-db',
-    stroke: MINT,
-    strokeWidth: 2,
+    ...ARROW,
+    stroke: GREEN,
+    seed: 77_002,
   },
-  // --- a decision and a note, so the board looks designed, not dumped ---
+  // --- a decision, where the ops go next, and a note ---
   {
     id: 'demo-gate',
     type: 'diamond',
-    x: 380,
-    y: 380,
-    w: 150,
-    h: 110,
-    fill: '#fed7aa',
-    stroke: AMBER,
-    strokeWidth: 2,
-  },
-  {
-    id: 'demo-gate-lbl',
-    type: 'text',
-    x: 396,
-    y: 420,
-    w: 120,
-    h: 30,
-    text: 'Valid op?',
-    fontSize: 18,
-    align: 'center',
-    fill: INK,
-  },
-  {
-    id: 'demo-sticky',
-    type: 'sticky',
-    x: 600,
-    y: 380,
-    w: 200,
-    h: 150,
-    label: 'Double-click a shape to rename it. Everything here syncs live to every open tab.',
-    fill: '#fde68a',
-    stroke: AMBER,
-    strokeWidth: 1,
+    x: 360,
+    y: 360,
+    w: 220,
+    h: 140,
+    ...filled(RED, RED_BG),
+    roundness: 'round',
+    ...LABEL,
+    label: 'Op válida?',
+    seed: 424_242_424,
   },
   {
     id: 'demo-arrow-3',
@@ -184,13 +190,64 @@ const DEMO_ELEMENTS = [
     w: 0,
     h: 0,
     points: [
-      { x: 455, y: 296 },
-      { x: 455, y: 380 },
+      { x: 470, y: 280 },
+      { x: 470, y: 356 },
     ],
     startId: 'demo-api',
     endId: 'demo-gate',
-    stroke: AMBER,
-    strokeWidth: 2,
+    ...ARROW,
+    stroke: ORANGE,
+    seed: 77_003,
+  },
+  {
+    id: 'demo-peers',
+    type: 'ellipse',
+    x: 680,
+    y: 500,
+    w: 180,
+    h: 100,
+    ...filled(VIOLET, '#d0bfff'),
+    roundness: 'sharp',
+    ...LABEL,
+    label: 'Outras abas',
+    seed: 987_654_321,
+  },
+  {
+    // Three points: an elbow from the bottom of the diamond to the ellipse.
+    // Binding moves only the two ends; the middle point stays where it is.
+    id: 'demo-arrow-4',
+    type: 'arrow',
+    x: 0,
+    y: 0,
+    w: 0,
+    h: 0,
+    points: [
+      { x: 470, y: 504 },
+      { x: 470, y: 550 },
+      { x: 676, y: 550 },
+    ],
+    startId: 'demo-gate',
+    endId: 'demo-peers',
+    ...ARROW,
+    stroke: VIOLET,
+    roundness: 'sharp',
+    seed: 77_004,
+  },
+  {
+    id: 'demo-sticky',
+    type: 'sticky',
+    x: 80,
+    y: 360,
+    w: 220,
+    h: 210,
+    label: 'Dê dois cliques numa forma para escrever nela. Tudo aqui sincroniza ao vivo com as outras abas abertas.',
+    fill: YELLOW_BG,
+    fontFamily: 'hand',
+    fontSize: 20,
+    align: 'left',
+    opacity: 1,
+    seed: 55_555,
+    roughness: 1,
   },
 ];
 
@@ -202,7 +259,7 @@ export async function seedDemoBoard(store) {
   const { boards } = await store.listBoards({ limit: 1, offset: 0 });
   if (boards.length > 0) return null;
 
-  const board = await store.createBoard({ title: 'Demo', theme: 'light', ownerId: null });
+  const board = await store.createBoard({ title: 'Demonstração', theme: 'light', ownerId: null });
   const boardId = board.id;
 
   // The store validates every element (and re-derives a connector's box from
@@ -230,18 +287,27 @@ export async function seedDemoBoard(store) {
   return board;
 }
 
+/**
+ * The options `createStore` reads, from the runtime config. Exactly its keys:
+ * handing it other names silently fell back to the defaults, which is how
+ * OP_DEDUPE_TTL_MS came to be ignored.
+ */
+export function storeOptions(cfg) {
+  return { storage: cfg.storage, sqlitePath: cfg.sqlitePath, opDedupeTtlMs: cfg.opDedupeTtlMs };
+}
+
+/**
+ * The options `new Hub()` reads. The config names differ from the hub's
+ * (`wsPeerTtlMs` vs `peerTtlMs`), so passing the config straight through made
+ * the hub ignore WS_PEER_TTL_MS and WS_CURSOR_RATE_MS.
+ */
+export function hubOptions(cfg) {
+  return { peerTtlMs: cfg.wsPeerTtlMs, cursorRateMs: cfg.wsCursorRateMs };
+}
+
 export async function main() {
-  // `driver` and `storage` carry the same value under both names the store
-  // entrypoint might read, and `path`/`sqlitePath` likewise — the dispatcher
-  // owns that choice and this file should not break if it differs.
-  const store = await createStore({
-    driver: config.storage,
-    storage: config.storage,
-    path: config.sqlitePath,
-    sqlitePath: config.sqlitePath,
-    config,
-  });
-  const hub = new Hub(config);
+  const store = await createStore(storeOptions(config));
+  const hub = new Hub(hubOptions(config));
   const app = await buildApp({ store, hub, config, version: VERSION });
 
   if (config.seedDemoBoard) {

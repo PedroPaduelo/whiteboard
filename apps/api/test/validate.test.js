@@ -15,6 +15,18 @@ import {
   tryValidateOps,
   LIMITS,
   ELEMENT_TYPES,
+  FILL_STYLES,
+  ROUNDNESS,
+  FONT_FAMILY_KEYS,
+  TEXT_ALIGNS,
+  ARROWHEADS,
+  SEED_MAX,
+  NULLABLE_PATCH_KEYS,
+  TOOLS,
+  DRAWING_TOOLS,
+  WS_MSG,
+  OP_RESULT,
+  elementTypeForTool,
 } from '@whiteboard/shared';
 
 /** One valid instance of each of the ten element types. */
@@ -157,11 +169,19 @@ describe('validateElement rejection paths', () => {
     'a non-finite point coordinate throws',
   );
 
-  rejects({ id: 'a', type: 'arrow', x: 0, y: 0, w: 1, h: 1,
-    points: [{ x: 0, y: 0 }, { x: 1, y: 1 }, { x: 2, y: 2 }] },
-    'a connector with 3 points throws');
   rejects({ id: 'a', type: 'arrow', x: 0, y: 0, w: 1, h: 1, points: [{ x: 0, y: 0 }] },
     'a connector with 1 point throws');
+  rejects({ id: 'a', type: 'line', x: 0, y: 0, w: 1, h: 1, points: [{ x: 0, y: 0 }] },
+    'a line with 1 point throws');
+  rejects({ id: 'a', type: 'arrow', x: 0, y: 0, w: 1, h: 1, points: [] },
+    'a connector with no points throws');
+  rejects(
+    { id: 'a', type: 'arrow', x: 0, y: 0, w: 1, h: 1, points: new Array(LIMITS.MAX_POINTS + 1).fill({ x: 1, y: 1 }) },
+    'a connector over MAX_POINTS throws',
+  );
+  rejects({ id: 'a', type: 'arrow', x: 0, y: 0, w: 1, h: 1,
+    points: [{ x: 0, y: 0 }, { x: 1, y: 1 }, { x: 2, y: 'far' }] },
+    'a bad interior connector point throws');
 
   rejects({ id: 'a', type: 'text', x: 0, y: 0, w: 1, h: 1, text: 42 },
     'non-string text throws');
@@ -196,6 +216,181 @@ describe('validateElement rejection paths', () => {
     'a bad strokeStyle throws');
   rejects({ id: 'a', type: 'rect', x: 0, y: 0, w: 1, h: 1, stroke: 'not-a-colour!!' },
     'a malformed colour throws');
+
+  // --- the hand-drawn fields reject bad values (they are never coerced) ---
+  const r = { id: 'a', type: 'rect', x: 0, y: 0, w: 1, h: 1 };
+  rejects({ ...r, seed: -1 }, 'a negative seed throws');
+  rejects({ ...r, seed: 1.5 }, 'a fractional seed throws');
+  rejects({ ...r, seed: SEED_MAX + 1 }, 'a seed past 2^31-1 throws');
+  rejects({ ...r, seed: '42' }, 'a string seed throws');
+  rejects({ ...r, roughness: 2.5 }, 'roughness above 2 throws');
+  rejects({ ...r, roughness: -0.1 }, 'negative roughness throws');
+  rejects({ ...r, roughness: NaN }, 'NaN roughness throws');
+  rejects({ ...r, fillStyle: 'dots' }, 'an unknown fillStyle throws');
+  rejects({ ...r, roundness: 'very' }, 'an unknown roundness throws');
+  rejects({ ...r, roundness: 12 }, 'a numeric roundness throws');
+  rejects({ ...r, fontFamily: 'comic' }, 'an unknown fontFamily on a shape throws');
+  rejects({ ...r, fontSize: 3 }, 'a tiny fontSize on a shape throws');
+  rejects({ ...r, fontSize: 600 }, 'a huge fontSize on a shape throws');
+  rejects({ ...r, align: 'justify' }, 'a bad align on a shape throws');
+  rejects({ ...r, label: 42 }, 'a non-string shape label throws');
+  rejects({ ...r, label: 'x'.repeat(LIMITS.MAX_LABEL + 1) }, 'an oversized shape label throws');
+  rejects({ id: 'a', type: 'sticky', x: 0, y: 0, w: 1, h: 1, label: 'x', fontFamily: 'serif' },
+    'an unknown fontFamily on a sticky throws');
+  rejects({ id: 'a', type: 'text', x: 0, y: 0, w: 1, h: 1, text: 'x', fontFamily: 'serif' },
+    'an unknown fontFamily on a text throws');
+  rejects({ ...SAMPLES.arrow, startArrowhead: 'star' }, 'an unknown startArrowhead throws');
+  rejects({ ...SAMPLES.line, endArrowhead: 'x' }, 'an unknown endArrowhead throws');
+});
+
+describe('validateElement: the Excalidraw-style fields', () => {
+  test('seed, roughness, fillStyle and roundness are kept on EVERY type', () => {
+    for (const [type, sample] of Object.entries(SAMPLES)) {
+      const out = validateElement({
+        ...sample, seed: 123456, roughness: 2, fillStyle: 'cross-hatch', roundness: 'round',
+      });
+      assert.equal(out.seed, 123456, type);
+      assert.equal(out.roughness, 2, type);
+      assert.equal(out.fillStyle, 'cross-hatch', type);
+      assert.equal(out.roundness, 'round', type);
+    }
+  });
+
+  test('the full range of each enum and bound is accepted', () => {
+    for (const fillStyle of FILL_STYLES) assert.equal(validateElement({ ...SAMPLES.rect, fillStyle }).fillStyle, fillStyle);
+    for (const roundness of ROUNDNESS) assert.equal(validateElement({ ...SAMPLES.rect, roundness }).roundness, roundness);
+    for (const fontFamily of FONT_FAMILY_KEYS) assert.equal(validateElement({ ...SAMPLES.text, fontFamily }).fontFamily, fontFamily);
+    for (const align of TEXT_ALIGNS) assert.equal(validateElement({ ...SAMPLES.ellipse, align }).align, align);
+    for (const head of ARROWHEADS) {
+      const out = validateElement({ ...SAMPLES.arrow, startArrowhead: head, endArrowhead: head });
+      assert.equal(out.startArrowhead, head);
+      assert.equal(out.endArrowhead, head);
+    }
+    for (const seed of [0, 1, SEED_MAX]) assert.equal(validateElement({ ...SAMPLES.rect, seed }).seed, seed);
+    for (const roughness of [0, 0.5, 1, 2]) assert.equal(validateElement({ ...SAMPLES.rect, roughness }).roughness, roughness);
+  });
+
+  test('shapes carry a label with its own font styling', () => {
+    for (const type of ['rect', 'ellipse', 'diamond', 'cylinder']) {
+      const out = validateElement({
+        ...SAMPLES[type], label: 'Olá', fontFamily: 'code', fontSize: 28, align: 'right',
+      });
+      assert.equal(out.label, 'Olá', type);
+      assert.equal(out.fontFamily, 'code', type);
+      assert.equal(out.fontSize, 28, type);
+      assert.equal(out.align, 'right', type);
+    }
+  });
+
+  test('a shape gets NO fontSize default, a text still defaults to 24', () => {
+    assert.equal('fontSize' in validateElement(SAMPLES.rect), false);
+    assert.equal('fontSize' in validateElement(SAMPLES.sticky), false);
+    const { fontSize, ...noSize } = SAMPLES.text;
+    assert.equal(validateElement(noSize).fontSize, 24);
+  });
+
+  test('a sticky keeps fontFamily, fontSize and align', () => {
+    const out = validateElement({ ...SAMPLES.sticky, fontFamily: 'normal', fontSize: 16, align: 'center' });
+    assert.deepEqual([out.fontFamily, out.fontSize, out.align], ['normal', 16, 'center']);
+  });
+
+  test('arrows and lines carry arrowheads', () => {
+    const a = validateElement({ ...SAMPLES.arrow, startArrowhead: 'dot', endArrowhead: 'triangle' });
+    assert.deepEqual([a.startArrowhead, a.endArrowhead], ['dot', 'triangle']);
+    const l = validateElement({ ...SAMPLES.line, startArrowhead: 'bar', endArrowhead: 'none' });
+    assert.deepEqual([l.startArrowhead, l.endArrowhead], ['bar', 'none']);
+  });
+
+  test('a multi-point connector keeps every point in order and reboxes from all of them', () => {
+    const points = [{ x: 0, y: 0 }, { x: 50, y: -20 }, { x: 80, y: 40 }, { x: 10, y: 90 }, { x: -30, y: 5 }];
+    const out = validateElement({ ...SAMPLES.arrow, points, startId: 's', endId: 'e' });
+    assert.deepEqual(out.points, points);
+    assert.deepEqual([out.x, out.y, out.w, out.h], [-30, -20, 110, 110]);
+    assert.equal(out.startId, 's');
+    assert.equal(out.endId, 'e');
+    // The points are copies: the caller's array can never alias the stored one.
+    assert.notEqual(out.points, points);
+    assert.notEqual(out.points[0], points[0]);
+  });
+
+  test('a connector with exactly MAX_POINTS points is accepted', () => {
+    const points = Array.from({ length: LIMITS.MAX_POINTS }, (_, i) => ({ x: i, y: i % 7 }));
+    assert.equal(validateElement({ ...SAMPLES.line, points }).points.length, LIMITS.MAX_POINTS);
+  });
+
+  test('fields on a type that does not use them are STRIPPED, not rejected', () => {
+    const pen = validateElement({
+      ...SAMPLES.pen, label: 'x', fontFamily: 'comic', fontSize: 1, align: 'weird',
+      startArrowhead: 'star', text: 'nope',
+    });
+    for (const k of ['label', 'fontFamily', 'fontSize', 'align', 'startArrowhead', 'text']) {
+      assert.equal(k in pen, false, `pen must not keep ${k}`);
+    }
+    const rect = validateElement({ ...SAMPLES.rect, startArrowhead: 'arrow', endArrowhead: 'arrow', points: [] });
+    assert.equal('startArrowhead' in rect, false);
+    assert.equal('points' in rect, false);
+    const image = validateElement({ ...SAMPLES.image, label: 'caption', fontFamily: 'hand' });
+    assert.equal('label' in image, false);
+    assert.equal('fontFamily' in image, false);
+  });
+
+  test('a legacy element (none of the new fields) is still valid and gains nothing', () => {
+    for (const [type, sample] of Object.entries(SAMPLES)) {
+      const out = validateElement(sample);
+      for (const k of ['seed', 'roughness', 'fillStyle', 'roundness', 'fontFamily', 'startArrowhead', 'endArrowhead']) {
+        assert.equal(k in out, false, `${type} must not gain ${k}`);
+      }
+      if (type !== 'sticky') assert.equal('label' in out, false, `${type} must not gain a label`);
+    }
+  });
+
+  test('null optional fields are treated as absent', () => {
+    const out = validateElement({
+      ...SAMPLES.arrow, seed: null, roughness: null, fillStyle: null, roundness: null,
+      startArrowhead: null, endArrowhead: null, startId: null, endId: null, groupId: null,
+    });
+    for (const k of ['seed', 'roughness', 'fillStyle', 'roundness', 'startArrowhead', 'endArrowhead', 'startId', 'endId', 'groupId']) {
+      assert.equal(k in out, false, `${k}: null means absent`);
+    }
+    assert.equal('label' in validateElement({ ...SAMPLES.rect, label: null }), false);
+  });
+});
+
+describe('shared enums and protocol constants', () => {
+  test('the style enums are exported, frozen, and match the contract', () => {
+    assert.deepEqual([...FILL_STYLES], ['hachure', 'cross-hatch', 'solid', 'zigzag']);
+    assert.deepEqual([...ROUNDNESS], ['sharp', 'round']);
+    assert.deepEqual([...FONT_FAMILY_KEYS], ['hand', 'normal', 'code']);
+    assert.deepEqual([...TEXT_ALIGNS], ['left', 'center', 'right']);
+    assert.deepEqual([...ARROWHEADS], ['none', 'arrow', 'triangle', 'bar', 'dot']);
+    assert.equal(SEED_MAX, 2 ** 31 - 1);
+    for (const list of [FILL_STYLES, ROUNDNESS, FONT_FAMILY_KEYS, TEXT_ALIGNS, ARROWHEADS]) {
+      assert.ok(Object.isFrozen(list));
+    }
+  });
+
+  test('TOOLS gains image and keeps every existing tool', () => {
+    for (const t of ['select', 'hand', 'pen', 'rect', 'ellipse', 'diamond', 'cylinder', 'sticky', 'text', 'arrow', 'line', 'eraser']) {
+      assert.ok(TOOLS.includes(t), t);
+    }
+    assert.ok(TOOLS.includes('image'));
+    assert.ok(DRAWING_TOOLS.includes('image'));
+    assert.equal(elementTypeForTool('image'), 'image');
+    assert.equal(elementTypeForTool('eraser'), null);
+    for (const t of DRAWING_TOOLS) assert.ok(ELEMENT_TYPES.includes(t), `${t} is an element type`);
+  });
+
+  test('WS_MSG.BOARD and the new OP_RESULT statuses exist', () => {
+    assert.equal(WS_MSG.BOARD, 'board');
+    assert.equal(WS_MSG.ERROR, 'error');
+    assert.equal(OP_RESULT.APPLIED, 'applied');
+    assert.equal(OP_RESULT.DUPLICATE, 'duplicate');
+    assert.equal(OP_RESULT.CONFLICT, 'conflict');
+    assert.equal(OP_RESULT.MISSING, 'missing');
+    assert.equal(OP_RESULT.ERROR, 'error');
+    // Envelope types must stay unique, or a handler would catch the wrong one.
+    assert.equal(new Set(Object.values(WS_MSG)).size, Object.values(WS_MSG).length);
+  });
 });
 
 describe('tryValidateElement', () => {
@@ -292,6 +487,112 @@ describe('validateOps', () => {
       () => validateOps([{ ...base, kind: 'update', elementId: 'r1', patch: [1] }]),
       /patch/,
     );
+  });
+
+  test('every Excalidraw-style field is patchable', () => {
+    const patch = {
+      seed: 99, roughness: 0, fillStyle: 'zigzag', roundness: 'sharp', fontFamily: 'code',
+      fontSize: 36, align: 'center', label: 'Oi', startArrowhead: 'triangle', endArrowhead: 'dot',
+    };
+    const [op] = validateOps([{ ...base, kind: 'update', elementId: 'r1', patch }]);
+    assert.deepEqual(op.patch, patch);
+  });
+
+  test('startId, endId, groupId and label accept null (null = remove the field)', () => {
+    assert.deepEqual([...NULLABLE_PATCH_KEYS].sort(), ['endId', 'groupId', 'label', 'startId']);
+    const [op] = validateOps([{
+      ...base, kind: 'update', elementId: 'a1',
+      patch: { startId: null, endId: null, groupId: null, label: null },
+    }]);
+    assert.deepEqual(op.patch, { startId: null, endId: null, groupId: null, label: null });
+  });
+
+  test('a bound id in a patch is still validated', () => {
+    const [op] = validateOps([{ ...base, kind: 'update', elementId: 'a1', patch: { startId: 'box', endId: 'box2' } }]);
+    assert.deepEqual(op.patch, { startId: 'box', endId: 'box2' });
+    assert.throws(() => validateOps([{ ...base, kind: 'update', elementId: 'a1', patch: { startId: '' } }]), /startId/);
+    assert.throws(() => validateOps([{ ...base, kind: 'update', elementId: 'a1', patch: { endId: 7 } }]), /endId/);
+    assert.throws(
+      () => validateOps([{ ...base, kind: 'update', elementId: 'a1', patch: { groupId: 'g'.repeat(LIMITS.MAX_ID + 1) } }]),
+      /groupId/,
+    );
+  });
+
+  test('bad values in the new patch fields are rejected, naming the field', () => {
+    const bad = {
+      seed: -3, roughness: 7, fillStyle: 'dots', roundness: 'soft', fontFamily: 'serif',
+      startArrowhead: 'star', endArrowhead: 'ARROW', align: 'justify',
+    };
+    for (const [k, v] of Object.entries(bad)) {
+      assert.throws(
+        () => validateOps([{ ...base, kind: 'update', elementId: 'r1', patch: { [k]: v } }]),
+        new RegExp(`patch\\.${k}`),
+        `${k}: ${JSON.stringify(v)} must be rejected`,
+      );
+    }
+    // Only the four nullable keys take null; for the rest null is a bad value.
+    for (const k of ['seed', 'roughness', 'fillStyle', 'roundness', 'fontFamily', 'startArrowhead', 'endArrowhead']) {
+      assert.throws(
+        () => validateOps([{ ...base, kind: 'update', elementId: 'r1', patch: { [k]: null } }]),
+        new RegExp(k),
+        `${k}: null is not a value`,
+      );
+    }
+  });
+
+  test('CREATE and UPDATE keep the same fields (the store merge round-trip)', () => {
+    // The store applies an update as validateElement({...stored, ...patch}).
+    // Every field a create keeps must also survive an update, per type.
+    const cases = [
+      ['rect', { seed: 5, roughness: 0, fillStyle: 'solid', roundness: 'round', fontFamily: 'normal', fontSize: 16, align: 'left', label: 'L' }],
+      ['ellipse', { label: 'E', fontFamily: 'code', align: 'right' }],
+      ['diamond', { label: 'D', fontSize: 40 }],
+      ['cylinder', { label: 'C', fillStyle: 'hachure' }],
+      ['sticky', { fontFamily: 'code', fontSize: 30, align: 'center', label: 'S2' }],
+      ['text', { fontFamily: 'normal', fontSize: 48, align: 'right', text: 'T2' }],
+      ['arrow', { startArrowhead: 'bar', endArrowhead: 'triangle', roundness: 'round', points: [{ x: 0, y: 0 }, { x: 5, y: 5 }, { x: 9, y: 0 }] }],
+      ['line', { startArrowhead: 'dot', endArrowhead: 'dot', roughness: 2 }],
+      ['pen', { seed: 77, roughness: 1.5 }],
+      ['image', { seed: 8, roundness: 'round' }],
+    ];
+    for (const [type, fields] of cases) {
+      const created = validateElement({ ...SAMPLES[type], ...fields });
+      const stored = validateElement(SAMPLES[type]);
+      const [op] = validateOps([{ ...base, kind: 'update', elementId: stored.id, patch: fields }]);
+      const merged = validateElement({ ...stored, ...op.patch });
+      for (const k of Object.keys(fields)) {
+        assert.deepEqual(merged[k], created[k], `${type}.${k} survives an update exactly as a create`);
+      }
+    }
+  });
+
+  test('a null patch removes a binding, a group and a shape label after the merge', () => {
+    const stored = validateElement({ ...SAMPLES.arrow, startId: 'b1', endId: 'b2', groupId: 'g' });
+    const [op] = validateOps([{ ...base, kind: 'update', elementId: stored.id, patch: { startId: null, endId: null, groupId: null } }]);
+    const merged = validateElement({ ...stored, ...op.patch });
+    assert.equal('startId' in merged, false);
+    assert.equal('endId' in merged, false);
+    assert.equal('groupId' in merged, false);
+
+    const shape = validateElement({ ...SAMPLES.rect, label: 'bye' });
+    const [op2] = validateOps([{ ...base, kind: 'update', elementId: shape.id, patch: { label: null } }]);
+    assert.equal('label' in validateElement({ ...shape, ...op2.patch }), false);
+
+    // A sticky's label is required: removing it is invalid, not silently kept.
+    const sticky = validateElement(SAMPLES.sticky);
+    const [op3] = validateOps([{ ...base, kind: 'update', elementId: sticky.id, patch: { label: null } }]);
+    assert.throws(() => validateElement({ ...sticky, ...op3.patch }), /label/);
+  });
+
+  test('a multi-point points patch is accepted; the merged connector needs >= 2', () => {
+    const stored = validateElement(SAMPLES.arrow);
+    const pts = [{ x: 0, y: 0 }, { x: 10, y: 10 }, { x: 20, y: 0 }, { x: 30, y: 10 }];
+    const [op] = validateOps([{ ...base, kind: 'update', elementId: stored.id, patch: { points: pts } }]);
+    const merged = validateElement({ ...stored, ...op.patch });
+    assert.equal(merged.points.length, 4);
+    assert.deepEqual([merged.x, merged.y, merged.w, merged.h], [0, 0, 30, 10]);
+    const [one] = validateOps([{ ...base, kind: 'update', elementId: stored.id, patch: { points: [{ x: 1, y: 1 }] } }]);
+    assert.throws(() => validateElement({ ...stored, ...one.patch }), /at least 2 points/);
   });
 
   test('tryValidateOps reports invalid without throwing', () => {

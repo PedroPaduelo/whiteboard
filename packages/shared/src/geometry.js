@@ -407,118 +407,227 @@ export function diamondPolygon(box) {
  * ------------------------------------------------------------------ */
 
 /**
- * Where a connector meets an element's box: the point on the box's perimeter,
- * on the ray from the box centre toward `toward`.
- *
- * This is what makes "the arrow rides the box" work. We pick the *edge*
- * intersection rather than the corner because an arrow through a corner looks
- * wrong, and because the intersection is stable as the other end moves.
- *
- * @param {Rect} box
- * @param {Point} toward  The point on the OTHER end of the connector.
- * @returns {Point} the attach point (falls back to the centre).
+ * How far (board units) a bound connector end stops short of the shape's
+ * outline, so the arrowhead never overlaps the stroke (Excalidraw leaves a
+ * similar gap). `resolveConnectors` uses it for every bound end.
  */
-export function connectorEndpoint(box, toward) {
-  const cx = box.x + box.w / 2;
-  const cy = box.y + box.h / 2;
-  const dx = toward.x - cx;
-  const dy = toward.y - cy;
-  if (Math.abs(dx) < EPS && Math.abs(dy) < EPS) return { x: cx, y: cy };
-  // A zero-area box (a dot) has no perimeter; use its centre.
-  if (box.w <= EPS && box.h <= EPS) return { x: cx, y: cy };
+export const BIND_GAP = 4;
 
-  // Scale the direction so the LARGER of the two ratios is 1, then clamp to
-  // the half-extent. This hits the nearer edge, which is the visually correct
-  // one: an arrow coming from the left stops at the left edge.
-  const hx = box.w / 2;
-  const hy = box.h / 2;
-  const sx = Math.abs(dx) < EPS ? Infinity : hx / Math.abs(dx);
-  const sy = Math.abs(dy) < EPS ? Infinity : hy / Math.abs(dy);
-  const s = Math.min(sx, sy);
-  if (!Number.isFinite(s)) return { x: cx, y: cy };
-  return { x: cx + dx * s, y: cy + dy * s };
+/** Which outline an element presents to a connector. Anything unknown (and a
+ *  bare `{x,y,w,h}` box) is a box. */
+function outlineKind(el) {
+  const t = el && el.type;
+  if (t === 'ellipse') return 'ellipse';
+  if (t === 'diamond') return 'diamond';
+  return 'box';
 }
 
 /**
- * Re-derive every connector's endpoints from its `startId`/`endId`.
+ * Distance from the centre to the outline along the direction (dx, dy), as a
+ * multiple of that direction vector, in the element's UNROTATED frame. The
+ * outline point is `centre + (dx, dy) * t`. Infinity/NaN-free: returns 0 for a
+ * degenerate (zero-extent) outline so the caller falls back to the centre.
  *
- * Called after ANY geometry mutation that moved a box (the store's
- * `updateElement`/`updateElements` do it, and the API does it after applying
- * ops). A connector's own free end is left exactly where the user put it —
- * only the ATTACHED end is recomputed, because that is the end the user did
- * not choose.
- *
- * @param {Array<{id:string,type:string,x:number,y:number,w:number,h:number,points?:Point[],startId?:string,endId?:string}>} elements
- * @returns {Array} a NEW array; elements that do not change keep identity
+ *  - box:     the nearer of the two edge crossings, min(hx/|dx|, hy/|dy|).
+ *  - ellipse: (t·dx/hx)^2 + (t·dy/hy)^2 = 1.
+ *  - diamond: |t·dx|/hx + |t·dy|/hy = 1 (the four edges of the rhombus).
  */
+function outlineScale(kind, hx, hy, dx, dy) {
+  const ax = Math.abs(dx);
+  const ay = Math.abs(dy);
+  // A flat or thin element degenerates to its box, which handles one zero
+  // half-extent (it is the segment itself) without dividing by zero.
+  if (kind !== 'box' && (hx <= EPS || hy <= EPS)) kind = 'box';
+  if (kind === 'ellipse') {
+    const q = (dx / hx) ** 2 + (dy / hy) ** 2;
+    return q > 0 ? 1 / Math.sqrt(q) : 0;
+  }
+  if (kind === 'diamond') {
+    const q = ax / hx + ay / hy;
+    return q > 0 ? 1 / q : 0;
+  }
+  const sx = ax < EPS ? Infinity : hx / ax;
+  const sy = ay < EPS ? Infinity : hy / ay;
+  const t = Math.min(sx, sy);
+  return Number.isFinite(t) ? t : 0;
+}
+
+/**
+ * Where a connector meets an element: the point on the element's OUTLINE, on
+ * the ray from its centre toward `toward`, pushed `gap` units further out
+ * along that ray.
+ *
+ * The outline follows the shape — rect/sticky/text/image/cylinder use the box,
+ * `ellipse` the ellipse, `diamond` the rhombus — and the element's `rotation`
+ * (radians, clockwise, about the box centre): `toward` is rotated into the
+ * element's unrotated frame, intersected there, and the result is rotated
+ * back out. A bare `{x,y,w,h}` is treated as an unrotated box, which is what
+ * callers written before this was shape-aware pass.
+ *
+ * We pick the intersection toward the other end rather than a fixed anchor
+ * because it is stable as the other end moves and never runs through a corner
+ * the way a fixed port does.
+ *
+ * @param {{x:number,y:number,w:number,h:number,type?:string,rotation?:number}} el
+ * @param {Point} toward  The point the connector comes from.
+ * @param {number} [gap]  Board units to stay clear of the outline (>= 0).
+ * @returns {Point} the attach point (the centre when there is no direction).
+ */
+export function connectorEndpoint(el, toward, gap = 0) {
+  const cx = el.x + el.w / 2;
+  const cy = el.y + el.h / 2;
+  if (!toward || !Number.isFinite(toward.x) || !Number.isFinite(toward.y)) return { x: cx, y: cy };
+  const rotation = Number.isFinite(el.rotation) ? el.rotation : 0;
+  // Into the unrotated frame: rotatePoint un-rotates by `rotation`.
+  const local = rotation ? rotatePoint(toward, el, rotation) : toward;
+  const dx = local.x - cx;
+  const dy = local.y - cy;
+  const len = Math.hypot(dx, dy);
+  // No direction (the other end sits on the centre): the centre is the only
+  // honest answer, and it is stable.
+  if (!(len > EPS)) return { x: cx, y: cy };
+
+  const t = outlineScale(outlineKind(el), el.w / 2, el.h / 2, dx, dy);
+  const g = Number.isFinite(gap) && gap > 0 ? gap / len : 0;
+  const k = t + g;
+  let x = cx + dx * k;
+  let y = cy + dy * k;
+  if (rotation) {
+    // Back out: rotate by +rotation about the centre.
+    const c = Math.cos(rotation);
+    const s = Math.sin(rotation);
+    const ox = x - cx;
+    const oy = y - cy;
+    x = cx + ox * c - oy * s;
+    y = cy + ox * s + oy * c;
+  }
+  return { x, y };
+}
+
 /** Centre of a box — the direction an attached connector points from. */
 function centreOf(box) {
   return { x: box.x + box.w / 2, y: box.y + box.h / 2 };
 }
 
+const isConnector = (el) => !!el && (el.type === 'arrow' || el.type === 'line');
+
+/**
+ * The element a bound end rides on, or null. A connector is never an anchor:
+ * its own box moves during this very pass, so binding to it could not be
+ * idempotent (and the editor never offers it). A missing id is null too —
+ * the store drops those with detachMissingConnectors.
+ */
+function anchorOf(byId, id) {
+  if (!id) return null;
+  const target = byId.get(id);
+  return target && !isConnector(target) ? target : null;
+}
+
+/**
+ * Re-derive every bound connector's END points from its `startId`/`endId`.
+ *
+ * Called after ANY geometry mutation that moved a box (the web store after
+ * local and remote edits, and the API after applying every batch, which
+ * persists the result). Only the first and last point are ever moved; interior
+ * points of a multi-point connector are exactly where the user put them, and so
+ * is an unbound end.
+ *
+ * A bound end aims at:
+ *  - 2 points, BOTH ends bound: the centre of the OTHER anchor;
+ *  - otherwise: its adjacent point (`points[1]` for the start, `points[n-2]`
+ *    for the end) — the direction the user drew the connector in.
+ * and lands BIND_GAP outside the anchor's outline (see connectorEndpoint).
+ *
+ * IDEMPOTENT, and that is not a nicety: the server runs this on every batch
+ * and persists the result, and peers run it again on what they receive. Every
+ * aim point above is something this function never moves (an anchor centre,
+ * an interior point, or an unbound end), so one pass is a pure function of the
+ * anchors and the fixed points and a second pass is a no-op. Aiming an end at
+ * the other end's RESOLVED position would make the two chase each other and
+ * creep across the board a little on every save.
+ *
+ * A two-point connector bound at both ends to the SAME element has no stable
+ * aim (each end would aim at the other's moving position, or both at the
+ * centre and collapse), so it is left exactly as stored. A binding to another
+ * connector, or to an id that is not in the list, is ignored.
+ *
+ * @param {Object[]} elements
+ * @returns {Object[]} a NEW array; elements that do not change keep identity
+ *   (an invalid input returns `[]`, an input with nothing bound returns itself)
+ */
 export function resolveConnectors(elements) {
   if (!Array.isArray(elements) || elements.length === 0) return Array.isArray(elements) ? elements : [];
 
   // Index by id only if some connector actually needs it.
-  const needsIndex = elements.some(
-    (e) => (e.type === 'arrow' || e.type === 'line') && (e.startId || e.endId),
-  );
+  const needsIndex = elements.some((e) => isConnector(e) && (e.startId || e.endId));
   if (!needsIndex) return elements;
 
   const byId = new Map();
   for (const el of elements) byId.set(el.id, el);
 
   return elements.map((el) => {
-    if (el.type !== 'arrow' && el.type !== 'line') return el;
+    if (!isConnector(el)) return el;
     if (!el.startId && !el.endId) return el;
-    const pts = el.points && el.points.length === 2 ? el.points : null;
+    const pts = Array.isArray(el.points) && el.points.length >= 2 ? el.points : null;
     if (!pts) return el;
+    const n = pts.length;
 
-    const startTarget = el.startId ? byId.get(el.startId) : null;
-    const endTarget = el.endId ? byId.get(el.endId) : null;
+    const startTarget = anchorOf(byId, el.startId);
+    const endTarget = anchorOf(byId, el.endId);
+    if (!startTarget && !endTarget) return el;
 
-    // Each endpoint is resolved toward the CENTRE of the opposite anchor —
-    // never toward the other endpoint's resolved position.
-    //
-    // This is what makes the function idempotent, and idempotence is not a
-    // nicety here: the server calls resolveConnectors on every applyOps, and
-    // the resolved points are persisted. Aiming each end at the other end's
-    // resolved point makes the two chase each other, so every pass nudges
-    // both slightly further (observed: 800 -> 900 -> 900.03 -> 900.04) and a
-    // bound arrow creeps across the board over its lifetime, never settling.
-    // Aiming at the anchor centres makes one pass a pure function of the two
-    // boxes, so the second pass is a no-op and the value is stable forever.
-    //
-    // A half-bound connector has only one anchor, and there the stored point
-    // IS the only directional information the user gave us — it keeps it,
-    // projected onto the edge it now sits against.
-    const start = { x: pts[0].x, y: pts[0].y };
-    const end = { x: pts[1].x, y: pts[1].y };
-
+    const start = pts[0];
+    const end = pts[n - 1];
     let s = start;
     let e = end;
-    if (startTarget && endTarget) {
-      s = connectorEndpoint(startTarget, centreOf(endTarget));
-      e = connectorEndpoint(endTarget, centreOf(startTarget));
-    } else if (startTarget) {
-      s = connectorEndpoint(startTarget, end);
-    } else if (endTarget) {
-      e = connectorEndpoint(endTarget, start);
+
+    if (n === 2 && startTarget && endTarget) {
+      if (startTarget === endTarget) return el; // self-loop: no stable aim, see above
+      s = connectorEndpoint(startTarget, centreOf(endTarget), BIND_GAP);
+      e = connectorEndpoint(endTarget, centreOf(startTarget), BIND_GAP);
+    } else {
+      // n === 2 with one end bound aims at the other (free, unmoved) end;
+      // n > 2 aims at the interior neighbour, which binding never moves.
+      if (startTarget) s = connectorEndpoint(startTarget, pts[1], BIND_GAP);
+      if (endTarget) e = connectorEndpoint(endTarget, pts[n - 2], BIND_GAP);
     }
 
     if (s.x === start.x && s.y === start.y && e.x === end.x && e.y === end.y) return el;
-    return reboxPolyline({ ...el, points: [s, e] });
+    const points = pts.map((p, i) => (i === 0 ? { x: s.x, y: s.y } : i === n - 1 ? { x: e.x, y: e.y } : { x: p.x, y: p.y }));
+    return reboxPolyline({ ...el, points });
   });
 }
 
 /**
- * The visual midpoint of a connector, for the rotate handle and for labels.
+ * The visual midpoint of a connector (half-way along its length), for the
+ * label anchor and the midpoint handle. Works for 2..N points; a straight
+ * connector gives the plain midpoint of its two ends.
  * @param {Point[]} points
  */
 export function connectorMidpoint(points) {
-  const a = points[0] || { x: 0, y: 0 };
-  const b = points[1] || a;
-  return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+  if (!Array.isArray(points) || points.length === 0) return { x: 0, y: 0 };
+  if (points.length === 1) return { x: points[0].x, y: points[0].y };
+  if (points.length === 2) {
+    const a = points[0];
+    const b = points[1];
+    return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+  }
+  let total = 0;
+  for (let i = 1; i < points.length; i++) total += distance(points[i - 1], points[i]);
+  if (!(total > EPS)) return { x: points[0].x, y: points[0].y };
+  let left = total / 2;
+  for (let i = 1; i < points.length; i++) {
+    const a = points[i - 1];
+    const b = points[i];
+    const seg = distance(a, b);
+    if (seg >= left && seg > EPS) {
+      const t = left / seg;
+      return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
+    }
+    left -= seg;
+  }
+  const last = points[points.length - 1];
+  return { x: last.x, y: last.y };
 }
 
 /* ------------------------------------------------------------------ *

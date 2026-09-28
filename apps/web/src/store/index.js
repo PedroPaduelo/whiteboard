@@ -17,13 +17,14 @@
  */
 
 import { useShallow } from 'zustand/react/shallow';
+import { useStoreWithEqualityFn } from 'zustand/traditional';
 import { useBoardStore } from './boardStore.js';
-import { shallow } from 'zustand/shallow';
 
 export { useBoardStore };
-export { subscribe, getState, initialState, CURSOR_TTL_MS } from './boardStore.js';
+export { subscribe, getState, initialState, CURSOR_TTL_MS, CONNECTION_STATES } from './boardStore.js';
 export * as selectors from './selectors.js';
-export * from './presets.js';
+// Presets are NOT re-exported: import them from './presets.js' directly, so
+// every store consumer does not load (and validate) the preset library.
 
 /**
  * The raw store, for imperative code outside React (`realtime/sync.js`,
@@ -42,16 +43,20 @@ export const store = useBoardStore;
  * array every call, identity comparison re-renders on every store change,
  * so pass `shallow` as the second argument:
  *
- *     const { stroke, fill } = useSelector((s) => s.style, shallow);
+ *     const { stroke, fill } = useSelector((s) => s.style, shallow); // shallow from 'zustand/shallow'
  *
  * This is a thin wrapper over zustand's own hook, so it inherits the same
- * `useSyncExternalStore` behaviour and the same StrictMode safety.
+ * `useSyncExternalStore` behaviour and the same StrictMode safety. With an
+ * equality function it goes through `zustand/traditional` (passing one to the
+ * plain hook is deprecated in zustand 4 and removed in 5).
  *
  * @param {(state: object) => unknown} selector
  * @param {(a: unknown, b: unknown) => boolean} [equality]
  */
 export function useSelector(selector, equality) {
-  return useBoardStore(selector, equality);
+  // Hook order is stable per call site: a caller either always passes an
+  // equality function or never does.
+  return equality ? useStoreWithEqualityFn(useBoardStore, selector, equality) : useBoardStore(selector);
 }
 
 /** `useSelector` pre-wrapped for the common "object/array result" case. */
@@ -61,6 +66,15 @@ export function useShallowSelector(selector) {
 
 /** The active tool. A string — no shallow needed. */
 export const useTool = () => useBoardStore((s) => s.tool);
+
+/** Excalidraw's tool lock (Q): keep the drawing tool after creating an element. */
+export const useToolLocked = () => useBoardStore((s) => s.toolLocked);
+
+/** The canvas' CSS size `{w, h}`, as reported by the Canvas' ResizeObserver. */
+export const useViewportSize = () => useBoardStore((s) => s.viewportSize);
+
+/** Realtime connection: 'idle' | 'connecting' | 'connected' | 'offline' | 'disconnected'. */
+export const useConnection = () => useBoardStore((s) => s.connection);
 
 /** The active selection as a stable ARRAY. Never return the Set itself. */
 export const useSelection = () => useBoardStore(useShallow((s) => Array.from(s.selection)));
@@ -92,15 +106,17 @@ export const usePeers = () => useBoardStore(useShallow((s) => s.peers));
 export const useMyPeerId = () => useBoardStore((s) => s.myPeerId);
 
 /**
- * Remote cursors as an array. This one matters most: a cursor moves on every
- * pointer event, so an unwrapped Map here re-renders the whole board on
- * every mouse move of every collaborator.
+ * Remote cursors: the store's `Map<peerId, {x, y, name, color, at}>` itself.
+ * The store replaces the Map only when a cursor actually changes, so this
+ * re-renders on cursor moves and on nothing else. (Building an array of
+ * fresh objects here would defeat any equality check and re-render on EVERY
+ * store write.) The canvas should not use this hook at all — it reads
+ * `remoteCursors` in its rAF loop via `useBoardStore.subscribe`.
  */
-export const useRemoteCursors = () =>
-  useBoardStore(useShallow((s) => Array.from(s.remoteCursors, ([peerId, cur]) => ({ peerId, ...cur }))));
+export const useRemoteCursors = () => useBoardStore((s) => s.remoteCursors);
 
 /** Load status, board id, board rev, last error. */
-export const useStatus = () => useBoardStore(useShallow((s) => s.status));
+export const useStatus = () => useBoardStore((s) => s.status);
 export const useBoardId = () => useBoardStore((s) => s.boardId);
 export const useRev = () => useBoardStore((s) => s.rev);
 export const useError = () => useBoardStore((s) => s.error);
@@ -119,11 +135,11 @@ export const useHistoryDepth = () => useBoardStore(useShallow((s) => ({ past: s.
 
 /**
  * Actions are stable for the lifetime of the store, so they are read through
- * `getState` and never trigger a re-render. Pull them out of the render path
- * entirely — this is what lets a component call `commit()` in a pointer
- * handler without subscribing to anything.
+ * `getState` and never trigger a re-render. Returns the state object (whose
+ * functions are the actions): `const { commit, addElement } = useActions()`.
+ * Destructure inside handlers when you need the LIVE state too.
  */
-export const useActions = () => useBoardStore.getState;
+export const useActions = () => useBoardStore.getState();
 
 /**
  * A live facade over the store for code that is NOT a React render: the

@@ -1,22 +1,25 @@
 <!doctype html>
-<html lang="en">
+<html lang="pt-BR">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
     <!-- maximum-scale/user-scalable: a whiteboard that pinch-zooms the page
-         instead of the canvas is infuriating on a phone. Panning and zooming
-         are handled by the canvas, not by the browser. -->
+         instead of the canvas is infuriating on a phone. Pan and zoom are the
+         canvas' job. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
     <meta name="color-scheme" content="light dark" />
-    <meta
-      name="description"
-      content="Collaborative whiteboard: draw, sketch and structure ideas together in real time."
-    />
+    <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#121212" media="(prefers-color-scheme: dark)" />
+    <meta name="description" content="Quadro branco colaborativo: desenhe, rabisque e organize ideias juntos, em tempo real." />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <!-- editor/fonts.js fetch()es the hand-drawn font as bytes (for the
+         canvas FontFace and the SVG export), so the preload is `as="fetch"`
+         with CORS mode — the one form the fetch can reuse. -->
+    <link rel="preload" href="/fonts/Virgil-Regular.woff2" as="fetch" crossorigin="anonymous" />
     <title>Whiteboard</title>
   </head>
   <body>
     <div id="root"></div>
-    <noscript>This whiteboard needs JavaScript enabled.</noscript>
+    <noscript>Este quadro branco precisa de JavaScript.</noscript>
     <script type="module" src="/src/main.jsx"></script>
   </body>
 </html>
