@@ -49,7 +49,6 @@ import {
   GRID,
   reboxPolyline,
   resolveConnectors,
-  fitViewCompat,
   zoomAt,
   clampZoom,
 } from '@whiteboard/shared';
@@ -64,14 +63,6 @@ export const CURSOR_TTL_MS = 30_000;
 
 /** Mirrors `RealtimeClient.status`. The UI renders a dot/label per value. */
 export const CONNECTION_STATES = Object.freeze(['idle', 'connecting', 'connected', 'offline', 'disconnected']);
-
-/**
- * Bumped by `replaceAll` (undo, redo, import). Informational only: the sync
- * bridge used to encode an epoch change as `clear` + re-create, which wiped
- * collaborators' work, and now diffs every transition the same way. Kept so
- * code that wants to know "was that a wholesale swap" still can.
- */
-export const historyEpoch = { value: 0 };
 
 const now = () => Date.now();
 
@@ -103,13 +94,17 @@ export function initialState() {
     selection: new Set(),
     hoveredId: null,
     editingId: null,
-    resizingId: null,
-    marquee: null,
 
     // collaborators
     peers: [],
     myPeerId: null,
     remoteCursors: new Map(),
+    /**
+     * What each collaborator has selected: Map peerId -> {ids, color, name}
+     * (`renderInteractive`'s `peerSelections`). Only non-empty selections are
+     * kept; a peer that leaves the roster takes its entry with it.
+     */
+    peerSelections: new Map(),
 
     // history — internal stacks, surfaced as canUndo/canRedo/pastDepth/futureDepth
     canUndo: false,
@@ -148,12 +143,35 @@ function isKnownTool(tool) {
   return typeof tool === 'string' && (TOOLS.includes(tool) || Boolean(TOOL_BY_ID[tool]));
 }
 
+/** Same point sequence? x/y only — that is all the wire carries. */
+function samePoints(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i]?.x !== b[i]?.x || a[i]?.y !== b[i]?.y) return false;
+  }
+  return true;
+}
+
+/**
+ * Is `v` the value `el` already holds under `k`? By content, not reference:
+ * every patch that crosses the wire (or is re-applied as a pending op)
+ * carries a fresh copy of `points`, and treating an identical copy as a
+ * change gave the element a new object — which the history rebase then read
+ * as a REMOTE change and wrote into every undo snapshot.
+ */
+function sameValue(k, current, v) {
+  if (current === v) return true;
+  if (typeof v !== 'object' || v === null) return false;
+  return k === 'points' ? samePoints(current, v) : jsonEqual(current, v);
+}
+
 /**
  * Merge a patch onto an element, returning a NEW element (or the same one when
- * the patch changes nothing). `null`/`undefined` values delete the key; `id`
- * and `type` are identity and never patched. A polyline whose points or box
- * were touched is re-boxed from its points — exactly what the server's
- * `validateElement` does, so local and server agree on the box.
+ * the patch changes nothing — compared by content, see `sameValue`).
+ * `null`/`undefined` values delete the key; `id` and `type` are identity and
+ * never patched. A polyline whose points or box were touched is re-boxed from
+ * its points — exactly what the server's `validateElement` does, so local and
+ * server agree on the box.
  */
 export function mergePatch(el, patch) {
   if (!patch || typeof patch !== 'object') return el;
@@ -167,7 +185,7 @@ export function mergePatch(el, patch) {
       if (!out) out = { ...el };
       delete out[k];
     } else {
-      if (el[k] === v) continue;
+      if (sameValue(k, el[k], v)) continue;
       if (!out) out = { ...el };
       out[k] = v;
     }
@@ -389,12 +407,56 @@ export function applyOpsToElements(elements, ops, { rebase = false } = {}) {
 /* ------------------------------------------------------------ history rebase */
 
 /**
+ * The survivors (ids in both lists) whose relative order changed from `prev`
+ * to `next`: everything outside ONE longest run that kept its order (a
+ * longest increasing subsequence of prev positions, O(n log n)). A "bring to
+ * front" of one element moves exactly that element; creates and deletes move
+ * nothing.
+ */
+function movedSurvivors(prev, next, after) {
+  const posInPrev = new Map();
+  let n = 0;
+  for (const el of prev) if (after.has(el.id)) posInPrev.set(el.id, n++);
+  const seq = [];
+  const ids = [];
+  for (const el of next) {
+    const p = posInPrev.get(el.id);
+    if (p === undefined) continue;
+    seq.push(p);
+    ids.push(el.id);
+  }
+  const tails = [];
+  const link = new Array(seq.length);
+  for (let k = 0; k < seq.length; k++) {
+    let lo = 0;
+    let hi = tails.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (seq[tails[mid]] < seq[k]) lo = mid + 1;
+      else hi = mid;
+    }
+    link[k] = lo > 0 ? tails[lo - 1] : -1;
+    tails[lo] = k;
+  }
+  const kept = new Set();
+  for (let k = tails.length > 0 ? tails[tails.length - 1] : -1; k >= 0; k = link[k]) kept.add(ids[k]);
+  const moved = new Set();
+  if (kept.size === ids.length) return moved;
+  for (const id of ids) if (!kept.has(id)) moved.add(id);
+  return moved;
+}
+
+/**
  * Describe the transition `prev -> next` (a remote batch, a resync) so it can
  * be replayed onto undo/redo snapshots. Changes are found by object identity,
  * which is cheap and exact because nothing mutates in place.
  *
+ * `moved` are the survivors whose relative order changed; `order` is the new
+ * order when any did (null otherwise); `next` is always the new order, which
+ * is where created and moved elements find their neighbours.
+ *
  * @returns {null | {created: object[], changed: Map<string,{before:object, after:object}>,
- *   deleted: Set<string>, order: string[]|null}}
+ *   deleted: Set<string>, moved: Set<string>, order: string[]|null, next: string[]}}
  */
 export function describeTransition(prev, next) {
   if (prev === next) return null;
@@ -412,31 +474,24 @@ export function describeTransition(prev, next) {
 
   // Did the relative order of the survivors change? (Creates append on top
   // and deletes just vanish; neither is a reorder by itself.)
-  let reordered = false;
-  let j = 0;
-  for (const el of prev) {
-    if (!after.has(el.id)) continue;
-    while (j < next.length && !before.has(next[j].id)) j++;
-    if (j >= next.length || next[j].id !== el.id) {
-      reordered = true;
-      break;
-    }
-    j++;
-  }
+  const moved = movedSurvivors(prev, next, after);
 
-  if (created.length === 0 && changed.size === 0 && deleted.size === 0 && !reordered) return null;
-  return { created, changed, deleted, order: reordered ? next.map((el) => el.id) : null };
+  if (created.length === 0 && changed.size === 0 && deleted.size === 0 && moved.size === 0) return null;
+  const nextIds = next.map((el) => el.id);
+  return { created, changed, deleted, moved, order: moved.size > 0 ? nextIds : null, next: nextIds };
 }
 
 /**
  * Replay a remote field-level change onto an older version of an element:
  * every key the remote changed takes the remote value (or disappears), and
- * every key it did not touch keeps the snapshot's value.
+ * every key it did not touch keeps the snapshot's value. "Changed" is by
+ * content (see `sameValue`), so a fresh copy of the same points is not a
+ * change that overwrites the snapshot's points.
  */
 function applyDelta(el, before, after) {
   let out = null;
   for (const k of Object.keys(after)) {
-    if (after[k] === before[k] || el[k] === after[k]) continue;
+    if (sameValue(k, before[k], after[k]) || sameValue(k, el[k], after[k])) continue;
     if (!out) out = { ...el };
     out[k] = after[k];
   }
@@ -462,18 +517,68 @@ function positionsIn(entry) {
 }
 
 /**
+ * Put `place` (id -> element) into `list` next to their neighbours in the
+ * board order `nextIds`: right after the nearest element before them there
+ * that `list` also holds; at the very bottom when there is none; on the very
+ * top when nothing `list` holds comes after them. Elements of `list` that are
+ * not on the board any more (deleted locally since the snapshot) keep their
+ * place, so undoing that delete still restores them in place.
+ */
+function placeByNeighbours(list, place, nextIds) {
+  const rest = list.filter((el) => !place.has(el.id));
+  const inRest = new Set(rest.map((el) => el.id));
+  let lastShared = -1;
+  for (let i = 0; i < nextIds.length; i++) if (inRest.has(nextIds[i])) lastShared = i;
+
+  const bottom = [];
+  const top = [];
+  const after = new Map(); // anchor id -> elements that go right after it
+  let anchor = null;
+  for (let i = 0; i < nextIds.length; i++) {
+    const id = nextIds[i];
+    if (inRest.has(id)) {
+      anchor = id;
+      continue;
+    }
+    const el = place.get(id);
+    if (!el) continue;
+    if (i > lastShared) top.push(el);
+    else if (anchor === null) bottom.push(el);
+    else {
+      if (!after.has(anchor)) after.set(anchor, []);
+      after.get(anchor).push(el);
+    }
+  }
+  const out = bottom;
+  for (const el of rest) {
+    out.push(el);
+    const group = after.get(el.id);
+    if (group) out.push(...group);
+  }
+  out.push(...top);
+  return out;
+}
+
+/**
  * Rebase one undo/redo snapshot over a remote transition. Returns the SAME
  * array when the transition does not touch it. An element the snapshot shares
  * with the pre-transition present (unchanged locally since the snapshot) is
  * swapped for the post-transition object itself, so identity-based "is this
  * entry a no-op?" checks keep working.
+ *
+ * Z-order: a remote create is added where it sits among its neighbours on the
+ * board (not simply on top — a peer's undo restores things in place), and an
+ * element a remote reorder moved is moved the same way relative to its
+ * neighbours. Everything else keeps the snapshot's order, so restoring the
+ * snapshot reverts only this user's own reorders and deletes.
  */
 export function rebaseEntry(entry, t) {
   if (!t) return entry;
+  const moved = t.moved ?? new Set();
 
   // Fast path — updates only, the shape of a remote drag. O(changed) plus a
   // memcpy, instead of a full scan of every snapshot on every frame.
-  if (t.created.length === 0 && t.deleted.size === 0 && !t.order) {
+  if (t.created.length === 0 && t.deleted.size === 0 && moved.size === 0) {
     const pos = positionsIn(entry);
     let out = null;
     for (const [id, ch] of t.changed) {
@@ -502,18 +607,20 @@ export function rebaseEntry(entry, t) {
     if (nextEl !== el) changed = true;
     out.push(nextEl);
   }
+
+  // What needs a (new) place: remote creates this snapshot lacks, and the
+  // elements a remote reorder moved.
+  const place = new Map();
   if (t.created.length > 0) {
     const have = new Set(out.map((el) => el.id));
-    for (const el of t.created) {
-      if (have.has(el.id)) continue;
-      out.push(el);
-      changed = true;
-    }
+    for (const el of t.created) if (!have.has(el.id)) place.set(el.id, el);
   }
-  if (t.order) {
-    const ordered = orderBy(out, t.order);
-    if (ordered !== out) {
-      out = ordered;
+  if (moved.size > 0) for (const el of out) if (moved.has(el.id)) place.set(el.id, el);
+  if (place.size > 0) {
+    const nextIds = t.next ?? t.order ?? [];
+    const placed = placeByNeighbours(out, place, nextIds);
+    if (!sameSequence(placed, out)) {
+      out = placed;
       changed = true;
     }
   }
@@ -568,16 +675,6 @@ function reuseEqual(local, incoming) {
   return same ? local : out;
 }
 
-/** A viewport size: explicit, else the canvas' reported size, else the window. */
-function viewportFor(override, reported) {
-  const vw = override?.vw ?? override?.w ?? (reported?.w > 0 ? reported.w : undefined);
-  const vh = override?.vh ?? override?.h ?? (reported?.h > 0 ? reported.h : undefined);
-  return {
-    vw: vw ?? (typeof window !== 'undefined' ? window.innerWidth : 1440),
-    vh: vh ?? (typeof window !== 'undefined' ? window.innerHeight : 900),
-  };
-}
-
 /** The empty-history fields (hydration of a different board). Fresh objects per call. */
 function noHistory() {
   return {
@@ -589,6 +686,61 @@ function noHistory() {
     _future: [],
     _lastCommit: { label: null, at: 0 },
   };
+}
+
+/* ========================================================================
+   Collaborators' selections
+   ======================================================================== */
+
+/**
+ * A `peerSelections` entry, or null when nothing is selected. Ids are
+ * strings, unique, in the order given.
+ */
+function peerSelectionEntry(ids, { color = null, name = null } = {}) {
+  if (!ids || typeof ids === 'string' || typeof ids[Symbol.iterator] !== 'function') return null;
+  const list = [];
+  const seen = new Set();
+  for (const id of ids) {
+    if (typeof id !== 'string' || !id || seen.has(id)) continue;
+    seen.add(id);
+    list.push(id);
+  }
+  return list.length > 0 ? { ids: list, color: color ?? null, name: name ?? null } : null;
+}
+
+function samePeerSelection(a, b) {
+  if (a.color !== b.color || a.name !== b.name || a.ids.length !== b.ids.length) return false;
+  for (let i = 0; i < a.ids.length; i++) if (a.ids[i] !== b.ids[i]) return false;
+  return true;
+}
+
+/**
+ * `peerSelections` after a new roster: entries of peers who left are
+ * dropped, a roster entry carrying `selection` sets (or clears) that peer's
+ * entry, and colours/names follow the roster. Our own entry (`self`) is never
+ * kept: the local selection is drawn from `selection`. Returns the SAME Map
+ * when nothing changed.
+ */
+function rosterSelections(current, roster, onRoster, self) {
+  let next = null;
+  const write = () => (next ??= new Map(current));
+  for (const id of current.keys()) if (!onRoster.has(id) || id === self) write().delete(id);
+  for (const p of roster) {
+    if (!p || !p.id || p.id === self) continue;
+    const prev = (next ?? current).get(p.id);
+    const carried = Array.isArray(p.selection);
+    if (!carried && !prev) continue;
+    const entry = peerSelectionEntry(carried ? p.selection : prev.ids, {
+      color: p.color ?? prev?.color ?? null,
+      name: p.name ?? prev?.name ?? null,
+    });
+    if (!entry) {
+      if (prev) write().delete(p.id);
+    } else if (!prev || !samePeerSelection(prev, entry)) {
+      write().set(p.id, entry);
+    }
+  }
+  return next ?? current;
 }
 
 /* ========================================================================
@@ -805,7 +957,6 @@ export const useBoardStore = create((set, get) => ({
    */
   replaceAll(els) {
     const next = Array.isArray(els) ? els.slice() : [];
-    historyEpoch.value += 1;
     set((s) => ({ elements: next, ...prunedInteraction(s, next) }));
   },
 
@@ -868,7 +1019,7 @@ export const useBoardStore = create((set, get) => ({
   },
 
   clearSelection() {
-    set({ selection: new Set(), marquee: null });
+    set({ selection: new Set() });
   },
 
   setHovered(id) {
@@ -877,17 +1028,8 @@ export const useBoardStore = create((set, get) => ({
     set({ hoveredId: next });
   },
 
-  /** Legacy (React Flow NodeResizer). Kept until the old layer is removed. */
-  setResizing(id) {
-    set({ resizingId: id ?? null });
-  },
-
   setEditing(id) {
     set({ editingId: id ?? null });
-  },
-
-  setMarquee(rect) {
-    set({ marquee: rect ?? null });
   },
 
   // ------------------------------------------------------------ tool & style
@@ -985,21 +1127,6 @@ export const useBoardStore = create((set, get) => ({
     set({ viewportSize: { w, h } });
   },
 
-  /**
-   * Frame every element. Uses `{vw, vh}` (or `{w, h}`) when given, else the
-   * canvas size the Canvas reported, else the window.
-   */
-  fitToContent(size) {
-    set((s) => {
-      const { vw, vh } = viewportFor(size, s.viewportSize);
-      return { view: fitViewCompat(s.elements, vw, vh) };
-    });
-  },
-
-  resetView() {
-    set({ view: { ...IDENTITY_VIEW } });
-  },
-
   // ---------------------------------------------------------------- history
 
   /**
@@ -1087,15 +1214,20 @@ export const useBoardStore = create((set, get) => ({
   },
 
   /**
-   * Replace the roster. Cursors of peers no longer on it are dropped in the
-   * same write — a peer that left must not leave its arrow on the board.
+   * Replace the roster. Cursors and selections of peers no longer on it are
+   * dropped in the same write — a peer that left must not leave its arrow,
+   * or its outline around a shape, on the board.
+   *
+   * A roster entry that carries `selection` (an array of element ids) is the
+   * server's record of that peer's selection and replaces ours: that is how
+   * someone joining late sees what the others already have selected.
    */
   setPeers(peers) {
     const list = Array.isArray(peers) ? peers : [];
     set((s) => {
       const out = { peers: list };
+      const ids = new Set(list.map((p) => p && p.id));
       if (s.remoteCursors.size > 0) {
-        const ids = new Set(list.map((p) => p && p.id));
         let changed = false;
         const next = new Map();
         for (const [id, cur] of s.remoteCursors) {
@@ -1104,7 +1236,38 @@ export const useBoardStore = create((set, get) => ({
         }
         if (changed) out.remoteCursors = next;
       }
+      const selections = rosterSelections(s.peerSelections, list, ids, s.myPeerId);
+      if (selections !== s.peerSelections) out.peerSelections = selections;
       return out;
+    });
+  },
+
+  /**
+   * A collaborator's selection changed (`peer-selection`). An empty list
+   * removes the entry; the same ids again change nothing (no re-render).
+   * @param {string} peerId
+   * @param {{ids?: Iterable<string>, color?: string|null, name?: string|null}} sel
+   */
+  setPeerSelection(peerId, sel) {
+    if (!peerId) return;
+    set((s) => {
+      if (peerId === s.myPeerId) return {};
+      const prev = s.peerSelections.get(peerId);
+      const peer = s.peers.find((p) => p && p.id === peerId);
+      const entry = peerSelectionEntry(sel?.ids, {
+        color: sel?.color ?? peer?.color ?? prev?.color ?? null,
+        name: sel?.name ?? peer?.name ?? prev?.name ?? null,
+      });
+      if (!entry) {
+        if (!prev) return {};
+        const next = new Map(s.peerSelections);
+        next.delete(peerId);
+        return { peerSelections: next };
+      }
+      if (prev && samePeerSelection(prev, entry)) return {};
+      const next = new Map(s.peerSelections);
+      next.set(peerId, entry);
+      return { peerSelections: next };
     });
   },
 

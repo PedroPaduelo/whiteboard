@@ -23,7 +23,7 @@
 import websocket from '@fastify/websocket';
 import fp from 'fastify-plugin';
 import { WS_MSG, OP_RESULT, validateOps, colorForPeer } from '@whiteboard/shared';
-import { Hub } from './hub.js';
+import { Hub, PENDING_ROOM, CLOSE_IDLE } from './hub.js';
 import { rejectionCode } from '../store/ops.js';
 
 /** Must match `config.BODY_LIMIT`, or a big op batch is cut off mid-parse. */
@@ -145,8 +145,9 @@ export async function wsPlugin(fastify, opts = {}) {
 
     // Added before `join`, so a socket that never identifies itself is still
     // something the sweeper can reap. It sits in a parking room that is
-    // broadcast to nobody and never reported in a real room's roster.
-    const peer = hub.add({ socket: client, boardId: '_pending', name: null });
+    // broadcast to nobody (hub.broadcast refuses parking rooms) and never
+    // reported in a real room's roster.
+    const peer = hub.add({ socket: client, boardId: PENDING_ROOM, name: null });
     const session = {
       peer,
       joined: false,
@@ -299,7 +300,7 @@ export async function wsPlugin(fastify, opts = {}) {
         case WS_MSG.ACTIVITY:
           return onActivity(session, message);
         case WS_MSG.PING:
-          hub.touch(session.peer.id);
+          if (!hub.touch(session.peer.id)) evict(session);
           return;
         default:
           log.debug({ type: message.type }, 'ws: ignoring unknown message type');
@@ -314,6 +315,23 @@ export async function wsPlugin(fastify, opts = {}) {
 
   function error(peer, text, extra = {}) {
     hub.send(peer, { type: 'error', text, ...extra });
+  }
+
+  /**
+   * The hub no longer knows this connection (the sweeper dropped it, or its
+   * board was deleted) but the socket still talks to us. Hang up so the
+   * client reconnects and resyncs, instead of carrying on as a one-way
+   * zombie: out of every room, so deaf to everyone else's ops, cursors and
+   * presence, while its own acks kept telling it all was well.
+   */
+  function evict(session, code = CLOSE_IDLE, reason = 'idle timeout') {
+    cleanup(session);
+    session.joined = false;
+    try {
+      session.peer.socket.close(code, reason);
+    } catch {
+      /* already closing */
+    }
   }
 
   /* -------------------------------------------------------------- handlers */
@@ -374,11 +392,24 @@ export async function wsPlugin(fastify, opts = {}) {
       return;
     }
     // Liveness: a client actively editing is not idle, whatever its ping says.
-    hub.touch(peer.id);
+    // A peer the hub already dropped is hung up on, not served: the batch is
+    // NOT applied (the client re-sends its unacked batch after reconnecting,
+    // and opIds make that retry safe), because an ack here is exactly what
+    // kept a pruned tab believing it was still connected.
+    if (!hub.touch(peer.id)) {
+      evict(session);
+      return;
+    }
 
     let ops;
     try {
       ops = validateOps(message.ops);
+      // Same rule as REST (routes/ops.js): a batch holds 1..MAX_OPS_PER_BATCH
+      // ops. An empty one used to be acked 'applied' and cost a full write
+      // plus a rev bump for nothing.
+      if (ops.length === 0) {
+        throw Object.assign(new Error('ops: expected at least one op'), { path: 'ops' });
+      }
     } catch (err) {
       // Rejected without touching the store: nothing is half-applied. The
       // client must DROP this batch (re-sending it can only fail again).
@@ -448,7 +479,10 @@ export async function wsPlugin(fastify, opts = {}) {
   function onCursor(session, message) {
     const { peer } = session;
     if (!session.joined || !session.boardId) return;
-    hub.touch(peer.id);
+    if (!hub.touch(peer.id)) {
+      evict(session);
+      return;
+    }
 
     const source = message.cursor ?? message;
     const cursor = { x: clampCoord(source?.x), y: clampCoord(source?.y) };
@@ -498,7 +532,11 @@ export async function wsPlugin(fastify, opts = {}) {
     // Broadcast only when the tool actually CHANGED. A presence fan-out on
     // every keystroke is pure waste and churns the whole roster.
     const touched = hub.touch(peer.id, { tool: message.text });
-    if (touched?.toolChanged && session.boardId) {
+    if (!touched) {
+      evict(session);
+      return;
+    }
+    if (touched.toolChanged && session.boardId) {
       hub.broadcast(session.boardId, hub.presence(session.boardId));
     }
   }

@@ -21,16 +21,21 @@
  * this component puts DARK_MODE_FILTER on both canvases (and the textarea).
  *
  * Keyboard handled here is only what belongs to a gesture: Space (hold to
- * pan), Escape/Enter (finish a multi-point connector), Shift/Alt (re-evaluate
- * a drag), and arrow keys are swallowed WHILE a drag is active. Everything
- * else is the global shortcut handler's (ui/shortcuts.js).
+ * pan — unless a dialog is open or a control has keyboard focus, where Space
+ * activates it), Escape/Enter (finish a multi-point connector), Shift/Alt
+ * (re-evaluate a drag), Delete/Backspace (remove the active point in
+ * connector point editing), and arrow keys, Delete and undo/redo are
+ * swallowed WHILE a drag is active. Everything else is the global shortcut
+ * handler's (ui/shortcuts.js).
  *
  * Also here: the collaborator cursor broadcast (realtime.sendCursor in board
- * units), touch pinch-zoom, and image files dropped on or pasted into the
- * board (editor/image.js).
+ * units), touch pinch-zoom and the touch long-press context menu, the guard
+ * that keeps Ctrl/⌘+wheel and pinch from zooming the whole page, and files
+ * dropped on or pasted into the board (images via editor/image.js; a saved
+ * board file opens it).
  */
 
-import { forwardRef, useCallback, useEffect, useRef, useState } from 'react';
+import { forwardRef, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { LIMITS, tryValidateElement } from '@whiteboard/shared';
 import { useBoardStore } from '../store/index.js';
 import { realtime } from '../realtime/realtime.js';
@@ -39,14 +44,92 @@ import { reduce, initialInteraction } from './interaction.js';
 import { renderStatic, renderInteractive } from './render/renderScene.js';
 import { loadFonts, onFontsLoaded } from './fonts.js';
 import { fitTextElement, labelKeyOf } from './text.js';
-import { applyPatches, resolveBindingPatches } from './scene.js';
+import { styleKeysFor } from './elements.js';
+import { applyPatches, growContainerForLabel, resolveBindingPatches } from './scene.js';
 import { insertImageFiles, isImageFile, openImagePicker } from './image.js';
+import { actions } from './actions.js';
+import { isControlTarget } from '../ui/shortcuts.js';
+import { useUi } from '../ui/uiStore.js';
+import { toast } from '../ui/toast.js';
+import { t } from '../ui/strings.js';
 import TextEditor from './TextEditor.jsx';
 
 const clampDpr = (d) => Math.min(3, Math.max(1, Number.isFinite(d) && d > 0 ? d : 1));
 
 /** Keys the Canvas forwards to the reducer (all others belong to the global shortcuts). */
-const GESTURE_KEYS = new Set(['Escape', 'Enter', 'Shift', 'Alt', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight']);
+const GESTURE_KEYS = new Set(['Escape', 'Enter', 'Shift', 'Alt', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Delete', 'Backspace']);
+
+/** Mod+Z / Mod+Shift+Z / Mod+Y, by physical key too (any keyboard layout); null when not one. */
+function undoRedoKey(e) {
+  if (!(e.ctrlKey || e.metaKey) || e.altKey) return null;
+  if (e.code === 'KeyZ' || e.code === 'KeyY') return e.code === 'KeyZ' ? 'z' : 'y';
+  const k = String(e.key || '').toLowerCase();
+  return k === 'z' || k === 'y' ? k : null;
+}
+
+/** Excalidraw's TOUCH_CTX_MENU_TIMEOUT: a finger held this long (ms) opens the context menu. */
+const LONG_PRESS_MS = 500;
+/** How far (CSS px) a held finger may wander and still count as a long-press. */
+const LONG_PRESS_SLOP = 10;
+/** Tools where a long-press opens the menu (elsewhere a held finger is drawing). */
+const LONG_PRESS_TOOLS = new Set(['select', 'hand']);
+
+/**
+ * The canvas host clips its overflow — the text editor grows past the board
+ * edge while typing near it. `hidden` would still let the browser SCROLL the
+ * host to keep the caret visible, shifting both canvases under the pointer;
+ * `clip` makes it no scroll container at all. (Browsers without `clip` get
+ * `hidden` plus the scroll reset in the render effect.)
+ */
+const HOST_OVERFLOW = typeof CSS !== 'undefined' && typeof CSS.supports === 'function' && CSS.supports('overflow', 'clip') ? 'clip' : 'hidden';
+
+/** Is this dropped file a saved board (what "Salvar em arquivo" writes)? */
+function isBoardFile(file) {
+  if (!file) return false;
+  const name = String(file.name || '').toLowerCase();
+  return name.endsWith('.json') || name.endsWith('.whiteboard') || file.type === 'application/json';
+}
+
+/** An image that could not be inserted (undecodable, too big): say so, like the image picker does. */
+function reportImageFailure(err) {
+  console.warn('[canvas] image insert failed', err);
+  toast.error(t.toast.imageFailed);
+}
+
+/** Open a board file dropped on the board: replaces the board, confirming first when it is not empty. */
+async function openDroppedBoardFile(file) {
+  if (useBoardStore.getState().elements.length > 0) {
+    const ok = await useUi.getState().askConfirm({
+      title: t.confirm.openTitle,
+      message: t.confirm.openMessage,
+      confirmLabel: t.confirm.openConfirm,
+    });
+    if (!ok) return;
+  }
+  await actions.importFile(file);
+}
+
+/**
+ * Does Space on `target` belong to the page instead of the Space-pan?
+ *  - anything inside a dialog or an open menu, and any Space while a modal
+ *    dialog is open (the board is not reachable then anyway);
+ *  - a control focused from the KEYBOARD (`:focus-visible`): Space activates
+ *    a button, toggles a checkbox, picks a radio (ui/shortcuts.js
+ *    isControlTarget hands Space to such controls too).
+ * A control that merely kept the focus after a mouse click does not: holding
+ * Space over the board to pan right after clicking a zoom button is common.
+ */
+function spaceBelongsToPage(target) {
+  if (typeof document !== 'undefined' && document.querySelector('[aria-modal="true"], dialog[open]')) return true;
+  if (!target || typeof target.closest !== 'function') return false;
+  if (target.closest('[role="dialog"], [role="alertdialog"], dialog, [role="menu"], [role="listbox"]')) return true;
+  if (!isControlTarget(target)) return false;
+  try {
+    return target.matches(':focus-visible');
+  } catch {
+    return true; // no :focus-visible support: keyboard use wins
+  }
+}
 
 /** Is `el` a field the user is typing into (keys and pastes are theirs)? */
 function isTypingTarget(el) {
@@ -68,6 +151,17 @@ function sameInputs(a, b) {
 }
 
 const LAYER_STYLE = { position: 'absolute', left: 0, top: 0, width: '100%', height: '100%', display: 'block' };
+
+/**
+ * Publish whether a NEW text is being typed (`useUi` `textDraftOpen`). That
+ * draft lives only in this component until it is committed — the store has
+ * no element and no editingId for it — so this is how the shell learns of
+ * it: the welcome screen of an empty board gets out of the way the moment
+ * text creation starts, as it does for any element (Excalidraw).
+ */
+function publishTextDraft(open) {
+  if (Boolean(useUi.getState().textDraftOpen) !== open) useUi.setState({ textDraftOpen: open });
+}
 
 /**
  * @param {object} props
@@ -92,6 +186,16 @@ export default function Canvas({ theme = 'light', onContextMenu, onRequestImage 
   const propsRef = useRef({ onContextMenu, onRequestImage });
   propsRef.current = { onContextMenu, onRequestImage };
   const [newText, setNewText] = useState(null);
+  // The label edit in progress: {id, minH, label, committed} — the height the
+  // container had when editing started (it never shrinks below it) and
+  // whether this edit already took its one undo snapshot (a label that grows
+  // its shape while typing is still ONE undo step with the text).
+  const labelEditRef = useRef(null);
+
+  // Before paint, so the welcome screen never shows through the new editor.
+  const drafting = newText !== null;
+  useLayoutEffect(() => publishTextDraft(drafting), [drafting]);
+  useEffect(() => () => publishTextDraft(false), []);
 
   /* ------------------------------------------------------------ helpers */
 
@@ -143,6 +247,7 @@ export default function Canvas({ theme = 'light', onContextMenu, onRequestImage 
             setNewText(fx.element);
           } else {
             setNewText(null);
+            labelEditRef.current = null;
             s.select([fx.id]);
             s.setEditing(fx.id);
           }
@@ -158,7 +263,7 @@ export default function Canvas({ theme = 'light', onContextMenu, onRequestImage 
           else {
             openImagePicker()
               .then((file) => (file ? insertImageFiles([file], at) : null))
-              .catch((err) => console.warn('[canvas] image insert failed', err));
+              .catch(reportImageFailure);
           }
           break;
         }
@@ -245,7 +350,10 @@ export default function Canvas({ theme = 'light', onContextMenu, onRequestImage 
       const s = useBoardStore.getState();
       const it = itRef.current;
       const last = lastRef.current;
-      const sIn = [s.elements, s.view, w, h, dpr, s.snapEnabled, s.gridSize, s.editingId, it.erasingIds, it.draft];
+      // The element being created (it.draft) is painted on the INTERACTIVE
+      // layer: it changes on every pointer move, and repainting every shape
+      // of a big board each time would make drawing crawl.
+      const sIn = [s.elements, s.view, w, h, dpr, s.snapEnabled, s.gridSize, s.editingId, it.erasingIds];
       if (last.dirty || !sameInputs(sIn, last.s)) {
         last.dirty = false;
         last.s = sIn;
@@ -260,7 +368,6 @@ export default function Canvas({ theme = 'light', onContextMenu, onRequestImage 
             gridSize: s.gridSize,
             editingId: s.editingId,
             erasingIds: it.erasingIds,
-            draft: it.draft,
             onImageLoad,
           });
         } catch (err) {
@@ -283,6 +390,8 @@ export default function Canvas({ theme = 'light', onContextMenu, onRequestImage 
             myPeerId: s.myPeerId,
             hoveredId: s.hoveredId,
             editingId: s.editingId,
+            draft: it.draft,
+            onImageLoad,
           });
         } catch (err) {
           console.error('[canvas] renderInteractive failed', err);
@@ -298,11 +407,25 @@ export default function Canvas({ theme = 'light', onContextMenu, onRequestImage 
     // Tool and selection changes from outside (toolbar, shortcuts) must reach
     // the reducer: a tool switch finishes/drops a gesture in progress, and
     // the connector point-edit state follows the selection.
+    //
+    // They also END an open text edit, and that must COMMIT what was typed,
+    // exactly like a blur: the tool island's buttons keep the focus in the
+    // textarea (so it never blurs) and store.setTool clears editingId, which
+    // would unmount the editor with the text in it. This listener runs
+    // synchronously inside the store update, before React re-renders, so the
+    // editor is still mounted and holds the typed value. Commit runs once, so
+    // the changes the commit itself makes (a text tool returning to select)
+    // come back here harmlessly.
     let prevTool = useBoardStore.getState().tool;
     let prevSel = useBoardStore.getState().selection;
+    let prevEditing = useBoardStore.getState().editingId;
     const unsub = useBoardStore.subscribe((st) => {
-      if (st.tool !== prevTool) {
-        prevTool = st.tool;
+      const toolChanged = st.tool !== prevTool;
+      const editClosed = prevEditing !== null && st.editingId !== prevEditing;
+      prevTool = st.tool;
+      prevEditing = st.editingId;
+      if (toolChanged || editClosed) editorRef.current?.commit({ external: true });
+      if (toolChanged) {
         queueMicrotask(() => alive && dispatch({ type: 'toolchange' }));
       } else if (st.selection !== prevSel) {
         prevSel = st.selection;
@@ -316,6 +439,17 @@ export default function Canvas({ theme = 'light', onContextMenu, onRequestImage 
       if (r) resize(Math.round(r.width), Math.round(r.height));
     });
     ro.observe(hostRef.current);
+
+    // The host must never scroll (see HOST_OVERFLOW): where `overflow: clip`
+    // is missing, undo any scroll the browser does to show the caret.
+    const host = hostRef.current;
+    const onHostScroll = () => {
+      if (host.scrollLeft || host.scrollTop) {
+        host.scrollLeft = 0;
+        host.scrollTop = 0;
+      }
+    };
+    host.addEventListener('scroll', onHostScroll);
     const r0 = hostRef.current.getBoundingClientRect();
     resize(Math.round(r0.width), Math.round(r0.height));
 
@@ -330,6 +464,7 @@ export default function Canvas({ theme = 'light', onContextMenu, onRequestImage 
       unsub();
       unfont();
       ro.disconnect();
+      host.removeEventListener('scroll', onHostScroll);
       if (raf) cancelAnimationFrame(raf);
       scheduleRef.current = () => {};
     };
@@ -342,6 +477,11 @@ export default function Canvas({ theme = 'light', onContextMenu, onRequestImage 
     const touches = new Map();
     let pinch = null; // {mid, dist}
     let touchLock = false; // a pinch happened: ignore touch input until all fingers lift
+    // A finger held still opens the context menu (iOS never fires
+    // `contextmenu` for a long-press, and Android's arrives while the press
+    // holds a gesture, which the reducer ignores): {pointerId, x, y, timer, fired}.
+    let longPress = null;
+    let longPressAt = 0; // when the last long-press opened the menu (a late native one must not reopen it)
 
     const norm = (type, e) => {
       const pt = localPoint(e);
@@ -374,11 +514,54 @@ export default function Canvas({ theme = 'light', onContextMenu, onRequestImage 
       pinch = { mid, dist };
     };
 
+    const cancelLongPress = () => {
+      if (longPress?.timer) clearTimeout(longPress.timer);
+      longPress = null;
+    };
+
+    /** The long-press is due: the press becomes the context menu. */
+    const fireLongPress = () => {
+      const lp = longPress;
+      if (!lp || lp.fired) return;
+      if (lp.timer) clearTimeout(lp.timer);
+      lp.timer = 0;
+      lp.fired = true;
+      longPressAt = Date.now();
+      const g = itRef.current.g;
+      if (g && g.started) return; // it became a drag after all
+      // Drop the gesture the press started (nothing was written yet; what it
+      // selected stays selected, so the menu is about it), then open the menu.
+      if (g && g.held) dispatch({ type: 'pointercancel', x: lp.x, y: lp.y, pointerId: lp.pointerId });
+      dispatch({ type: 'contextmenu', x: lp.x, y: lp.y, button: 2, shiftKey: false, altKey: false, mod: false });
+    };
+
+    const startLongPress = (e) => {
+      cancelLongPress();
+      if (!LONG_PRESS_TOOLS.has(useBoardStore.getState().tool)) return;
+      const pt = localPoint(e);
+      longPress = { pointerId: e.pointerId, x: pt.x, y: pt.y, timer: setTimeout(fireLongPress, LONG_PRESS_MS), fired: false };
+    };
+
+    /** The pointer holding the active gesture, or null. */
+    const gestureOwner = () => {
+      const g = itRef.current.g;
+      return g && g.held && g.pointerId !== undefined ? g.pointerId : null;
+    };
+
     const onPointerDown = (e) => {
+      // A pointer pressing while ANOTHER one holds a gesture — a palm or a
+      // finger during a pen or mouse drag — is ignored outright: no commit of
+      // the text editor, no capture, no reducer event (which would ignore it
+      // too). A second FINGER while a finger drags is the pinch below.
+      const owner = gestureOwner();
+      if (owner !== null && owner !== e.pointerId && !(e.pointerType === 'touch' && touches.has(owner))) return;
       if (e.pointerType === 'touch') {
         touches.set(e.pointerId, localPoint(e));
         if (touches.size >= 2) {
-          if (!touchLock) dispatch({ type: 'pointercancel', x: 0, y: 0, pointerId: e.pointerId });
+          cancelLongPress();
+          // The pinch takes over: cancel the first finger's gesture (by ITS
+          // pointer id — the reducer ignores a cancel from any other pointer).
+          if (!touchLock && owner !== null) dispatch({ type: 'pointercancel', x: 0, y: 0, pointerId: owner });
           touchLock = true;
           pinch = null;
           pinchStep();
@@ -398,6 +581,7 @@ export default function Canvas({ theme = 'light', onContextMenu, onRequestImage 
         /* pointer already gone */
       }
       dispatch(norm('pointerdown', e));
+      if (e.pointerType === 'touch') startLongPress(e);
     };
 
     const onPointerMove = (e) => {
@@ -407,7 +591,15 @@ export default function Canvas({ theme = 'light', onContextMenu, onRequestImage 
           if (touches.size >= 2) pinchStep();
           return;
         }
+        if (longPress && longPress.pointerId === e.pointerId && !longPress.fired) {
+          const pt = localPoint(e);
+          if (Math.hypot(pt.x - longPress.x, pt.y - longPress.y) > LONG_PRESS_SLOP) cancelLongPress();
+        }
       }
+      // A stray pointer during another pointer's gesture: not the gesture's,
+      // and not where this user's cursor is either.
+      const owner = gestureOwner();
+      if (owner !== null && owner !== e.pointerId) return;
       const it = itRef.current;
       if (it.mode === 'freedraw' && typeof e.getCoalescedEvents === 'function') {
         const list = e.getCoalescedEvents();
@@ -422,6 +614,7 @@ export default function Canvas({ theme = 'light', onContextMenu, onRequestImage 
     };
 
     const onPointerUp = (e) => {
+      if (longPress && longPress.pointerId === e.pointerId) cancelLongPress();
       if (e.pointerType === 'touch') {
         touches.delete(e.pointerId);
         if (touchLock) {
@@ -439,6 +632,7 @@ export default function Canvas({ theme = 'light', onContextMenu, onRequestImage 
     };
 
     const onPointerCancel = (e) => {
+      if (longPress && longPress.pointerId === e.pointerId) cancelLongPress();
       if (e.pointerType === 'touch') {
         touches.delete(e.pointerId);
         if (touches.size === 0) touchLock = false;
@@ -460,18 +654,49 @@ export default function Canvas({ theme = 'light', onContextMenu, onRequestImage 
       }
     };
 
-    // Right click, Ctrl+click on macOS, touch long-press, the menu key.
+    // Right click, Ctrl+click on macOS, the menu key — and Android's own
+    // long-press, which is the long-press timer's (it opens the menu once).
     const onContextMenuNative = (e) => {
       e.preventDefault();
+      if (longPress && !longPress.fired) {
+        fireLongPress();
+        return;
+      }
+      if (longPress || Date.now() - longPressAt < 1000) return; // the timer already opened it
+      if (touches.size > 0) return; // a finger held while drawing (pen, shape…)
       const pt = localPoint(e);
       dispatch({ type: 'contextmenu', x: pt.x, y: pt.y, button: 2, shiftKey: e.shiftKey, altKey: e.altKey, mod: e.ctrlKey || e.metaKey });
+    };
+
+    const wheelEvent = (e) => {
+      const pt = localPoint(e);
+      return { type: 'wheel', x: pt.x, y: pt.y, deltaX: e.deltaX, deltaY: e.deltaY, deltaMode: e.deltaMode, mod: e.ctrlKey || e.metaKey, shiftKey: e.shiftKey };
     };
 
     const onWheel = (e) => {
       if (e.target !== canvas) return;
       e.preventDefault();
-      const pt = localPoint(e);
-      dispatch({ type: 'wheel', x: pt.x, y: pt.y, deltaX: e.deltaX, deltaY: e.deltaY, deltaMode: e.deltaMode, mod: e.ctrlKey || e.metaKey, shiftKey: e.shiftKey });
+      dispatch(wheelEvent(e));
+    };
+
+    // Ctrl/⌘+wheel — and a trackpad pinch, which browsers send as one — must
+    // never zoom the whole PAGE (Excalidraw's handleWheel): over the text
+    // editor it zooms/pans the board like the canvas under it; over the
+    // islands, dialogs and the welcome screen it is just cancelled. Capture
+    // phase: the text editor stops the event's propagation.
+    const onWindowWheel = (e) => {
+      if (e.target === canvas) return; // onWheel
+      const host = hostRef.current;
+      if (host && e.target instanceof Node && host.contains(e.target)) {
+        e.preventDefault();
+        dispatch(wheelEvent(e));
+        return;
+      }
+      if (e.ctrlKey || e.metaKey) e.preventDefault();
+    };
+    // Safari's pinch (gesture events) over anything but the canvas: no page zoom.
+    const onWindowGesture = (e) => {
+      if (e.target !== canvas) e.preventDefault();
     };
 
     // Safari trackpad pinch arrives as non-standard gesture events.
@@ -492,6 +717,9 @@ export default function Canvas({ theme = 'light', onContextMenu, onRequestImage 
       if (isTypingTarget(e.target)) return;
       if (e.key === ' ' || e.code === 'Space') {
         if (e.ctrlKey || e.metaKey || e.altKey) return;
+        // Space on a dialog or a keyboard-focused control is theirs (activate
+        // the button, toggle the checkbox) — not the start of a pan.
+        if (!spaceRef.current && spaceBelongsToPage(e.target)) return;
         e.preventDefault();
         if (!spaceRef.current) {
           spaceRef.current = true;
@@ -499,8 +727,9 @@ export default function Canvas({ theme = 'light', onContextMenu, onRequestImage 
         }
         return;
       }
-      if (!GESTURE_KEYS.has(e.key)) return;
-      const handled = dispatch({ type: 'keydown', key: e.key, shiftKey: e.shiftKey, altKey: e.altKey, mod: e.ctrlKey || e.metaKey });
+      const undoKey = undoRedoKey(e);
+      if (!undoKey && !GESTURE_KEYS.has(e.key)) return;
+      const handled = dispatch({ type: 'keydown', key: undoKey ?? e.key, shiftKey: e.shiftKey, altKey: e.altKey, mod: e.ctrlKey || e.metaKey });
       if (handled) {
         e.preventDefault();
         e.stopPropagation();
@@ -535,7 +764,7 @@ export default function Canvas({ theme = 'light', onContextMenu, onRequestImage 
       e.preventDefault();
       e.stopPropagation();
       const pt = lastPointerRef.current ?? { x: sizeRef.current.w / 2, y: sizeRef.current.h / 2 };
-      insertImageFiles(files, toBoardPoint(pt)).catch((err) => console.warn('[canvas] image paste failed', err));
+      insertImageFiles(files, toBoardPoint(pt)).catch(reportImageFailure);
     };
 
     const onPointerLeave = (e) => {
@@ -553,6 +782,9 @@ export default function Canvas({ theme = 'light', onContextMenu, onRequestImage 
     canvas.addEventListener('wheel', onWheel, { passive: false });
     canvas.addEventListener('gesturestart', onGestureStart);
     canvas.addEventListener('gesturechange', onGestureChange);
+    window.addEventListener('wheel', onWindowWheel, { passive: false, capture: true });
+    window.addEventListener('gesturestart', onWindowGesture, true);
+    window.addEventListener('gesturechange', onWindowGesture, true);
     window.addEventListener('keydown', onKeyDown, true);
     window.addEventListener('keyup', onKeyUp, true);
     window.addEventListener('blur', onBlur);
@@ -570,6 +802,10 @@ export default function Canvas({ theme = 'light', onContextMenu, onRequestImage 
       canvas.removeEventListener('wheel', onWheel);
       canvas.removeEventListener('gesturestart', onGestureStart);
       canvas.removeEventListener('gesturechange', onGestureChange);
+      window.removeEventListener('wheel', onWindowWheel, { capture: true });
+      window.removeEventListener('gesturestart', onWindowGesture, true);
+      window.removeEventListener('gesturechange', onWindowGesture, true);
+      cancelLongPress();
       window.removeEventListener('keydown', onKeyDown, true);
       window.removeEventListener('keyup', onKeyUp, true);
       window.removeEventListener('blur', onBlur);
@@ -585,17 +821,39 @@ export default function Canvas({ theme = 'light', onContextMenu, onRequestImage 
     e.dataTransfer.dropEffect = 'copy';
   };
 
+  // Every file drop is cancelled — onDragOver accepted it, and a drop left to
+  // the browser OPENS the file, leaving the board. Images are inserted where
+  // they land; a saved board file opens (Excalidraw); anything else says why
+  // nothing happened.
   const onDrop = (e) => {
-    const files = [...(e.dataTransfer?.files ?? [])].filter(isImageFile);
-    if (files.length === 0) return;
+    if (![...(e.dataTransfer?.types ?? [])].includes('Files')) return;
     e.preventDefault();
-    const pt = localPoint(e);
-    insertImageFiles(files, toBoardPoint(pt)).catch((err) => console.warn('[canvas] image drop failed', err));
+    const all = [...(e.dataTransfer.files ?? [])];
+    const images = all.filter(isImageFile);
+    if (images.length) {
+      const pt = localPoint(e);
+      insertImageFiles(images, toBoardPoint(pt)).catch(reportImageFailure);
+      return;
+    }
+    const board = all.find(isBoardFile);
+    if (board) {
+      openDroppedBoardFile(board).catch((err) => {
+        console.warn('[canvas] board file drop failed', err);
+        toast.error(t.toast.openFailed);
+      });
+      return;
+    }
+    if (all.length) toast.error(t.toast.openFailed);
   };
 
   /* ---------------------------------------------------------- text edit */
 
-  const finishNewText = useCallback((el, text) => {
+  /**
+   * Commit a NEW text. `external`: the edit was closed from outside (a tool
+   * picked while typing) — the text is kept, but the tool the user just
+   * picked stays and nothing gets selected under it.
+   */
+  const finishNewText = useCallback((el, text, { external = false } = {}) => {
     setNewText(null);
     const s = useBoardStore.getState();
     const value = String(text ?? '').slice(0, LIMITS.MAX_TEXT);
@@ -605,48 +863,101 @@ export default function Canvas({ theme = 'light', onContextMenu, onRequestImage 
       if (res.valid) {
         s.commit(`text:${el.id}`);
         s.addElements([res.element]);
-        s.select([el.id]);
+        if (!external || s.tool === 'select' || s.tool === 'hand') s.select([el.id]);
       } else {
         console.warn('[canvas] text rejected', res.error);
       }
     }
+    if (external) return;
     const after = useBoardStore.getState();
     if (after.tool === 'text' && !after.toolLocked) after.setTool('select');
   }, []);
 
-  const finishExisting = useCallback((id, text) => {
-    const s = useBoardStore.getState();
-    const el = s.elements.find((e) => e.id === id);
-    if (s.editingId === id) s.setEditing(null);
-    // Editing started from the text tool returns to select, like a new text.
-    if (s.tool === 'text' && !s.toolLocked) s.setTool('select');
-    if (!el) return;
-    const label = `text:${id}:${Date.now()}`;
-    if (el.type === 'text') {
-      const value = String(text ?? '').slice(0, LIMITS.MAX_TEXT);
-      if (value.trim() === '') {
+  /** The label edit record for container `el` (started on its first use). */
+  const labelEditFor = useCallback((el) => {
+    let rec = labelEditRef.current;
+    if (!rec || rec.id !== el.id) {
+      rec = { id: el.id, minH: el.h, label: `text:${el.id}:${Date.now()}`, committed: false };
+      labelEditRef.current = rec;
+    }
+    return rec;
+  }, []);
+
+  /**
+   * While a label is typed, its container grows (height only, top edge
+   * fixed) so the wrapped text always fits inside it, and shrinks back when
+   * text is deleted — never below the height it had when editing started
+   * (Excalidraw). Peers see it grow live; bound arrows follow in the same
+   * batch; the first growth takes the edit's one undo snapshot.
+   */
+  const growLabel = useCallback(
+    (id, text) => {
+      const s = useBoardStore.getState();
+      const el = s.elements.find((e) => e.id === id);
+      if (!el || !labelKeyOf(el) || el.locked) return;
+      const rec = labelEditFor(el);
+      const fit = growContainerForLabel(el, String(text ?? '').slice(0, LIMITS.MAX_LABEL), { minH: rec.minH });
+      if (!fit) return;
+      if (!rec.committed) {
+        s.commit(rec.label);
+        rec.committed = true;
+      }
+      const patches = [{ id, patch: { ...fit, updatedAt: Date.now() } }];
+      s.updateElements([...patches, ...resolveBindingPatches(applyPatches(s.elements, patches), [id])]);
+    },
+    [labelEditFor],
+  );
+
+  /**
+   * Commit an edit of an existing text or label. `external`: closed from
+   * outside (see finishNewText) — the tool the user picked stays.
+   */
+  const finishExisting = useCallback(
+    (id, text, { external = false } = {}) => {
+      const s = useBoardStore.getState();
+      const el = s.elements.find((e) => e.id === id);
+      const rec = labelEditRef.current && labelEditRef.current.id === id ? labelEditRef.current : null;
+      labelEditRef.current = null;
+      if (s.editingId === id) s.setEditing(null);
+      // Editing started from the text tool returns to select, like a new text.
+      if (!external && s.tool === 'text' && !s.toolLocked) s.setTool('select');
+      if (!el) return;
+      const label = rec?.label ?? `text:${id}:${Date.now()}`;
+      if (el.type === 'text') {
+        const value = String(text ?? '').slice(0, LIMITS.MAX_TEXT);
+        if (value.trim() === '') {
+          s.commit(label);
+          s.removeElements([id]);
+          return;
+        }
+        if (value === el.text) return;
+        const patches = [{ id, patch: { text: value, ...fitTextElement({ ...el, text: value }), updatedAt: Date.now() } }];
+        const next = applyPatches(s.elements, patches);
         s.commit(label);
-        s.removeElements([id]);
+        s.updateElements([...patches, ...resolveBindingPatches(next, [id])]);
         return;
       }
-      if (value === el.text) return;
-      const patches = [{ id, patch: { text: value, ...fitTextElement({ ...el, text: value }), updatedAt: Date.now() } }];
-      const next = applyPatches(s.elements, patches);
-      s.commit(label);
-      s.updateElements([...patches, ...resolveBindingPatches(next, [id])]);
-      return;
-    }
-    if (labelKeyOf(el)) {
-      const value = String(text ?? '').slice(0, LIMITS.MAX_LABEL);
-      if (value === (el.label ?? '')) return;
-      const patch = el.type === 'sticky' ? { label: value } : { label: value.trim() === '' ? null : value };
-      s.commit(label);
-      s.updateElements([{ id, patch: { ...patch, updatedAt: Date.now() } }]);
-    }
-  }, []);
+      if (labelKeyOf(el)) {
+        const value = String(text ?? '').slice(0, LIMITS.MAX_LABEL);
+        const changed = value !== (el.label ?? '');
+        // The container ends exactly as tall as its label needs (a paste or a
+        // font change may not have gone through growLabel).
+        const fit = el.locked ? null : growContainerForLabel(el, value, { minH: rec?.minH ?? el.h });
+        if (!changed && !fit) return;
+        const patch = { ...(fit ?? {}), updatedAt: Date.now() };
+        if (changed) patch.label = el.type === 'sticky' ? value : value.trim() === '' ? null : value;
+        const patches = [{ id, patch }];
+        // One undo step per edit: growing while typing already took it.
+        if (!rec?.committed) s.commit(label);
+        s.updateElements(fit ? [...patches, ...resolveBindingPatches(applyPatches(s.elements, patches), [id])] : patches);
+      }
+    },
+    [],
+  );
 
   const cancelEdit = useCallback(() => {
     setNewText(null);
+    labelEditRef.current = null;
     const s = useBoardStore.getState();
     if (s.editingId) s.setEditing(null);
   }, []);
@@ -658,7 +969,7 @@ export default function Canvas({ theme = 'light', onContextMenu, onRequestImage 
       ref={hostRef}
       className="wb-canvas"
       data-testid="canvas"
-      style={{ position: 'absolute', inset: 0, overflow: 'hidden', touchAction: 'none', userSelect: 'none', WebkitUserSelect: 'none' }}
+      style={{ position: 'absolute', inset: 0, overflow: HOST_OVERFLOW, touchAction: 'none', userSelect: 'none', WebkitUserSelect: 'none' }}
       onDragOver={onDragOver}
       onDrop={onDrop}
     >
@@ -670,10 +981,32 @@ export default function Canvas({ theme = 'light', onContextMenu, onRequestImage 
         theme={theme}
         onFinishNew={finishNewText}
         onFinishExisting={finishExisting}
+        onLabelChange={growLabel}
         onCancel={cancelEdit}
       />
     </div>
   );
+}
+
+/** The text style keys a new text takes from the style panel. */
+const TEXT_STYLE_KEYS = styleKeysFor('text');
+
+/**
+ * A NEW text draft with the panel's current text style on top: the draft is
+ * not in the store (nor in the selection), so actions.applyStyle only changes
+ * `store.style` while it is typed — this is how those changes still reach it,
+ * live in the editor and in what is committed (Excalidraw).
+ */
+function styledDraft(draft, style) {
+  if (!draft || !style) return draft;
+  let out = draft;
+  for (const k of TEXT_STYLE_KEYS) {
+    if (style[k] !== undefined && style[k] !== out[k]) {
+      if (out === draft) out = { ...draft };
+      out[k] = style[k];
+    }
+  }
+  return out;
 }
 
 /**
@@ -681,12 +1014,15 @@ export default function Canvas({ theme = 'light', onContextMenu, onRequestImage 
  * the new text draft. Its own component so only IT re-renders on view changes
  * while an edit is open — the Canvas itself never does.
  */
-const EditorHost = forwardRef(function EditorHost({ newText, theme, onFinishNew, onFinishExisting, onCancel }, ref) {
+const EditorHost = forwardRef(function EditorHost({ newText, theme, onFinishNew, onFinishExisting, onLabelChange, onCancel }, ref) {
   const editing = useBoardStore((s) => (s.editingId ? s.elements.find((e) => e.id === s.editingId) ?? null : null));
-  const active = newText ?? editing;
+  const style = useBoardStore((s) => (newText ? s.style : null));
+  const draft = useMemo(() => styledDraft(newText, style), [newText, style]);
+  const active = draft ?? editing;
   const view = useBoardStore((s) => (active ? s.view : null));
   if (!active || !view) return null;
   const isNew = Boolean(newText);
+  const isLabel = !isNew && Boolean(labelKeyOf(active));
   return (
     <TextEditor
       ref={ref}
@@ -695,7 +1031,8 @@ const EditorHost = forwardRef(function EditorHost({ newText, theme, onFinishNew,
       isNew={isNew}
       view={view}
       theme={theme}
-      onCommit={(text) => (isNew ? onFinishNew(active, text) : onFinishExisting(active.id, text))}
+      onCommit={(text, opts) => (isNew ? onFinishNew(active, text, opts) : onFinishExisting(active.id, text, opts))}
+      onChange={isLabel ? (text) => onLabelChange(active.id, text) : undefined}
       onCancel={onCancel}
     />
   );

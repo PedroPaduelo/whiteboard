@@ -19,7 +19,12 @@ import {
   transformFrame,
   handlePoint,
   applyPatches,
+  rebindMovedConnectors,
+  labelFitHeight,
+  growContainerForLabel,
 } from '../src/editor/scene.js';
+import { commonBounds, elementBounds } from '../src/editor/handles.js';
+import { labelBox, layoutText } from '../src/editor/text.js';
 import { elementCorners } from '../src/editor/handles.js';
 
 const near = (a, b, eps = 1e-6) => Math.abs(a - b) <= eps;
@@ -150,7 +155,7 @@ test('side-resizing a rotated rect keeps the opposite edge fixed', () => {
   assertNear(patch.w, 100 + Math.hypot(20, 20));
 });
 
-test('resizing text scales its font size (never stretches or flips it)', () => {
+test('resizing text scales its font size (never stretches it)', () => {
   const t = text('t', 0, 0, 100, 25, 20);
   const p = patchOf(resizeElements([t], null, 'se', { x: 200, y: 30 }), 't');
   assertNear(p.fontSize, 40);
@@ -158,6 +163,30 @@ test('resizing text scales its font size (never stretches or flips it)', () => {
   const tiny = patchOf(resizeElements([t], null, 'se', { x: 1, y: 1 }), 't');
   assert.equal(tiny.fontSize, 4, 'clamped to the validator minimum');
   assertNear(tiny.w, 20);
+});
+
+test('text dragged past the anchor flips its box to the pointer side, like a rect (glyphs never mirror)', () => {
+  const t = text('t', 100, 100, 120, 30, 20);
+  const r = rect('r', 100, 100, 120, 30);
+  // The se corner dragged up-left past the nw anchor.
+  const past = { x: 40, y: 70 };
+  const rp = patchOf(resizeElements([r], null, 'se', past), 'r');
+  const tp = patchOf(resizeElements([t], null, 'se', past), 't');
+  assert.deepEqual({ x: rp.x, y: rp.y, w: rp.w, h: rp.h }, { x: 40, y: 70, w: 60, h: 30 });
+  assert.equal(tp.fontSize, 20, 'uniform scale |-1|');
+  assertNear(tp.x + tp.w, 100, 1e-6, 'right edge on the anchor');
+  assertNear(tp.y + tp.h, 100, 1e-6, 'bottom edge on the anchor');
+  assert.ok(tp.x < 100 && tp.y < 100, 'the box is on the pointer side (north-west), not south-east');
+  // A side handle past the opposite edge: the box moves across it.
+  const side = patchOf(resizeElements([t], null, 'w', { x: 300, y: 115 }), 't');
+  assertNear(side.x, 220, 1e-6, 'left edge on the anchor');
+  assertNear(side.x + side.w, 300, 1e-6, 'right edge under the pointer');
+  assert.ok(!('rotation' in side) && side.w > 0 && side.h > 0);
+  // Just past the anchor: the minimum font, still on the pointer side.
+  const tiny = patchOf(resizeElements([t], null, 'se', { x: 99, y: 99 }), 't');
+  assert.equal(tiny.fontSize, 4);
+  assertNear(tiny.x + tiny.w, 100);
+  assertNear(tiny.y + tiny.h, 100);
 });
 
 test('images keep their aspect by default and stretch with Shift', () => {
@@ -234,9 +263,23 @@ test('rotating several elements orbits them about the common centre; polylines b
   assertPt(pts[1], { x: 0, y: 0 });
 });
 
-test('a lone connector is not rotatable; locked elements are skipped', () => {
+test('a lone 2-point connector is not rotatable; locked elements are skipped', () => {
   assert.deepEqual(rotateElements([arrow('a', [{ x: 0, y: 0 }, { x: 10, y: 0 }])], null, { x: 50, y: 50 }), []);
   assert.deepEqual(rotateElements([rect('r', 0, 0, 10, 10, { locked: true })], null, { x: 50, y: 50 }), []);
+});
+
+test('a lone multi-point connector rotates about its box centre, the turn baked into its points', () => {
+  const a = arrow('a', [{ x: 0, y: 0 }, { x: 100, y: 50 }, { x: 200, y: 0 }]);
+  const f = transformFrame([a]);
+  const c = { x: f.x + f.w / 2, y: f.y + f.h / 2 };
+  // The handle dragged to the right of the centre: a quarter turn clockwise.
+  const p = patchOf(rotateElements([a], f, { x: c.x + 100, y: c.y }), 'a');
+  assert.ok(p && !('rotation' in p), 'no rotation field on a connector');
+  assertPt(p.points[0], { x: c.x + (c.y - 0), y: c.y + (0 - c.x) }, 1e-6, 'start');
+  assertPt(p.points[1], { x: c.x - (50 - c.y), y: c.y + (100 - c.x) }, 1e-6, 'middle');
+  // And resizes through its own frame like a pen stroke.
+  const r = patchOf(resizeElements([a], null, 'e', { x: 400, y: 25 }), 'a');
+  assert.deepEqual(r.points.map((q) => q.x), [0, 200, 400]);
 });
 
 /* --------------------------------------------------------------- binding */
@@ -309,4 +352,95 @@ test('transformFrame and handlePoint agree with the rotated corners', () => {
   assertPt(handlePoint(f, 'ne'), corners[1]);
   assertPt(handlePoint(f, 'se'), corners[2]);
   assertPt(handlePoint(f, 'sw'), corners[3]);
+});
+
+/* ----------------------------------------------------------- review fixes */
+
+test('moveElements with the scene keeps a binding whose end stays close to its shape (a nudge)', () => {
+  const A = rect('A', 0, 0, 100, 100);
+  const B = rect('B', 300, 0, 100, 100);
+  const ar = resolveConnectors([A, B, arrow('ar', [{ x: 0, y: 0 }, { x: 1, y: 1 }], { startId: 'A', endId: 'B' })])[2];
+  const scene = [A, B, ar];
+  const nudged = patchOf(moveElements([ar], 1, 0, { elements: scene }), 'ar');
+  assert.equal('startId' in nudged, false, 'start kept');
+  assert.equal('endId' in nudged, false, 'end kept');
+  const far = patchOf(moveElements([ar], 0, 200, { elements: scene }), 'ar');
+  assert.equal(far.startId, null);
+  assert.equal(far.endId, null);
+  // Without the scene: the old unbind-on-move (a live drag).
+  assert.equal(patchOf(moveElements([ar], 1, 0), 'ar').startId, null);
+});
+
+test('rebindMovedConnectors restores close original bindings, resolved onto the outlines', () => {
+  const A = rect('A', 0, 0, 100, 100);
+  const B = rect('B', 300, 0, 100, 100);
+  const ar = resolveConnectors([A, B, arrow('ar', [{ x: 0, y: 0 }, { x: 1, y: 1 }], { startId: 'A', endId: 'B' })])[2];
+  const moved = applyPatches([A, B, ar], moveElements([ar], 0, 6));
+  assert.equal(moved[2].startId, undefined);
+  const patches = rebindMovedConnectors([ar], moved);
+  const p = patchOf(patches, 'ar');
+  assert.equal(p.startId, 'A');
+  assert.equal(p.endId, 'B');
+  const after = applyPatches(moved, patches);
+  assert.deepEqual(resolveConnectors(after)[2].points, after[2].points, 'settled');
+  assert.deepEqual(rebindMovedConnectors([ar], applyPatches([A, B, ar], moveElements([ar], 0, 300))), []);
+});
+
+test('multi resize with a member turned 45° scales uniformly: it keeps its angle and stays in the frame', () => {
+  const A = rect('A', 300, 250, 100, 100, { rotation: Math.PI / 4 });
+  const B = rect('B', 500, 250, 100, 100);
+  const f = transformFrame([A, B]);
+  const patches = resizeElements([A, B], f, 'e', { x: f.x + f.w * 2, y: f.y + f.h / 2 });
+  const pa = patchOf(patches, 'A');
+  assert.equal(pa.rotation, undefined, 'angle unchanged');
+  assertNear(pa.w, 200);
+  assertNear(pa.h, 200);
+  const next = applyPatches([A, B], patches);
+  const nb = commonBounds(next);
+  assertNear(nb.x, f.x, 1e-6, 'anchored left edge');
+  assertNear(nb.w, f.w * 2, 1e-6, 'width doubled');
+  assertNear(elementBounds(next[0]).x, f.x, 1e-6, 'A still touches the anchored edge');
+  // Right angles can still stretch on one axis.
+  const C = rect('C', 0, 0, 100, 50, { rotation: Math.PI / 2 });
+  const D = rect('D', 200, 0, 100, 50);
+  const g = transformFrame([C, D]);
+  const pc = patchOf(resizeElements([C, D], g, 'e', { x: g.x + g.w * 2, y: 0 }), 'C');
+  assertNear(pc.w, 100);
+  assertNear(pc.h, 100);
+});
+
+test('labelFitHeight / growContainerForLabel: a long label grows its container downward, never narrower', () => {
+  const long = 'Este é um rótulo muito comprido que certamente não cabe dentro deste retângulo pequeno de jeito nenhum';
+  for (const type of ['rect', 'ellipse', 'diamond', 'sticky']) {
+    const el = { id: 'x', type, x: 300, y: 300, w: 120, h: 70, fontSize: 20 };
+    const fit = growContainerForLabel(el, long);
+    assert.ok(fit && fit.h > 70, `${type} grows`);
+    assert.equal(fit.x, undefined);
+    assert.equal(fit.y, undefined, 'the top edge stays');
+    const grown = { ...el, ...fit, label: long };
+    const lay = layoutText(grown);
+    const top = lay.lines[0].y;
+    const bottom = lay.lines.at(-1).y + lay.lineHeight;
+    const box = labelBox(grown);
+    assert.ok(top >= box.y - 1e-6 && bottom <= box.y + box.h + 1e-6, `${type}: text inside its box (${top}..${bottom} vs ${box.y}..${box.y + box.h})`);
+    assert.equal(growContainerForLabel(grown, long), null, 'already fits');
+    // A short label never shrinks a shape; with minH it shrinks back to it.
+    assert.equal(growContainerForLabel(grown, 'oi'), null);
+    assert.deepEqual(growContainerForLabel(grown, 'oi', { minH: 70 }), { h: 70 });
+  }
+  assert.equal(labelFitHeight({ type: 'rect', x: 0, y: 0, w: 100, h: 50 }, ''), 0);
+  assert.equal(growContainerForLabel({ type: 'text', x: 0, y: 0, w: 10, h: 10, text: long }, long), null, 'free text is not a container');
+});
+
+test('growContainerForLabel keeps the top edge of a rotated container in place', () => {
+  const el = { id: 'x', type: 'rect', x: 0, y: 0, w: 100, h: 50, rotation: Math.PI / 2, fontSize: 20 };
+  const fit = growContainerForLabel(el, 'uma frase longa que quebra em várias linhas dentro do retângulo');
+  assert.ok(fit.h > 50);
+  const topMid = (e) => {
+    const c = { x: e.x + e.w / 2, y: e.y + e.h / 2 };
+    const a = e.rotation;
+    const d = { x: 0, y: -e.h / 2 };
+    return { x: c.x + d.x * Math.cos(a) - d.y * Math.sin(a), y: c.y + d.x * Math.sin(a) + d.y * Math.cos(a) };
+  };
+  assertPt(topMid({ ...el, ...fit }), topMid(el), 1e-6);
 });

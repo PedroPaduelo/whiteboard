@@ -8,27 +8,37 @@
  *
  * A driver supplies a tiny "persistence port":
  *
- *   load()            -> Element[]            current z-ordered element list
- *   isSeen(opId)      -> boolean              has this opId been recorded?
- *   recordSeen(ids)   -> void                 record opIds inside the txn
- *   prune()           -> void                 drop expired seen_ops rows
- *   touch()           -> void                 bump boards.updated_at
- *   bumpRev(nextRev)  -> void                 write the new rev
- *   save(elements)    -> void                 persist the new element list
+ *   load()              -> Element[]          current z-ordered element list
+ *   isSeen(opId)        -> boolean            has this opId been recorded?
+ *   recordSeen(ids)     -> void               record opIds inside the txn
+ *   prune()             -> void               drop expired seen_ops rows
+ *   touch()             -> void               bump boards.updated_at
+ *   bumpRev(nextRev)    -> void               write the new rev
+ *   save(next, prev)    -> void               persist the new element list
  *
  * ATOMICITY BY CONSTRUCTION: the function mutates only locals until the very
  * end, where it hands the driver exactly one `save` + one `bumpRev`. If any op
  * throws, nothing was ever written, so the driver has nothing to undo — and the
  * sqlite driver still runs the whole thing inside BEGIN IMMEDIATE/COMMIT, so a
  * concurrent writer cannot interleave with our reads.
+ *
+ * COST PROPORTIONAL TO THE CHANGE, NOT TO THE BOARD. Every drag frame is a
+ * batch, and a board may hold megabytes of inline images, so nothing here may
+ * copy, serialise or re-validate the whole board:
+ *
+ *  - Element objects are NEVER mutated. `load()` may hand us the driver's own
+ *    (frozen) objects in a fresh array; every change makes a new object, and
+ *    an element the batch did not touch keeps its identity all the way to
+ *    `save`.
+ *  - `save(next, prev)` gets the list before the batch too, so a driver can
+ *    write only the elements whose identity changed (sqlite: one row each)
+ *    instead of the whole board.
+ *  - Every element this batch created or changed is deep-frozen before
+ *    `save`, so a driver may keep the list as its cache and a caller holding
+ *    a result can never reach in and change stored state.
  */
 
-import {
-  validateElement,
-  LIMITS,
-  detachMissingConnectors,
-  resolveConnectors,
-} from '@whiteboard/shared';
+import { validateElement, LIMITS, resolveConnectors } from '@whiteboard/shared';
 
 /** Op kinds that can change an element's geometry, and so need re-resolving. */
 const GEOMETRY_KINDS = new Set(['create', 'update', 'delete', 'clear']);
@@ -39,7 +49,12 @@ const GEOMETRY_KINDS = new Set(['create', 'update', 'delete', 'clear']);
  * infrastructure failure (a locked database, a closed store) and must be
  * reported as ours, never as a bad request.
  */
-export const REJECTION_CODES = Object.freeze(['DUPLICATE_ELEMENT', 'TOO_MANY_ELEMENTS', 'INVALID_OP']);
+export const REJECTION_CODES = Object.freeze([
+  'DUPLICATE_ELEMENT',
+  'TOO_MANY_ELEMENTS',
+  'BOARD_TOO_LARGE',
+  'INVALID_OP',
+]);
 
 /**
  * Classify a store throw: the contract code for a refused batch
@@ -59,11 +74,81 @@ function fail(msg, extra = {}) {
   throw err;
 }
 
+/** Freeze an element and its points, so a shared reference is read-only. */
+function freezeElement(el) {
+  if (Object.isFrozen(el)) return el;
+  if (Array.isArray(el.points)) {
+    for (const p of el.points) Object.freeze(p);
+    Object.freeze(el.points);
+  }
+  return Object.freeze(el);
+}
+
 /**
- * Apply one op to the working element list, in place.
+ * detachMissingConnectors without the in-place mutation: a connector whose
+ * start/end names an element that is no longer on the board becomes a NEW
+ * object without that binding; everything else keeps its identity. The
+ * shared helper deletes keys on the objects it is given, which would write
+ * through to a driver's cached (frozen) elements.
+ */
+function detachMissing(list) {
+  let ids = null;
+  let out = list;
+  for (let i = 0; i < list.length; i++) {
+    const el = list[i];
+    if (el.type !== 'arrow' && el.type !== 'line') continue;
+    if (!el.startId && !el.endId) continue;
+    ids ??= new Set(list.map((e) => e.id));
+    const dropStart = el.startId && !ids.has(el.startId);
+    const dropEnd = el.endId && !ids.has(el.endId);
+    if (!dropStart && !dropEnd) continue;
+    const next = { ...el };
+    if (dropStart) delete next.startId;
+    if (dropEnd) delete next.endId;
+    if (out === list) out = list.slice();
+    out[i] = next;
+  }
+  return out;
+}
+
+/**
+ * What a batch weighs, for the whole-board caps: characters of inline image
+ * data and points across every element. O(elements), no serialising.
+ */
+function boardWeight(list) {
+  let imageChars = 0;
+  let points = 0;
+  for (const el of list) {
+    if (el.type === 'image' && typeof el.src === 'string') imageChars += el.src.length;
+    if (Array.isArray(el.points)) points += el.points.length;
+  }
+  return { imageChars, points };
+}
+
+/**
+ * The patch as it actually took effect: what the store KEPT, not what the
+ * client sent. validateElement strips fields a type does not use (a `text`
+ * on a rect) and re-derives the box of pen strokes and connectors from their
+ * points, so the raw patch can name values the stored element does not have.
+ * Broadcasting the raw patch made every peer's copy diverge from the server's.
+ */
+function effectivePatch(patch, stored) {
+  const out = {};
+  for (const [k, v] of Object.entries(patch ?? {})) {
+    if (Object.prototype.hasOwnProperty.call(stored, k)) out[k] = stored[k];
+    else if (v === null) out[k] = null; // a removal that took effect
+    // else: a field this type does not store; the store dropped it, so do we.
+  }
+  return out;
+}
+
+/**
+ * Apply one op to the working element list, in place (the list is ours; the
+ * element objects are not, so they are replaced, never modified).
  * Throws on a contract violation; silently skips benign races.
  * `index` is the op's position in the batch AS SENT, so an error message
  * names the op the client actually wrote even after dedupe dropped some.
+ * @returns {Object} the op as it took effect, for `appliedOps`
  */
 function applyOne(op, list, index, maxEls) {
   const at = `ops[${index}]`;
@@ -81,27 +166,28 @@ function applyOne(op, list, index, maxEls) {
       }
       // END of the array == TOP of the z-order.
       list.push(element);
-      return;
+      return op;
     }
 
     case 'update': {
       const i = list.findIndex((e) => e.id === op.elementId);
       if (i === -1) {
         // A delete that raced this update is normal, not an error. Skip it.
-        return;
+        return op;
       }
       const merged = { ...list[i], ...(op.patch ?? {}) };
       // Re-validate the MERGED element, not the patch. This is what catches an
       // update that makes a pen stroke's points disagree with its box, or that
       // hands a `text` element a non-string.
       list[i] = validateElement(merged, `${at}.result`);
-      return;
+      if (op.patch === undefined) return op;
+      return { ...op, patch: effectivePatch(op.patch, list[i]) };
     }
 
     case 'delete': {
       const i = list.findIndex((e) => e.id === op.elementId);
       if (i !== -1) list.splice(i, 1);
-      return;
+      return op;
     }
 
     case 'reorder': {
@@ -121,12 +207,12 @@ function applyOne(op, list, index, maxEls) {
       }
       list.length = 0;
       list.push(...next);
-      return;
+      return op;
     }
 
     case 'clear': {
       list.length = 0;
-      return;
+      return op;
     }
 
     default:
@@ -157,8 +243,10 @@ function applyOne(op, list, index, maxEls) {
  * @param {() => void} io.prune
  * @param {() => void} io.touch
  * @param {(rev: number) => void} io.bumpRev
- * @param {(elements: Object[]) => void} io.save
+ * @param {(next: Object[], prev: Object[]) => void} io.save  the list after, and before, the batch
  * @param {number} [io.maxEls]
+ * @param {number} [io.maxImageChars]  whole-board cap (LIMITS.MAX_BOARD_IMAGE_CHARS)
+ * @param {number} [io.maxPoints]      whole-board cap (LIMITS.MAX_BOARD_POINTS)
  * @returns {Object} OpApplyResult
  */
 export function applyOpBatch(io) {
@@ -175,6 +263,8 @@ export function applyOpBatch(io) {
     bumpRev,
     save,
     maxEls = LIMITS.MAX_ELS,
+    maxImageChars = LIMITS.MAX_BOARD_IMAGE_CHARS,
+    maxPoints = LIMITS.MAX_BOARD_POINTS,
   } = io;
 
   // Rule 4: a missing board short-circuits before anything is read or written.
@@ -191,12 +281,17 @@ export function applyOpBatch(io) {
   }));
   const allIds = list.map((op) => op.opId);
 
+  // A batch holds 1..MAX_OPS_PER_BATCH ops (both edges check it too). An
+  // empty one is refused here as well: it used to be "applied", costing a
+  // full write and a rev bump for nothing.
+  if (list.length === 0) fail('ops: expected at least one op');
+
   // Opportunistic TTL sweep: keeps seen_ops bounded without a cron.
   prune();
 
   // Rule 2: DEDUPE. Only when EVERY opId is already recorded is this a retry.
   // A partially-seen batch is NOT a retry — its new ops must still take effect.
-  if (list.length > 0 && list.every((op) => isSeen(op.opId))) {
+  if (list.every((op) => isSeen(op.opId))) {
     return { status: 'duplicate', rev: currentRev, applied: allIds, appliedOps: [] };
   }
 
@@ -222,35 +317,68 @@ export function applyOpBatch(io) {
     }
   }
 
-  // Rule 5: apply in order against an in-memory copy. Throwing here means the
-  // driver rolls back and the client gets a 400.
-  let elements = load();
+  // Rule 5: apply in order against a working copy of the LIST (a fresh
+  // array; the element objects in it are shared and never modified).
+  // Throwing here means the driver rolls back and the client gets a 400.
+  const before = load();
+  let elements = before.slice();
   let geometryTouched = false;
+  const effective = [];
   for (let i = 0; i < fresh.length; i++) {
     if (GEOMETRY_KINDS.has(fresh[i].kind)) geometryTouched = true;
-    applyOne(fresh[i], elements, fresh[i].index, maxEls);
+    effective.push(applyOne(fresh[i], elements, fresh[i].index, maxEls));
   }
 
   if (geometryTouched) {
     // Detach FIRST, then resolve. A connector still pointing at an element the
     // batch just deleted would otherwise be resolved once more against a
-    // missing anchor before being let go. detachMissingConnectors mutates in
-    // place and drops only the dangling ids; resolveConnectors returns a NEW
-    // array, so its return value is what we must keep.
-    detachMissingConnectors(elements);
-    const resolved = resolveConnectors(elements);
-    if (Array.isArray(resolved)) elements = resolved;
+    // missing anchor before being let go. Both return a NEW array in which
+    // only the connectors they changed are new objects.
+    const detached = detachMissing(elements);
+    const resolved = resolveConnectors(detached);
+    const settled = Array.isArray(resolved) ? resolved : detached;
+    // A connector the resolver moved is persisted, so it passes the same
+    // validation as anything a client sends: the store never saves what it
+    // would refuse to accept (a non-finite end is a 400, not a stored NaN).
+    for (let i = 0; i < settled.length; i++) {
+      const el = settled[i];
+      if (el !== elements[i]) {
+        settled[i] = validateElement(el, `connector "${el.id}"`);
+      }
+    }
+    elements = settled;
+  }
+
+  // Whole-board caps. Only a batch that GROWS the board past a cap is refused:
+  // a board already over it (older data) must still accept the deletes that
+  // bring it back under.
+  const after = boardWeight(elements);
+  if (after.imageChars > maxImageChars || after.points > maxPoints) {
+    const was = boardWeight(before);
+    if (after.imageChars > maxImageChars && after.imageChars > was.imageChars) {
+      fail(`board would exceed ${maxImageChars} characters of image data`, { code: 'BOARD_TOO_LARGE' });
+    }
+    if (after.points > maxPoints && after.points > was.points) {
+      fail(`board would exceed ${maxPoints} points`, { code: 'BOARD_TOO_LARGE' });
+    }
+  }
+
+  // Everything this batch created or replaced becomes read-only before the
+  // driver sees it (untouched elements already are, or are the driver's own).
+  const kept = new Set(before);
+  for (const el of elements) {
+    if (!kept.has(el)) freezeElement(el);
   }
 
   // Rule 6: ONE rev bump per batch, never per op.
   const newRev = currentRev + 1;
-  save(elements);
+  save(elements, before);
   bumpRev(newRev);
   touch();
   // Rule 7: record opIds so a client retrying after a network timeout is deduped.
   recordSeen(fresh.map((op) => op.opId));
 
-  const appliedOps = fresh.map(({ index, ...op }) => op);
+  const appliedOps = effective.map(({ index, ...op }) => op);
   return { status: 'applied', rev: newRev, applied: allIds, appliedOps, elements };
 }
 

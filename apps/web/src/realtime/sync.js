@@ -69,6 +69,12 @@ export function withRemote(fn) {
 
 /* ------------------------------------------------------------------ diffing */
 
+/** What the renderer draws for an absent `stroke` on arrows, lines and pen strokes (shape.js DEFAULT_INK). */
+const DEFAULT_INK = '#1e1e1e';
+
+/** What the renderer draws for an absent `strokeWidth` (shape.js resolveStyle). */
+const DEFAULT_STROKE_WIDTH = 2;
+
 /** Patch keys the server accepts `null` for, meaning "remove the field". */
 const NULLABLE_KEYS = new Set(
   Array.isArray(shared.NULLABLE_PATCH_KEYS) ? shared.NULLABLE_PATCH_KEYS : ['startId', 'endId', 'groupId', 'label'],
@@ -93,8 +99,14 @@ export function clearedValue(key, el) {
     case 'strokeStyle':
       return 'solid';
     case 'stroke':
+      // Arrows, lines and pen strokes with no stroke are drawn in the default
+      // ink (render/shape.js resolveStyle); an explicit 'none' would make
+      // them invisible on every other screen.
+      return el?.type === 'arrow' || el?.type === 'line' || el?.type === 'pen' ? DEFAULT_INK : 'none';
     case 'fill':
       return 'none';
+    case 'strokeWidth':
+      return DEFAULT_STROKE_WIDTH;
     case 'roughness':
       return 1;
     case 'fillStyle':
@@ -175,6 +187,18 @@ export function diffElement(before, after) {
  * of a delete restores it in place). The server's resulting order is
  * simulated and a `reorder` is added only when it would differ.
  *
+ * The ops come out in DEPENDENCY order, because a big change (an import, a
+ * paste, an undo of either) is shipped in several batches and the server
+ * settles each batch on its own:
+ *
+ *  1. deletes first — they make room: with creates first, replacing a full
+ *     board passed MAX_ELS halfway and the server refused the rest;
+ *  2. creates, each bound connector after the element(s) it is bound to —
+ *     the server drops a binding to an element not on the board yet at the
+ *     end of a batch (detachMissingConnectors), and so do peers;
+ *  3. updates (which may bind to something just created);
+ *  4. the reorder, when needed, last.
+ *
  * @param {object[]} prev
  * @param {object[]} next
  * @param {(kind: string, fields?: object) => object} makeOp
@@ -184,23 +208,28 @@ export function diffElements(prev, next, makeOp) {
   const before = new Map(prev.map((el) => [el.id, el]));
   const after = new Map(next.map((el) => [el.id, el]));
   const ops = [];
-  const createdIds = [];
-
-  for (const el of next) {
-    const old = before.get(el.id);
-    if (!old) {
-      ops.push(makeOp('create', { element: el }));
-      createdIds.push(el.id);
-      continue;
-    }
-    if (old === el) continue;
-    const patch = diffElement(old, el);
-    if (patch) ops.push(makeOp('update', { elementId: el.id, patch }));
-  }
 
   for (const el of prev) {
     if (!after.has(el.id)) ops.push(makeOp('delete', { elementId: el.id }));
   }
+
+  const created = [];
+  const updates = [];
+  for (const el of next) {
+    const old = before.get(el.id);
+    if (!old) {
+      created.push(el);
+      continue;
+    }
+    if (old === el) continue;
+    const patch = diffElement(old, el);
+    if (patch) updates.push(makeOp('update', { elementId: el.id, patch }));
+  }
+
+  const createdIds = orderCreates(created);
+  const createdById = new Map(created.map((el) => [el.id, el]));
+  for (const id of createdIds) ops.push(makeOp('create', { element: createdById.get(id) }));
+  ops.push(...updates);
 
   // What order would the server end up with? Survivors keep prev's order and
   // creates are appended in the order they were sent.
@@ -212,6 +241,56 @@ export function diffElements(prev, next, makeOp) {
   if (reordered) ops.push(makeOp('reorder', { order: next.map((el) => el.id) }));
 
   return { ops, full: false };
+}
+
+const isConnector = (el) => el?.type === 'arrow' || el?.type === 'line';
+
+/**
+ * The ids of `created` (in z-order) in the order to SEND their creates: z-order,
+ * except that a connector bound to an element created later waits until that
+ * element has been sent. Only non-connectors can be binding targets (shared
+ * `resolveConnectors` ignores a binding to another connector), so one
+ * deferral step is enough.
+ */
+function orderCreates(created) {
+  const ids = created.map((el) => el.id);
+  if (created.length < 2) return ids;
+  const createdIds = new Set(ids);
+  const targets = new Set(created.filter((el) => !isConnector(el)).map((el) => el.id));
+  const sent = new Set();
+  const out = [];
+  /** targetId -> connectors waiting for it */
+  const waiting = new Map();
+  const blockers = new Map();
+
+  const send = (el) => {
+    out.push(el.id);
+    sent.add(el.id);
+    const waiters = waiting.get(el.id);
+    if (!waiters) return;
+    waiting.delete(el.id);
+    for (const w of waiters) {
+      const left = blockers.get(w.id) - 1;
+      blockers.set(w.id, left);
+      if (left === 0) send(w);
+    }
+  };
+
+  for (const el of created) {
+    const deps = isConnector(el)
+      ? [...new Set([el.startId, el.endId])].filter((id) => id && id !== el.id && createdIds.has(id) && targets.has(id) && !sent.has(id))
+      : [];
+    if (deps.length === 0) {
+      send(el);
+      continue;
+    }
+    blockers.set(el.id, deps.length);
+    for (const id of deps) {
+      if (!waiting.has(id)) waiting.set(id, []);
+      waiting.get(id).push(el);
+    }
+  }
+  return out;
 }
 
 /* --------------------------------------------------------------- StoreSync */
@@ -301,11 +380,6 @@ export class StoreSync {
     this.pending = [];
     this.client.sendOps(batch);
   }
-
-  /** Back-compat alias. */
-  _flush() {
-    this.flush();
-  }
 }
 
 /**
@@ -313,13 +387,3 @@ export class StoreSync {
  * so a test can drive a fake client through the exact same code path.
  */
 export const storeSync = new StoreSync();
-
-/** Start the bridge (idempotent). Called by the realtime binding on connect. */
-export function startSync() {
-  storeSync.start();
-}
-
-/** Stop the bridge. Flushes first so nothing is lost. */
-export function stopSync() {
-  storeSync.stop();
-}

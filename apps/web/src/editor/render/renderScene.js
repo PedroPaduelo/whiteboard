@@ -8,7 +8,9 @@
  *                     eraser trail, collaborators' cursors and selections.
  *
  * Splitting them is Excalidraw's trick for a smooth editor: moving the mouse
- * repaints only the cheap interactive layer, not every rough shape.
+ * repaints only the cheap interactive layer, not every rough shape. And a
+ * static repaint (every pan and zoom step) does not replay the shapes either:
+ * each element is blitted from a bitmap of its own (elementCache.js).
  *
  * Both canvases are sized in DEVICE px (`canvas.width = cssW * dpr`) and
  * every function sets its own transform, so no caller state leaks in:
@@ -17,7 +19,11 @@
  * View convention everywhere: screen = board * zoom + pan.
  *
  * The renderer always draws LIGHT colours; dark mode is a CSS filter the
- * Canvas component puts on both canvases (DARK_MODE_FILTER).
+ * Canvas component puts on both canvases (DARK_MODE_FILTER). Two things must
+ * not change colour under it, so in dark mode they are painted through its
+ * inverse: raster images (a photo is not a drawing) and collaborators'
+ * cursors and selections (their colour must match their avatar, which is
+ * plain DOM).
  */
 
 import {
@@ -31,7 +37,11 @@ import {
 } from '../constants.js';
 import { elementBounds, selectionFrame, transformHandles, rotateAround, commonBounds } from '../handles.js';
 import { isLinear, isRotatable } from '../elements.js';
-import { drawElement } from './renderElement.js';
+import { expandSelectionToGroups } from '../scene.js';
+import { onFontsLoaded } from '../fonts.js';
+import { drawElement, textPaintBounds } from './renderElement.js';
+import { darkPreimage, segmentMidpoints, curveSegments } from './shape.js';
+import { beginBitmapFrame } from './elementCache.js';
 
 /** Grid is hidden below this zoom (lines would be a grey smear). */
 export const GRID_MIN_ZOOM = 0.3;
@@ -46,6 +56,23 @@ const BIND_HIGHLIGHT = 'rgba(105, 101, 219, 0.28)';
 function normView(view) {
   const zoom = view && Number.isFinite(view.zoom) && view.zoom > 0 ? view.zoom : 1;
   return { zoom, panX: view?.panX || 0, panY: view?.panY || 0 };
+}
+
+/**
+ * The view both layers paint with: its pan rounded to whole DEVICE px.
+ * Element bitmaps (elementCache.js) are blitted 1:1 at whole device px to
+ * stay crisp, so the static layer's board origin must sit on a device pixel;
+ * everything else on both layers (grid, directly drawn elements, selection
+ * chrome) uses the same rounded pan, so nothing drifts apart. Off by at most
+ * half a device px from the exact view.
+ * `originX/Y`: device px of board (0, 0), whole numbers.
+ */
+export function deviceView(view, dpr = 1) {
+  const { zoom, panX, panY } = normView(view);
+  const d = Number.isFinite(dpr) && dpr > 0 ? dpr : 1;
+  const originX = Math.round(panX * d) || 0;
+  const originY = Math.round(panY * d) || 0;
+  return { zoom, panX: originX / d, panY: originY / d, originX, originY };
 }
 
 function asSet(v) {
@@ -81,12 +108,37 @@ function paintMargin(el) {
   return sw * 2 + 8;
 }
 
-/** Painted bounds per element object (a pen stroke's bounds are O(points)). */
-const boundsCache = new WeakMap();
-function cachedBounds(el) {
+/**
+ * Everything an element may paint, board units, as {x0, y0, x1, y1}: its
+ * geometric bounds plus the paint margin, united with its text (a label runs
+ * past a box that is too small for it). null when the element has no usable
+ * geometry. Cached per element object (a pen stroke's bounds are
+ * O(points)); text widths change when the fonts load, so the cache goes too.
+ */
+let boundsCache = new WeakMap();
+onFontsLoaded(() => {
+  boundsCache = new WeakMap();
+});
+
+function computePaintedBounds(el) {
+  const b = elementBounds(el);
+  if (!b || !Number.isFinite(b.x) || !Number.isFinite(b.y) || !Number.isFinite(b.w) || !Number.isFinite(b.h)) return null;
+  const m = paintMargin(el);
+  const out = { x0: b.x - m, y0: b.y - m, x1: b.x + b.w + m, y1: b.y + b.h + m };
+  const t = textPaintBounds(el);
+  if (t) {
+    out.x0 = Math.min(out.x0, t.x);
+    out.y0 = Math.min(out.y0, t.y);
+    out.x1 = Math.max(out.x1, t.x + t.w);
+    out.y1 = Math.max(out.y1, t.y + t.h);
+  }
+  return out;
+}
+
+function paintedBounds(el) {
   let b = boundsCache.get(el);
-  if (!b) {
-    b = elementBounds(el);
+  if (b === undefined) {
+    b = computePaintedBounds(el);
     boundsCache.set(el, b);
   }
   return b;
@@ -96,13 +148,139 @@ function cachedBounds(el) {
 export function isElementVisible(el, rect) {
   let b;
   try {
-    b = cachedBounds(el);
+    b = paintedBounds(el);
   } catch {
     return true;
   }
-  if (!b || !Number.isFinite(b.x) || !Number.isFinite(b.y)) return true;
-  const m = paintMargin(el);
-  return !(b.x + b.w + m < rect.x || b.y + b.h + m < rect.y || b.x - m > rect.x + rect.w || b.y - m > rect.y + rect.h);
+  if (!b) return true;
+  return !(b.x1 < rect.x || b.y1 < rect.y || b.x0 > rect.x + rect.w || b.y0 > rect.y + rect.h);
+}
+
+/**
+ * Whether the canvas is shown through DARK_MODE_FILTER: the `theme` the
+ * caller passes ('light' | 'dark'), or, when it passes none, whatever filter
+ * the canvas element itself carries (the Canvas component sets it inline) —
+ * so what gets countered is exactly what is applied.
+ */
+export function isDarkCanvas(theme, ctx) {
+  if (theme === 'dark') return true;
+  if (theme === 'light') return false;
+  try {
+    const f = ctx?.canvas?.style?.filter;
+    return typeof f === 'string' && f.includes('invert');
+  } catch {
+    return false;
+  }
+}
+
+/*
+ * When the theme is inferred from the canvas's filter, the painted pixels
+ * depend on that filter, so a theme switch must repaint — even when nothing
+ * the caller tracks changed. Each such canvas gets one MutationObserver on
+ * its style that calls the caller's latest repaint callback when the filter
+ * changes. (Not used when the caller passes `theme` and repaints on its own.)
+ */
+const filterWatches = new WeakMap(); // canvas element -> {filter, repaint}
+
+function watchCanvasFilter(canvas, repaint) {
+  if (typeof MutationObserver === 'undefined' || typeof repaint !== 'function') return;
+  if (!canvas || canvas.nodeType !== 1 || !canvas.style) return;
+  let w = filterWatches.get(canvas);
+  if (!w) {
+    w = { filter: canvas.style.filter || '', repaint };
+    const watch = w;
+    new MutationObserver(() => {
+      const f = canvas.style.filter || '';
+      if (f === watch.filter) return;
+      watch.filter = f;
+      try {
+        watch.repaint();
+      } catch (err) {
+        console.error('[render] repaint after a theme change failed', err);
+      }
+    }).observe(canvas, { attributes: true, attributeFilter: ['style'] });
+    filterWatches.set(canvas, w);
+  }
+  w.repaint = repaint;
+}
+
+/* ------------------------------------------------------------------ *
+ * Colours that must survive the dark filter
+ * ------------------------------------------------------------------ */
+
+const clampTo = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+
+function hslToRgb(h, s, l) {
+  const hh = (((h % 360) + 360) % 360) / 30;
+  const a = s * Math.min(l, 1 - l);
+  const f = (n) => {
+    const k = (n + hh) % 12;
+    return (l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1))) * 255;
+  };
+  return [f(0), f(8), f(4)];
+}
+
+/** [r, g, b (0..255), a (0..1)] of a hex / rgb() / hsl() colour, or null. */
+export function parseColor(c) {
+  if (typeof c !== 'string') return null;
+  const s = c.trim().toLowerCase();
+  let m = /^#([0-9a-f]{3,8})$/.exec(s);
+  if (m) {
+    let h = m[1];
+    if (h.length === 3 || h.length === 4) h = [...h].map((ch) => ch + ch).join('');
+    if (h.length !== 6 && h.length !== 8) return null;
+    const n = (i) => parseInt(h.slice(i, i + 2), 16);
+    return [n(0), n(2), n(4), h.length === 8 ? n(6) / 255 : 1];
+  }
+  m = /^(rgb|hsl)a?\(([^)]*)\)$/.exec(s);
+  if (!m) return null;
+  const parts = m[2].split(/[\s,/]+/).filter(Boolean);
+  if (parts.length < 3) return null;
+  const pct = (p, scale) => (p.endsWith('%') ? (parseFloat(p) / 100) * scale : parseFloat(p));
+  const alpha = parts[3] === undefined ? 1 : pct(parts[3], 1);
+  const rgb =
+    m[1] === 'rgb'
+      ? parts.slice(0, 3).map((p) => pct(p, 255))
+      : hslToRgb(parseFloat(parts[0]), parseFloat(parts[1]) / 100, parseFloat(parts[2]) / 100);
+  if (![...rgb, alpha].every(Number.isFinite)) return null;
+  return [...rgb.map((v) => clampTo(Math.round(v), 0, 255)), clampTo(alpha, 0, 1)];
+}
+
+/** Any CSS colour a 2D context understands, read back as #rrggbb / rgba(). */
+function normalizeColor(c, ctx) {
+  if (!ctx) return c;
+  try {
+    const prev = ctx.fillStyle;
+    ctx.fillStyle = c;
+    const norm = ctx.fillStyle;
+    ctx.fillStyle = prev;
+    return typeof norm === 'string' ? norm : c;
+  } catch {
+    return c;
+  }
+}
+
+const darkColors = new Map();
+
+/**
+ * The colour to paint on a dark-filtered canvas so that it SHOWS as `color`
+ * (see darkPreimage), alpha kept. Unparseable colours come back unchanged.
+ * @param {string} color
+ * @param {CanvasRenderingContext2D} [ctx]  parses colour names / modern syntax
+ */
+export function colorForDarkCanvas(color, ctx) {
+  const key = String(color);
+  let out = darkColors.get(key);
+  if (out) return out;
+  const rgba = parseColor(key) ?? parseColor(normalizeColor(key, ctx));
+  if (!rgba) out = key;
+  else {
+    const [r, g, b] = darkPreimage(rgba[0], rgba[1], rgba[2]);
+    out = rgba[3] < 1 ? `rgba(${r}, ${g}, ${b}, ${rgba[3]})` : `rgb(${r}, ${g}, ${b})`;
+  }
+  if (darkColors.size > 256) darkColors.clear();
+  darkColors.set(key, out);
+  return out;
 }
 
 /* ------------------------------------------------------------------ *
@@ -184,7 +362,16 @@ class Path2DLike {
  * @param {Set<string>|null} [p.erasingIds] painted at 30% opacity
  * @param {object|null} [p.draft]       element being created, painted last
  * @param {() => void} [p.onImageLoad]  schedule a repaint when an image decodes
- * @returns {{drawn:number, culled:number}} counts, for tests and debugging
+ * @param {'light'|'dark'} [p.theme]  'dark': the canvas is shown through
+ *   DARK_MODE_FILTER, so images are drawn through its inverse. Pass it (and
+ *   repaint when it changes). Omitted: read from the canvas element's own
+ *   inline filter, and `onImageLoad` is also called when that filter changes.
+ * @param {boolean} [p.bitmapCache=true]  paint elements from per-element
+ *   bitmaps (elementCache.js) where possible; false draws every element
+ *   directly. `onImageLoad` doubles as the repaint that sharpens bitmaps
+ *   stretched during a zoom.
+ * @returns {{drawn:number, culled:number, cached:number}} counts, for tests
+ *   and debugging (`cached`: drawn from a bitmap)
  */
 export function renderStatic(ctx, p) {
   const {
@@ -199,8 +386,12 @@ export function renderStatic(ctx, p) {
     erasingIds = null,
     draft = null,
     onImageLoad,
+    theme,
+    bitmapCache = true,
   } = p || {};
-  const { zoom, panX, panY } = normView(view);
+  const { zoom, panX, panY, originX, originY } = deviceView(view, dpr);
+  const dark = isDarkCanvas(theme, ctx);
+  if (theme !== 'light' && theme !== 'dark') watchCanvasFilter(ctx.canvas, onImageLoad);
 
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.globalAlpha = 1;
@@ -211,33 +402,58 @@ export function renderStatic(ctx, p) {
     drawGrid(ctx, { zoom, panX, panY, width, height, dpr, gridSize });
   }
 
-  ctx.setTransform(dpr * zoom, 0, 0, dpr * zoom, dpr * panX, dpr * panY);
+  const scale = dpr * zoom;
+  const toBoard = () => ctx.setTransform(scale, 0, 0, scale, originX, originY);
+  toBoard();
   const visible = visibleBoardRect(view, width, height);
-  const erasing = asSet(erasingIds);
-  let drawn = 0;
+  const shown = [];
   let culled = 0;
-  const opts = { zoom, onImageLoad, isEditing: false };
   for (const el of elements) {
     if (!el) continue;
-    if (!isElementVisible(el, visible)) {
-      culled++;
-      continue;
-    }
+    if (isElementVisible(el, visible)) shown.push(el);
+    else culled++;
+  }
+  // Elements come from their bitmaps where they can (elementCache.js): pass
+  // 1 rasterises whatever bitmaps are missing, pass 2 paints in z-order —
+  // blits (which leave the transform at identity) and, for the rest, direct
+  // drawing in board space.
+  const bitmaps = bitmapCache
+    ? beginBitmapFrame(ctx, { scale, originX, originY, zoom, viewportPx: width * height * dpr * dpr, repaint: onImageLoad })
+    : null;
+  const prepared = bitmaps ? shown.map((el) => (el.id === editingId ? null : bitmaps.prepare(el))) : null;
+  let inBoard = true;
+  const erasing = asSet(erasingIds);
+  let drawn = 0;
+  let cached = 0;
+  const opts = { zoom, onImageLoad, isEditing: false, dark };
+  shown.forEach((el, i) => {
     opts.isEditing = el.id === editingId;
     const ghost = erasing?.has(el.id);
     if (ghost) {
       ctx.save();
       ctx.globalAlpha = 0.3;
     }
-    drawElement(ctx, el, opts);
-    if (ghost) ctx.restore();
+    if (prepared?.[i] && bitmaps.paint(prepared[i], el)) {
+      inBoard = false;
+      cached++;
+    } else {
+      if (!inBoard) toBoard();
+      inBoard = true;
+      drawElement(ctx, el, opts);
+    }
+    if (ghost) {
+      ctx.restore();
+      inBoard = false; // whichever transform was saved
+    }
     drawn++;
-  }
+  });
+  bitmaps?.end();
   if (draft) {
-    drawElement(ctx, draft, { zoom, onImageLoad, isEditing: draft.id === editingId });
+    toBoard();
+    drawElement(ctx, draft, { zoom, onImageLoad, isEditing: draft.id === editingId, dark });
     drawn++;
   }
-  return { drawn, culled };
+  return { drawn, culled, cached };
 }
 
 /* ------------------------------------------------------------------ *
@@ -326,6 +542,76 @@ function drawPointHandles(ctx, points, toScreen, { hoverIndex = -1, activeIndex 
   ctx.restore();
 }
 
+/** Screen px a segment must span before it gets a midpoint "+" marker. */
+const MIDPOINT_MIN_SEGMENT = POINT_HANDLE_RADIUS * 4 + 8;
+
+/**
+ * Point-editing mode (double-click on a connector) must LOOK different from a
+ * plain selection, or the double-click seems to do nothing: the connector
+ * gets a soft violet halo along the path it draws, a round one also shows its
+ * control polygon dashed, and every segment long enough gets a "+" marker at
+ * its middle — where a double-click (or Ctrl/⌘-click) adds a point. Drawn
+ * under the point handles.
+ */
+function drawPointEditing(ctx, el, toScreen) {
+  const pts = el.points.map(toScreen);
+  if (pts.length < 2) return;
+  const curved = el.roundness === 'round' && el.points.length > 2;
+  ctx.save();
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  // The halo follows what is drawn: the curve pieces for a round connector
+  // (screen = affine image of board, so the control points map directly).
+  ctx.beginPath();
+  ctx.moveTo(pts[0].x, pts[0].y);
+  if (curved) {
+    for (const [, c1, c2, p3] of curveSegments(el.points)) {
+      const a = toScreen(c1);
+      const b = toScreen(c2);
+      const c = toScreen(p3);
+      ctx.bezierCurveTo(a.x, a.y, b.x, b.y, c.x, c.y);
+    }
+  } else {
+    for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+  }
+  ctx.strokeStyle = 'rgba(105, 101, 219, 0.2)';
+  ctx.lineWidth = POINT_HANDLE_RADIUS * 2;
+  ctx.stroke();
+  if (curved) {
+    ctx.setLineDash([4, 4]);
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = 'rgba(105, 101, 219, 0.6)';
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  const mids = segmentMidpoints(el.points, curved);
+  const r = POINT_HANDLE_RADIUS;
+  ctx.lineWidth = 1;
+  mids.forEach((mb, i) => {
+    const a = pts[i];
+    const b = pts[i + 1];
+    if (Math.hypot(b.x - a.x, b.y - a.y) < MIDPOINT_MIN_SEGMENT) return;
+    const m = toScreen(mb);
+    ctx.beginPath();
+    ctx.arc(m.x, m.y, r, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.9)';
+    ctx.strokeStyle = 'rgba(105, 101, 219, 0.7)';
+    ctx.fill();
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(m.x - r + 2, m.y);
+    ctx.lineTo(m.x + r - 2, m.y);
+    ctx.moveTo(m.x, m.y - r + 2);
+    ctx.lineTo(m.x, m.y + r - 2);
+    ctx.strokeStyle = SELECTION_COLOR;
+    ctx.stroke();
+  });
+  ctx.restore();
+}
+
 /** The outline of an element's shape, as a path in BOARD space. */
 function shapeOutlinePath(ctx, el, pad) {
   const x = el.x - pad;
@@ -396,39 +682,119 @@ function normRect(r) {
   return { x: Math.min(x, x + w), y: Math.min(y, y + h), w: Math.abs(w), h: Math.abs(h) };
 }
 
-function drawEraserTrail(ctx, trail, toScreen) {
-  const pts = (Array.isArray(trail) ? trail : trail?.points ?? []).filter((p) => p && Number.isFinite(p.x));
-  if (pts.length < 2) return;
-  ctx.save();
-  ctx.lineCap = 'round';
-  ctx.lineJoin = 'round';
-  ctx.setLineDash([]);
-  const n = pts.length;
-  let prev = toScreen(pts[0]);
-  for (let i = 1; i < n; i++) {
-    const s = toScreen(pts[i]);
-    const t = i / (n - 1); // 0 = oldest, 1 = newest
-    ctx.strokeStyle = `rgba(0, 0, 0, ${(0.05 + 0.2 * t).toFixed(3)})`;
-    ctx.lineWidth = 1 + 4 * t;
-    ctx.beginPath();
-    ctx.moveTo(prev.x, prev.y);
-    ctx.lineTo(s.x, s.y);
-    ctx.stroke();
-    prev = s;
+/** Width (screen px) of the eraser trail at its newest and oldest ends. */
+const TRAIL_HEAD_WIDTH = 5;
+const TRAIL_TAIL_WIDTH = 1;
+
+/**
+ * Outline of the eraser trail as ONE polygon, in the points' own space: a
+ * stroke that tapers from TRAIL_TAIL_WIDTH at the oldest point to
+ * TRAIL_HEAD_WIDTH at the newest (by distance along the path), with a round
+ * head. Filled in a single `fill`, it has no overlapping translucent caps —
+ * stroking segment by segment darkened every joint into a bead.
+ * @param {{x:number,y:number}[]} points  oldest first
+ * @returns {{x:number,y:number}[]} polygon (empty for fewer than 2 points)
+ */
+export function eraserTrailOutline(points, headWidth = TRAIL_HEAD_WIDTH, tailWidth = TRAIL_TAIL_WIDTH) {
+  const pts = [];
+  for (const p of points || []) {
+    if (!p || !Number.isFinite(p.x) || !Number.isFinite(p.y)) continue;
+    const q = pts[pts.length - 1];
+    if (q && Math.hypot(p.x - q.x, p.y - q.y) < 0.5) continue; // no zero-length segments
+    pts.push({ x: p.x, y: p.y });
   }
+  const n = pts.length;
+  if (n < 2) return [];
+  const along = [0];
+  const normals = []; // unit normal of each segment (left of the direction)
+  for (let i = 1; i < n; i++) {
+    const dx = pts[i].x - pts[i - 1].x;
+    const dy = pts[i].y - pts[i - 1].y;
+    const d = Math.hypot(dx, dy);
+    along.push(along[i - 1] + d);
+    normals.push({ x: -dy / d, y: dx / d });
+  }
+  const total = along[n - 1];
+  const half = (i) => (tailWidth + (headWidth - tailWidth) * (along[i] / total)) / 2;
+  const left = [];
+  const right = [];
+  for (let i = 0; i < n; i++) {
+    // Vertex normal: the average of the two segments meeting here (the
+    // previous one's alone at a hairpin turn, where the average vanishes).
+    const a = normals[Math.max(0, i - 1)];
+    const b = normals[Math.min(n - 2, i)];
+    let nx = a.x + b.x;
+    let ny = a.y + b.y;
+    const len = Math.hypot(nx, ny);
+    if (len < 1e-6) {
+      nx = a.x;
+      ny = a.y;
+    } else {
+      nx /= len;
+      ny /= len;
+    }
+    const h = half(i);
+    left.push({ x: pts[i].x + nx * h, y: pts[i].y + ny * h });
+    right.push({ x: pts[i].x - nx * h, y: pts[i].y - ny * h });
+  }
+  // Round head: half a circle around the newest point, from the left side
+  // through the direction of travel to the right side.
+  const tip = pts[n - 1];
+  const last = normals[n - 2];
+  const r = half(n - 1);
+  const start = Math.atan2(last.y, last.x); // the left normal's angle
+  const head = [];
+  const STEPS = 8;
+  for (let k = 1; k < STEPS; k++) {
+    const ang = start - (Math.PI * k) / STEPS;
+    head.push({ x: tip.x + Math.cos(ang) * r, y: tip.y + Math.sin(ang) * r });
+  }
+  return [...left, ...head, ...right.reverse()];
+}
+
+function drawEraserTrail(ctx, trail, toScreen) {
+  const raw = (Array.isArray(trail) ? trail : trail?.points ?? []).filter((p) => p && Number.isFinite(p.x));
+  if (raw.length < 2) return;
+  const screen = raw.map(toScreen);
+  const poly = eraserTrailOutline(screen);
+  if (poly.length < 3) return;
+  ctx.save();
+  ctx.setLineDash([]);
+  // Fading from the oldest to the newest end: one gradient over one fill.
+  const a = screen[0];
+  const b = screen[screen.length - 1];
+  let fill = 'rgba(0, 0, 0, 0.2)';
+  if (typeof ctx.createLinearGradient === 'function' && Math.hypot(b.x - a.x, b.y - a.y) > 1) {
+    fill = ctx.createLinearGradient(a.x, a.y, b.x, b.y);
+    fill.addColorStop(0, 'rgba(0, 0, 0, 0.05)');
+    fill.addColorStop(1, 'rgba(0, 0, 0, 0.25)');
+  }
+  ctx.fillStyle = fill;
+  ctx.beginPath();
+  ctx.moveTo(poly[0].x, poly[0].y);
+  for (let i = 1; i < poly.length; i++) ctx.lineTo(poly[i].x, poly[i].y);
+  ctx.closePath();
+  ctx.fill();
   ctx.restore();
 }
 
-/** Excalidraw-like pointer arrow + name tag, in the peer's colour. */
-function drawRemoteCursor(ctx, s, name, color, width, height) {
+/**
+ * Excalidraw-like pointer arrow + name tag, in the peer's colour. `paint`
+ * maps a colour to what must be painted for it to show (identity in light
+ * mode; through the dark filter's inverse in dark mode, so the cursor keeps
+ * its avatar's colour and the label stays white).
+ */
+function drawRemoteCursor(ctx, s, name, color, width, height, paint = (c) => c) {
   const margin = 8;
   const off = s.x < 0 || s.y < 0 || s.x > width || s.y > height;
   const x = Math.min(Math.max(s.x, margin), width - margin);
   const y = Math.min(Math.max(s.y, margin), height - margin);
+  const fill = paint(color);
+  const white = paint('#ffffff');
   ctx.save();
   ctx.setLineDash([]);
-  ctx.fillStyle = color;
-  ctx.strokeStyle = '#ffffff';
+  ctx.fillStyle = fill;
+  ctx.strokeStyle = white;
   ctx.lineWidth = 1.5;
   ctx.lineJoin = 'round';
   if (off) {
@@ -465,13 +831,13 @@ function drawRemoteCursor(ctx, s, name, color, width, height) {
     if (bx + bw > width - 2) bx = off ? x - 8 - bw : width - bw - 2;
     bx = Math.max(2, bx);
     by = Math.min(Math.max(by, 2), height - bh - 2);
-    ctx.fillStyle = color;
+    ctx.fillStyle = fill;
     roundedRectPath(ctx, bx, by, bw, bh, 6);
     ctx.fill();
-    ctx.strokeStyle = 'rgba(255, 255, 255, 0.9)';
+    ctx.strokeStyle = paint('rgba(255, 255, 255, 0.9)');
     ctx.lineWidth = 1;
     ctx.stroke();
-    ctx.fillStyle = '#ffffff';
+    ctx.fillStyle = white;
     ctx.fillText(label, bx + padX, by + bh / 2 + 0.5);
   }
   ctx.restore();
@@ -505,6 +871,15 @@ function drawRemoteCursor(ctx, s, name, color, width, height) {
  *   On a big board this keeps a drag-to-create from repainting every shape
  *   on every pointer move.
  * @param {() => void} [p.onImageLoad]
+ * @param {'light'|'dark'} [p.theme]  'dark': the canvas is shown through
+ *   DARK_MODE_FILTER, so collaborators' colours are painted through its
+ *   inverse (and a draft image too). Omitted: read from the canvas element.
+ *
+ * `interaction.linearEdit.editing` (point editing, entered by a double-click
+ * on a connector) adds a halo along the connector and the "+" midpoint
+ * markers (plus the dashed control polygon of a round one);
+ * `interaction.linearEdit.selectedIndices` (optional Set/array) fills those
+ * points like the active one.
  */
 export function renderInteractive(ctx, p) {
   const {
@@ -522,17 +897,23 @@ export function renderInteractive(ctx, p) {
     peerSelections,
     draft = null,
     onImageLoad,
+    theme,
   } = p || {};
-  const { zoom, panX, panY } = normView(view);
+  // The same device-aligned pan as the static layer, so frames and handles
+  // sit exactly on the strokes they outline.
+  const aligned = deviceView(view, dpr);
+  const { zoom, panX, panY } = aligned;
   const it = interaction || {};
   const mode = it.mode || 'idle';
+  const dark = isDarkCanvas(theme, ctx);
+  const peerPaint = dark ? (c) => colorForDarkCanvas(c, ctx) : (c) => c;
 
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.globalAlpha = 1;
   ctx.clearRect(0, 0, ctx.canvas?.width ?? width * dpr, ctx.canvas?.height ?? height * dpr);
   if (draft) {
     ctx.setTransform(dpr * zoom, 0, 0, dpr * zoom, dpr * panX, dpr * panY);
-    drawElement(ctx, draft, { zoom, onImageLoad, isEditing: draft.id === editingId });
+    drawElement(ctx, draft, { zoom, onImageLoad, isEditing: draft.id === editingId, dark });
   }
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
@@ -552,16 +933,21 @@ export function renderInteractive(ctx, p) {
       const el = lookup(id);
       if (!el) continue;
       const f = selectionFrame([el], zoom);
-      if (f) strokeFrame(ctx, f, toScreen, { color: ps.color || '#868e96', width: 1.5 });
+      if (f) strokeFrame(ctx, f, toScreen, { color: peerPaint(ps.color || '#868e96'), width: 1.5 });
     }
   }
 
   // --- hover -----------------------------------------------------------
+  // The hover frame outlines what a click would select: a grouped element
+  // brings its whole group (expandSelectionToGroups is what the click uses).
   if (hoveredId && mode === 'idle' && !sel.has(hoveredId) && hoveredId !== editingId) {
     const el = lookup(hoveredId);
     if (el && !el.locked) {
-      const f = selectionFrame([el], zoom);
-      if (f) strokeFrame(ctx, f, toScreen, { color: 'rgba(105, 101, 219, 0.45)' });
+      const members = hoverGroup(elements, el, lookup);
+      if (!members.some((m) => sel.has(m.id))) {
+        const f = selectionFrame(members, zoom);
+        if (f) strokeFrame(ctx, f, toScreen, { color: 'rgba(105, 101, 219, 0.45)' });
+      }
     }
   }
 
@@ -569,7 +955,7 @@ export function renderInteractive(ctx, p) {
   if (it.bindTarget) {
     const el = typeof it.bindTarget === 'string' ? lookup(it.bindTarget) : it.bindTarget;
     if (el) {
-      drawBindHighlight(ctx, el, view, dpr);
+      drawBindHighlight(ctx, el, aligned, dpr);
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     }
   }
@@ -648,6 +1034,7 @@ export function renderInteractive(ctx, p) {
   // --- connector point handles ----------------------------------------
   if (linearEl && Array.isArray(linearEl.points) && !linearEl.locked && mode !== 'moving' && mode !== 'erasing') {
     const le = it.linearEdit && it.linearEdit.id === linearEl.id ? it.linearEdit : {};
+    if (le.editing) drawPointEditing(ctx, linearEl, toScreen);
     drawPointHandles(ctx, linearEl.points, toScreen, {
       hoverIndex: le.hoverIndex ?? -1,
       activeIndex: le.activeIndex ?? -1,
@@ -681,6 +1068,27 @@ export function renderInteractive(ctx, p) {
   // --- collaborators' cursors -----------------------------------------
   for (const [peerId, c] of entriesOf(remoteCursors)) {
     if (!c || peerId === myPeerId || !Number.isFinite(c.x) || !Number.isFinite(c.y)) continue;
-    drawRemoteCursor(ctx, toScreen(c), c.name, c.color || '#1971c2', width, height);
+    drawRemoteCursor(ctx, toScreen(c), c.name, c.color || '#1971c2', width, height, peerPaint);
   }
+}
+
+/** One-entry memo: the hover frame is recomputed on every pointer move. */
+let hoverMemo = { elements: null, id: null, members: null };
+
+/** The elements a click on `el` selects: its group (if any), else itself. */
+function hoverGroup(elements, el, lookup) {
+  if (hoverMemo.elements === elements && hoverMemo.id === el.id) return hoverMemo.members;
+  let members = [el];
+  const grouped = !!el.groupId || elements.some((e) => e && e.groupId === el.id);
+  if (grouped) {
+    try {
+      const ids = expandSelectionToGroups(elements, [el.id]);
+      const list = ids.map(lookup).filter(Boolean);
+      if (list.length) members = list;
+    } catch {
+      members = [el];
+    }
+  }
+  hoverMemo = { elements, id: el.id, members };
+  return members;
 }

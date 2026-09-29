@@ -19,17 +19,17 @@ English, matching the codebase.
 
 **Already written (foundation, owned by the orchestrator — read, do not edit):**
 
-- `apps/web/src/editor/constants.js` — palettes, `DEFAULT_STYLE`, sizes, fonts, handle sizes, zoom steps.
-- `apps/web/src/editor/text.js` — `fontString`, `measureLine`, `measureText`, `wrapText`, `labelKeyOf`, `textOf`, `labelBox`, `layoutText`, `fitTextElement`, `textColorOf`, `lineHeightPx`.
-- `apps/web/src/editor/elements.js` — `newId`, `randomSeed`, `isLinear`, `isFreedraw`, `hasPoints`, `isText`, `isBindable`, `isContainer`, `isRotatable`, `styleKeysFor(type)`, `styleKeysForTool(tool)`, `createElement(type, geom, style, extra)`, `cloneElements(elements, {dx, dy})`.
+- `apps/web/src/editor/constants.js` — palettes, `DEFAULT_STYLE`, sizes, fonts, handle sizes, zoom steps. The enums `FILL_STYLES`, `STROKE_STYLES`, `ROUNDNESS`, `ARROWHEADS`, `TEXT_ALIGNS` are RE-EXPORTED from `@whiteboard/shared`, never declared again (a web copy of `FILL_STYLES` once lacked `'zigzag'`).
+- `apps/web/src/editor/text.js` — `fontString`, `measureLine`, `measureText`, `wrapText`, `trimTrailingSpaces`, `labelKeyOf`, `textOf`, `labelBox`, `layoutText`, `fitTextElement`, `textColorOf`, `lineHeightPx`.
+- `apps/web/src/editor/elements.js` — `newId`, `randomSeed`, `isLinear`, `isFreedraw`, `hasPoints`, `isText`, `isBindable`, `isContainer`, `isRotatable`, `styleKeysFor(type)`, `styleKeysForTool(tool)`, `styleKeysForElement(el, {editing})`, `createElement(type, geom, style, extra)`, `cloneElements(elements, {dx, dy})`.
 - `apps/web/src/editor/tools.js` — `TOOLBAR`, `TOOL_BY_ID`, `BOX_TOOLS`, `LINEAR_TOOLS`, `toolForKey(key)`.
 - `apps/web/src/editor/handles.js` — `rotateAround`, `elementCorners`, `elementBounds`, `commonBounds`, `selectionFrame(selected, zoom)`, `HANDLE_KEYS`, `transformHandles(frame, zoom, opts)`, `hitHandle(frame, p, zoom, opts)`, `cursorForHandle(key, rotation)`.
 - Fonts: `apps/web/public/fonts/Virgil-Regular.woff2`, `apps/web/public/fonts/CascadiaCode-Regular.woff2` (both SIL OFL 1.1, from the Excalidraw distribution).
 - Dependencies `roughjs` and `perfect-freehand` are installed in `apps/web`.
 
 The legacy directories `apps/web/src/flow/`, `apps/web/src/dnd/` and
-`apps/web/src/canvas/` stay on disk until integration. Read them for reference
-if useful; **do not delete or edit them** — the integration step removes them.
+`apps/web/src/canvas/` (React Flow, dnd-kit, the old renderer) were removed at
+integration; nothing may import them again.
 
 ---
 
@@ -170,7 +170,7 @@ applyRemoteOps(ops)                  // apply a batch, then ONE resolveConnector
 | `apps/web/src/editor/render/**`, `apps/web/src/editor/export/**`, `apps/web/src/editor/fonts.js`, `apps/web/test/render.test.js`, `apps/web/test/export.test.js` | **render** agent |
 | `apps/web/src/editor/scene.js`, `editor/hitTest.js`, `editor/interaction.js`, `editor/Canvas.jsx`, `editor/TextEditor.jsx`, `editor/image.js`, `apps/web/test/scene.test.js`, `apps/web/test/hitTest.test.js`, `apps/web/test/interaction.test.js` | **interaction** agent |
 | `apps/web/src/App.jsx`, `main.jsx`, `apps/web/src/ui/**`, `apps/web/src/styles/**`, `apps/web/src/editor/actions.js`, `apps/web/src/store/presets.js`, `apps/web/index.html`, `apps/web/vite.config.js`, `apps/web/package.json`, `apps/web/test/actions.test.js`, `apps/web/test/shortcuts.test.js` | **ui** agent |
-| `apps/web/src/editor/{constants,text,elements,tools,handles}.js`, `docs/EDITOR_CONTRACT.md`, fonts | orchestrator (read-only for agents) |
+| `apps/web/src/editor/{constants,text,elements,tools,handles}.js`, `apps/web/test/text.test.js`, `apps/web/test/elements.test.js`, `docs/EDITOR_CONTRACT.md`, fonts, `README.md`, `apps/*/README.md`, root `package.json` | orchestrator / core (read-only for agents) |
 
 ## 6. Rendering API (render agent)
 
@@ -352,6 +352,14 @@ export default function TextEditor({ element, isNew, view, theme, onCommit(text)
 // editing and painting. Enter inserts a newline; Escape or Ctrl/⌘+Enter or
 // blur commits (Escape commits too, like Excalidraw); empty new text is
 // discarded; empty existing text element is deleted.
+// Labels: the textarea uses `white-space: pre-wrap` and
+// `overflow-wrap/word-break: break-word`, and `text.js` `wrapText` follows the
+// same rules (checked against Chromium), so both break lines in the same
+// places: after spaces and after hyphens/dashes/`?`, never at a no-break
+// space; spaces at a soft wrap hang (no extra line, not counted for
+// alignment); spaces before a `\n` count for alignment up to the box width;
+// a word wider than the box goes to its own line and is broken between
+// graphemes. The textarea's height comes from `wrapText`'s line count.
 
 // editor/image.js
 export async function fileToImageElement(file, at /*board point*/, style): Promise<object>  // downscale to IMAGE_MAX_SIDE, data URL ≤ IMAGE_MAX_CHARS
@@ -367,7 +375,15 @@ Layout (Excalidraw islands, all floating over the full-screen canvas):
   Ajuda.
 - **Left, below the menu**: `PropertiesPanel`, visible when a drawing tool is
   active (keys from `styleKeysForTool`) or the selection is non-empty (union of
-  `styleKeysFor` of the selected types). Sections: Traço (STROKE_COLORS + custom
+  `styleKeysFor` of the selected types, or of `styleKeysForElement` per
+  selected element, which leaves font/size/alignment out for a shape without a
+  label). `styleKeysForTool(tool)` lists only keys the new element takes from
+  the default style, so every control shown changes what gets drawn: the line
+  tool shows no arrowheads (new lines have none; a selected line does show
+  them), the rect/diamond/ellipse/cylinder tools show no font, size or
+  alignment (a new shape has no label; its label is centred). Shape labels
+  are aligned with `align` like text and stickies (absent = centre); a new
+  sticky takes `style.align`. Sections: Traço (STROKE_COLORS + custom
   colour), Fundo (BACKGROUND_COLORS + custom), Preenchimento (FILL_STYLES, only
   with a background), Espessura (STROKE_WIDTHS), Estilo do traço, Traçado
   (ROUGHNESS), Bordas (ROUNDNESS), Pontas de seta (start/end), Fonte
@@ -428,8 +444,9 @@ selection, Mod+' grid, Alt+Shift+D theme, Mod+Shift+E export, ? help, Escape
 
 ## 9. Tests
 
-`npm test` (API) and `npm run test:web` must pass. Pure modules get node:test
+`npm test` (API) and `npm run test:web` must pass (`npm run test:all` runs
+both; `npm run build` is the web production build). Pure modules get node:test
 coverage (`node --test`). The web test script runs
-`apps/web/test/*.test.js apps/web/src/**/*.test.js`. Legacy tests that import
-`flow/`, `dnd/` or `canvas/` are migrated or removed at integration, not by
-you — but write your new tests so they do not import legacy modules.
+`"apps/web/test/*.test.js" "apps/web/src/**/*.test.js"`; the globs are quoted
+so node expands them (recursively), not the shell. Tests must not import the
+removed legacy modules (`flow/`, `dnd/`, `canvas/`).

@@ -11,7 +11,7 @@
  * On phones (≤ 640px) the panel is a bottom sheet behind a "Estilo" toggle.
  */
 
-import React, { useLayoutEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 import {
   STROKE_COLORS,
@@ -28,7 +28,7 @@ import {
   TEXT_ALIGNS,
 } from '../editor/constants.js';
 import { styleKeysFor, styleKeysForTool } from '../editor/elements.js';
-import { actions } from '../editor/actions.js';
+import { actions, groupAvailability } from '../editor/actions.js';
 import { useBoardStore, useStyle, useTool } from '../store/index.js';
 import { useUi } from './uiStore.js';
 import { IconButton, Island, useOutsideClose } from './common.jsx';
@@ -73,6 +73,7 @@ import {
   IconClose,
 } from './Icons.jsx';
 import { shortcutHint } from './shortcuts.js';
+import { hexFieldValue, hexToApply } from './colorHex.js';
 import { t } from './strings.js';
 
 const MIXED = Symbol('mixed');
@@ -155,45 +156,135 @@ function Swatch({ color, checked, onPick, label }) {
   );
 }
 
-/** Quick swatches + the current colour, which opens the full picker. */
-function ColorRow({ value, quick, onPick }) {
-  const [open, setOpen] = useState(false);
+/**
+ * Where the popover goes: beside the trigger (the panel scrolls, which would
+ * clip an absolutely positioned popover, so it is `fixed`), above it when
+ * there is no room beside, clamped to the window. Null when the trigger is
+ * not on screen any more (scrolled out of the panel, or the panel hidden):
+ * the popover then has nothing to point at and closes.
+ */
+function popoverPosition(trigger, pop) {
+  if (!trigger || !pop || !trigger.getClientRects().length) return null;
+  const r = trigger.getBoundingClientRect();
+  const scroller = trigger.closest('.props-panel');
+  if (scroller) {
+    const b = scroller.getBoundingClientRect();
+    if (r.bottom <= b.top || r.top >= b.bottom) return null;
+  }
+  const p = pop.getBoundingClientRect();
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  let left = r.right + 14;
+  if (left + p.width > vw - 8) left = Math.max(8, Math.min(r.left, vw - p.width - 8));
+  let top = r.top - 10;
+  if (left < r.right && left + p.width > r.left) top = r.top - p.height - 10; // no room beside: go above
+  top = Math.max(8, Math.min(top, vh - p.height - 8));
+  return { left: Math.round(left), top: Math.round(top) };
+}
+
+/**
+ * Quick swatches + the current colour, which opens the full picker.
+ *
+ * The popover is an overlay of the UI store (`colorPicker` = this row), so
+ * Escape closes just the picker — from the page or from the hex field — and
+ * keeps the selection, as in Excalidraw. It follows its trigger while the
+ * panel scrolls or the window resizes, and closes once the trigger is gone.
+ */
+function ColorRow({ row, value, quick, onPick }) {
+  const open = useUi((s) => s.colorPicker === row);
   const [hex, setHex] = useState('');
+  // The user typed in the hex field since it last showed the current colour.
+  // Only then does leaving it (or Enter) apply anything.
+  const hexEditedRef = useRef(false);
+  // Opened from the keyboard (the trigger had focus): focus goes back to it on close.
+  const restoreFocusRef = useRef(false);
   const [pos, setPos] = useState(null);
   const ref = useRef(null);
   const triggerRef = useRef(null);
   const popRef = useRef(null);
-  useOutsideClose(ref, open, () => setOpen(false));
+  const close = useCallback(() => useUi.getState().closeColorPicker(row), [row]);
+  useOutsideClose(ref, open, close);
 
-  // The panel scrolls (overflow), which would clip an absolutely positioned
-  // popover: place it `fixed` beside the trigger, clamped to the window.
+  // Never leave the store pointing at a popover that is gone (the panel
+  // unmounts when the selection is deleted or cleared from the keyboard).
+  useEffect(() => close, [close]);
+
+  const place = useCallback(() => {
+    const next = popoverPosition(triggerRef.current, popRef.current);
+    if (!next) {
+      close();
+      return;
+    }
+    setPos((prev) => (prev && prev.left === next.left && prev.top === next.top ? prev : next));
+  }, [close]);
+
   useLayoutEffect(() => {
-    if (!open || !triggerRef.current || !popRef.current) {
+    if (!open) {
       setPos(null);
       return;
     }
-    const r = triggerRef.current.getBoundingClientRect();
-    const p = popRef.current.getBoundingClientRect();
-    const vw = window.innerWidth;
-    const vh = window.innerHeight;
-    let left = r.right + 14;
-    if (left + p.width > vw - 8) left = Math.max(8, Math.min(r.left, vw - p.width - 8));
-    let top = r.top - 10;
-    if (left < r.right && left + p.width > r.left) top = r.top - p.height - 10; // no room beside: go above
-    top = Math.max(8, Math.min(top, vh - p.height - 8));
-    setPos({ left, top });
+    place();
+  }, [open, place]);
+
+  // Follow the trigger: the panel scrolls (capture catches scrolls of any
+  // container) and the window resizes; once per frame at most.
+  useEffect(() => {
+    if (!open) return undefined;
+    let frame = 0;
+    const onChange = () => {
+      if (!frame) {
+        frame = requestAnimationFrame(() => {
+          frame = 0;
+          place();
+        });
+      }
+    };
+    window.addEventListener('scroll', onChange, true);
+    window.addEventListener('resize', onChange);
+    return () => {
+      cancelAnimationFrame(frame);
+      window.removeEventListener('scroll', onChange, true);
+      window.removeEventListener('resize', onChange);
+    };
+  }, [open, place]);
+
+  // Closed with focus inside the popover (Escape in the hex field): the
+  // focused field is gone, so a keyboard user gets the trigger back.
+  const wasOpen = useRef(false);
+  useEffect(() => {
+    if (wasOpen.current && !open && restoreFocusRef.current) {
+      const active = document.activeElement;
+      if (!active || active === document.body) triggerRef.current?.focus({ preventScroll: true });
+    }
+    if (!open) restoreFocusRef.current = false;
+    wasOpen.current = open;
   }, [open]);
   const current = value === MIXED ? null : value;
+
+  // The field follows the colour while it is not being edited: a swatch pick,
+  // an undo or a collaborator's change all show up in it. (It used to keep the
+  // colour from when the popover opened, and its blur re-applied that.)
+  useEffect(() => {
+    if (open && !hexEditedRef.current) setHex(hexFieldValue(current));
+  }, [open, current]);
+
+  /** A swatch or the native picker: discards a half-typed hex. */
+  const pick = (c) => {
+    hexEditedRef.current = false;
+    onPick(c);
+  };
   const submitHex = () => {
-    const v = hex.trim();
-    const norm = /^#?[0-9a-fA-F]{6}$/.test(v) ? (v.startsWith('#') ? v : `#${v}`).toLowerCase() : null;
-    if (norm) onPick(norm);
+    const next = hexToApply(hex, hexEditedRef.current, current);
+    hexEditedRef.current = false;
+    if (next) onPick(next);
+    // Invalid or unchanged text goes back to showing the colour in use.
+    setHex(hexFieldValue(next ?? current));
   };
   return (
     <div className="color-row" ref={ref}>
       <div className="swatches" role="radiogroup">
         {quick.map((c) => (
-          <Swatch key={c} color={c} checked={current === c} onPick={onPick} />
+          <Swatch key={c} color={c} checked={current === c} onPick={pick} />
         ))}
       </div>
       <span className="props-divider" aria-hidden="true" />
@@ -208,8 +299,14 @@ function ColorRow({ value, quick, onPick }) {
         aria-label={t.props.customColor}
         onMouseDown={(e) => e.preventDefault()}
         onClick={() => {
-          setHex(isPaint(current) ? current : '');
-          setOpen((v) => !v);
+          hexEditedRef.current = false;
+          setHex(hexFieldValue(current));
+          if (open) {
+            close();
+            return;
+          }
+          restoreFocusRef.current = document.activeElement === triggerRef.current;
+          useUi.getState().openColorPicker(row);
         }}
       />
       {open ? (
@@ -222,7 +319,7 @@ function ColorRow({ value, quick, onPick }) {
         >
           <div className="color-grid" role="radiogroup">
             {COLOR_GRID.map((c) => (
-              <Swatch key={c} color={c} checked={current === c} onPick={(v) => onPick(v)} />
+              <Swatch key={c} color={c} checked={current === c} onPick={pick} />
             ))}
           </div>
           <form
@@ -239,7 +336,15 @@ function ColorRow({ value, quick, onPick }) {
               maxLength={7}
               spellCheck={false}
               aria-label={t.props.customColor}
-              onChange={(e) => setHex(e.target.value)}
+              onChange={(e) => {
+                hexEditedRef.current = true;
+                setHex(e.target.value);
+              }}
+              onKeyDown={(e) => {
+                // Escape discards what was typed; the keyboard map then
+                // closes the popover (it is the top overlay).
+                if (e.key === 'Escape') hexEditedRef.current = false;
+              }}
               onBlur={submitHex}
             />
             <input
@@ -247,10 +352,7 @@ function ColorRow({ value, quick, onPick }) {
               className="color-hex__native"
               value={isPaint(current) && /^#[0-9a-f]{6}$/i.test(current) ? current : '#000000'}
               aria-label={t.props.customColor}
-              onChange={(e) => {
-                setHex(e.target.value);
-                onPick(e.target.value);
-              }}
+              onChange={(e) => pick(e.target.value)}
             />
           </form>
         </Island>
@@ -320,10 +422,22 @@ function useSelectedElements() {
   return useBoardStore(useShallow((s) => (s.selection.size ? s.elements.filter((el) => s.selection.has(el.id)) : EMPTY)));
 }
 
+/**
+ * Which group buttons the selection gets, as a bit mask (a primitive, so the
+ * panel re-renders only when it changes): 1 = Agrupar would do something (not
+ * for a selection that already is exactly one group), 2 = Desagrupar.
+ */
+function groupButtons(state) {
+  if (!state.selection.size) return 0;
+  const { canGroup, canUngroup } = groupAvailability(state);
+  return (canGroup ? 1 : 0) | (canUngroup ? 2 : 0);
+}
+
 export function PropertiesPanel() {
   const tool = useTool();
   const style = useStyle();
   const selected = useSelectedElements();
+  const groupMask = useBoardStore(groupButtons);
   const sheetOpen = useUi((s) => s.propsOpen);
 
   const model = useMemo(() => {
@@ -348,18 +462,17 @@ export function PropertiesPanel() {
   const showFillStyle = keys.has('fillStyle') && (fill === MIXED || isPaint(fill));
   const showRoundness = keys.has('roundness') && types.some((ty) => ROUNDABLE.has(ty));
   const locked = hasSel && selected.every((el) => el.locked);
-  const grouped = hasSel && selected.some((el) => el.groupId);
 
   const body = (
     <>
       {keys.has('stroke') ? (
         <Section title={t.props.stroke}>
-          <ColorRow value={value('stroke')} quick={STROKE_COLORS} onPick={set('stroke')} />
+          <ColorRow row="stroke" value={value('stroke')} quick={STROKE_COLORS} onPick={set('stroke')} />
         </Section>
       ) : null}
       {keys.has('fill') ? (
         <Section title={t.props.background}>
-          <ColorRow value={fill} quick={onlySticky ? STICKY_COLORS : BACKGROUND_COLORS} onPick={set('fill')} />
+          <ColorRow row="fill" value={fill} quick={onlySticky ? STICKY_COLORS : BACKGROUND_COLORS} onPick={set('fill')} />
         </Section>
       ) : null}
       {showFillStyle ? (
@@ -438,15 +551,22 @@ export function PropertiesPanel() {
               <IconButton className="option" label={t.actions.duplicate} shortcut={shortcutHint('edit.duplicate')} onClick={() => actions.duplicateSelection()}>
                 <IconDuplicate size={18} />
               </IconButton>
-              <IconButton className="option" label={t.actions.delete} shortcut={shortcutHint('edit.delete')} onClick={() => actions.deleteSelection()}>
+              {/* Locked elements are protected from deletion: no dead button. */}
+              <IconButton
+                className="option"
+                label={t.actions.delete}
+                shortcut={shortcutHint('edit.delete')}
+                disabled={locked}
+                onClick={() => actions.deleteSelection()}
+              >
                 <IconTrash size={18} />
               </IconButton>
-              {selected.length > 1 ? (
+              {groupMask & 1 ? (
                 <IconButton className="option" label={t.actions.group} shortcut={shortcutHint('edit.group')} onClick={() => actions.group()}>
                   <IconGroup size={18} />
                 </IconButton>
               ) : null}
-              {grouped ? (
+              {groupMask & 2 ? (
                 <IconButton className="option" label={t.actions.ungroup} shortcut={shortcutHint('edit.ungroup')} onClick={() => actions.ungroup()}>
                   <IconUngroup size={18} />
                 </IconButton>
@@ -499,8 +619,41 @@ export function PropertiesPanel() {
   );
 }
 
+let sliderGestureSeq = 0;
+
+/**
+ * One pointer drag on a slider, as a gesture id for `actions.applyStyle`:
+ * set on pointerdown, cleared when the button is released anywhere (the
+ * pointer may leave the slider mid-drag). Keyboard changes carry no gesture
+ * and coalesce by label as before.
+ */
+function useSliderGesture() {
+  const gesture = useRef(null);
+  const end = useRef(null);
+  useEffect(() => () => end.current?.(), []);
+  const onPointerDown = (e) => {
+    if (e.button !== 0) return;
+    end.current?.();
+    sliderGestureSeq += 1;
+    gesture.current = `drag${Date.now().toString(36)}${sliderGestureSeq}`;
+    const stop = () => {
+      gesture.current = null;
+      window.removeEventListener('pointerup', stop, true);
+      window.removeEventListener('pointercancel', stop, true);
+      end.current = null;
+    };
+    end.current = stop;
+    window.addEventListener('pointerup', stop, true);
+    window.addEventListener('pointercancel', stop, true);
+  };
+  return { gesture, onPointerDown };
+}
+
 function OpacityRow({ value }) {
   const pct = value === MIXED || value === undefined ? 100 : Math.round(Number(value) * 100);
+  // A drag is one undo step even with pauses (EDITOR_CONTRACT §3): the
+  // store's 500 ms same-label window alone split a drag held still mid-way.
+  const { gesture, onPointerDown } = useSliderGesture();
   return (
     <Section title={t.props.opacity}>
       <div className="opacity-row">
@@ -513,7 +666,8 @@ function OpacityRow({ value }) {
           value={pct}
           aria-label={t.props.opacity}
           aria-valuetext={`${pct}%`}
-          onChange={(e) => actions.applyStyle({ opacity: Number(e.target.value) / 100 })}
+          onPointerDown={onPointerDown}
+          onChange={(e) => actions.applyStyle({ opacity: Number(e.target.value) / 100 }, { gesture: gesture.current })}
         />
         <span className="opacity-row__value">{value === MIXED ? '—' : `${pct}%`}</span>
       </div>

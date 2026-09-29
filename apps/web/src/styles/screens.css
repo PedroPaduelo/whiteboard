@@ -92,16 +92,47 @@
 
 .board-list__tools {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
+  justify-content: flex-end;
   gap: 8px;
+  max-width: 100%;
+}
+
+.board-search {
+  position: relative;
+  display: flex;
+  align-items: center;
+  flex: 0 1 220px;
+  min-width: 140px;
+}
+
+.board-search__icon {
+  position: absolute;
+  left: 10px;
+  color: var(--text-muted);
+  pointer-events: none;
+}
+
+.board-search__input {
+  width: 100%;
+  padding-left: 32px;
 }
 
 .board-list__body {
   margin-top: 28px;
 }
 
+.board-list__more {
+  display: flex;
+  justify-content: center;
+  margin-top: 16px;
+}
+
 .board-rows {
   display: grid;
+  /* minmax(0, …): a long title ellipsises instead of widening the column past a phone screen. */
+  grid-template-columns: minmax(0, 1fr);
   gap: 10px;
   margin: 0;
   padding: 0;
@@ -134,20 +165,38 @@
   box-shadow: var(--island-shadow);
 }
 
+/* The board's real content, small (ui/boardPreview.js). Large drawings
+   shrink to fit; small ones keep their size rather than being blown up. */
 .board-preview {
+  display: flex;
   flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 106px;
+  height: 70px;
+  padding: 4px;
+  overflow: hidden;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--canvas-bg);
 }
 
-.board-preview rect,
-.board-preview ellipse,
-.board-preview path {
-  fill: none;
-  stroke: var(--text-faint);
-  stroke-width: 1.4;
-  stroke-linejoin: round;
+.board-preview__img {
+  display: block;
+  width: auto;
+  height: auto;
+  max-width: 100%;
+  max-height: 100%;
+  pointer-events: none;
+  user-select: none;
+}
+
+.board-preview__note {
+  color: var(--text-faint);
+  font-family: var(--font-hand);
+  font-size: 14px;
+  line-height: 1.2;
+  text-align: center;
 }
 
 .board-row__main {
@@ -342,6 +391,20 @@
   white-space: pre-wrap;
 }
 
+/* --- board not found ----------------------------------------------------------------- */
+
+.not-found .form-actions {
+  flex-wrap: wrap;
+}
+
+.not-found__id {
+  margin-top: 8px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
 /* --- phones ------------------------------------------------------------------------- */
 
 @media (max-width: 640px) {
@@ -351,6 +414,14 @@
 
   .board-list__title {
     font-size: 24px;
+  }
+
+  .board-list__tools {
+    flex: 1 1 100%;
+  }
+
+  .board-search {
+    flex: 1 1 100%;
   }
 
   .board-preview {

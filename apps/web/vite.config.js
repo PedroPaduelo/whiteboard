@@ -1,9 +1,10 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 
-// The web app is served from / by nginx and talks to the API on another origin.
-// In dev everything is same-origin through the proxy below, so relative URLs
-// ('/api') work in both environments.
+// One origin in every environment: the bundle calls the relative '/api' (and
+// '/api/ws'). In dev the proxy below forwards it to the API; in the container,
+// nginx.conf does the same. Only a split deployment (API on another host) sets
+// VITE_API_URL / VITE_WS_URL at build time — see .env.example.
 const API_TARGET = process.env.VITE_API_PROXY_TARGET || 'http://localhost:3001';
 
 export default defineConfig({

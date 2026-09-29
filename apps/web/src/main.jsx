@@ -25,10 +25,15 @@ import { getState as getBoardState, subscribe as subscribeBoard } from './store/
 import { ErrorBoundary } from './ui/ErrorBoundary.jsx';
 import { applyTheme } from './ui/theme.js';
 import { useUi } from './ui/uiStore.js';
+import { installModalClipboardGuard } from './ui/modal.js';
 import App from './App.jsx';
 
 // Before the first paint, so a dark-mode user never sees a white flash.
 applyTheme(useUi.getState().theme);
+
+// Before React mounts, so it runs ahead of every clipboard listener the board
+// installs: while a modal dialog is open, Ctrl+C/X/V never reach the board.
+installModalClipboardGuard(window);
 
 // Never rejects: a font that fails falls back to the system stack.
 loadFonts();

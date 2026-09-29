@@ -16,6 +16,9 @@
  *
  * A successful PATCH is fanned out to the board's websocket room as
  * `{type:'board', boardId, board}`, so a rename shows up in every open tab.
+ * A successful DELETE empties the room: every socket on the board gets the
+ * same `{type:'error', code:'BOARD_NOT_FOUND'}` a join to an unknown board
+ * gets, and is closed with 1008.
  */
 
 import { WS_MSG } from '@whiteboard/shared';
@@ -178,6 +181,28 @@ function notifyRoom(fastify, boardId, envelope) {
   }
 }
 
+/**
+ * Tell everyone still on a board that it is gone, and hang up on them. The
+ * same envelope and close code as joining an unknown board (ws/plugin.js), so
+ * the client needs no new case: BOARD_NOT_FOUND is already fatal there. Left
+ * alone, those tabs stayed 'connected' to nothing; an editor only found out
+ * when its next edit bounced, and a viewer never did. Best-effort, like
+ * notifyRoom: the delete is already committed.
+ */
+function evictRoom(fastify, boardId) {
+  const hub = fastify.hub;
+  if (!hub || typeof hub.closeRoom !== 'function') return;
+  try {
+    hub.closeRoom(boardId, {
+      envelope: { type: WS_MSG.ERROR, text: 'board deleted', code: 'BOARD_NOT_FOUND', boardId },
+      code: 1008,
+      reason: 'board deleted',
+    });
+  } catch {
+    // A socket that cannot be closed now is reaped by the sweeper later.
+  }
+}
+
 export default async function boardsRoutes(fastify, opts) {
   const opts_ = opts || {};
   const prefix = opts_.prefix || '';
@@ -336,6 +361,7 @@ export default async function boardsRoutes(fastify, opts) {
     if (!deleted) {
       return sendError(reply, 404, 'NOT_FOUND', `board ${id} not found`);
     }
+    evictRoom(fastify, id);
     return reply.send({ deleted: true });
   });
 }

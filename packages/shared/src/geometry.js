@@ -12,11 +12,15 @@
  *  - Board units: x grows right, y grows DOWN (screen convention, matching
  *    canvas and DOM). The board is infinite and may have negative coordinates.
  *  - `rotation` is in radians, clockwise on screen, about the element's box
- *    CENTRE. Elements store an axis-aligned, always-tight `x/y/w/h` even when
- *    rotated, so there is exactly one rectangular source of truth and paint,
- *    hit-testing, snapping and export can never disagree about the box.
+ *    CENTRE. `x/y/w/h` is the UNROTATED box: a rotated element is that box
+ *    turned about its centre, so the area it paints is the box's rotated
+ *    corners (see boxCorners / rotatePoint), whose axis-aligned bounds are
+ *    LARGER than `x/y/w/h`. Pen strokes and connectors derive `x/y/w/h` from
+ *    their points instead (see reboxPolyline).
  *  - Screen points are CSS pixels relative to the canvas element's top-left.
  */
+
+import { ZOOM_LIMITS, ZOOM_STEP } from './types.js';
 
 /** @typedef {{x: number, y: number}} Point */
 /** @typedef {{x: number, y: number, w: number, h: number}} Rect */
@@ -89,12 +93,12 @@ export function boardToScreen(a, b) {
  * @param {View} view
  * @param {Point} screenPt
  * @param {number} factor  Multiply zoom by this (e.g. 1.1 to zoom in).
- * @param {{min?:number, max?:number}} [limits]
+ * @param {{min?:number, max?:number}} [limits]  Default ZOOM_LIMITS.
  * @returns {View} a NEW view; never mutates the input.
  */
 export function zoomAt(view, screenPt, factor, limits = {}) {
-  const min = limits.min ?? 0.05;
-  const max = limits.max ?? 8;
+  const min = limits.min ?? ZOOM_LIMITS.min;
+  const max = limits.max ?? ZOOM_LIMITS.max;
   const zoom = clamp((view.zoom || 1) * factor, min, max);
   // The board point under the screen point must not move.
   const bx = (screenPt.x - view.panX) / (view.zoom || 1);
@@ -104,6 +108,27 @@ export function zoomAt(view, screenPt, factor, limits = {}) {
     panX: screenPt.x - bx * zoom,
     panY: screenPt.y - by * zoom,
   };
+}
+
+/**
+ * The zoom level one press of zoom in (`direction` > 0) or zoom out (< 0)
+ * goes to: `zoom` plus or minus ZOOM_STEP, clamped to the limits (default
+ * ZOOM_LIMITS). Additive like Excalidraw's buttons, so 100% -> 110% -> 120%
+ * and a wheel-zoomed 137% -> 147%. Rounded to 1e-6 so a run of steps never
+ * shows float noise (0.1 + 0.2). A zoom helper takes a factor, so a caller
+ * zooming about a point passes `stepZoom(z, dir) / z`.
+ *
+ * @param {number} zoom
+ * @param {number} direction  > 0 zooms in, < 0 zooms out, 0 keeps the level
+ * @param {{min?:number, max?:number}} [limits]
+ * @returns {number}
+ */
+export function stepZoom(zoom, direction, limits = {}) {
+  const min = limits.min ?? ZOOM_LIMITS.min;
+  const max = limits.max ?? ZOOM_LIMITS.max;
+  const z = Number.isFinite(zoom) && zoom > 0 ? zoom : 1;
+  const d = direction > 0 ? 1 : direction < 0 ? -1 : 0;
+  return clamp(Math.round((z + d * ZOOM_STEP) * 1e6) / 1e6, min, max);
 }
 
 /**
@@ -117,8 +142,8 @@ export function zoomAt(view, screenPt, factor, limits = {}) {
  */
 export function fitView(bounds, viewport) {
   const pad = viewport.padding ?? 48;
-  const min = viewport.min ?? 0.05;
-  const max = viewport.max ?? 8;
+  const min = viewport.min ?? ZOOM_LIMITS.min;
+  const max = viewport.max ?? ZOOM_LIMITS.max;
   const W = Math.max(1, viewport.width - pad * 2);
   const H = Math.max(1, viewport.height - pad * 2);
 
@@ -409,17 +434,132 @@ export function diamondPolygon(box) {
 /**
  * How far (board units) a bound connector end stops short of the shape's
  * outline, so the arrowhead never overlaps the stroke (Excalidraw leaves a
- * similar gap). `resolveConnectors` uses it for every bound end.
+ * similar gap), measured for the DEFAULT stroke width on both sides.
+ * `resolveConnectors` widens it for thicker strokes: see `bindGap`.
  */
 export const BIND_GAP = 4;
 
+/** The stroke width the renderer draws when an element has none. */
+const DEFAULT_STROKE_WIDTH = 2;
+
+/** Types whose outline is drawn with their own `strokeWidth`. */
+const OUTLINED_TYPES = new Set(['rect', 'ellipse', 'diamond', 'cylinder']);
+
+function strokeWidthOf(el) {
+  const w = el && el.strokeWidth;
+  return typeof w === 'number' && Number.isFinite(w) && w >= 0 ? w : DEFAULT_STROKE_WIDTH;
+}
+
+/**
+ * The gap a bound end keeps from `anchor`'s outline, for this `connector`.
+ *
+ * Both strokes are centred on their geometry, so each reaches half its width
+ * past it: a fixed 4 left 2 units of air between two default (2-wide)
+ * strokes, and NONE between two extra-bold (4-wide) ones — the arrowhead sat
+ * on the outline. Every unit of stroke beyond the default widens the gap by
+ * half a unit per side, so the VISIBLE gap stays what it is at the default.
+ * Default strokes (or none given) give exactly BIND_GAP. An anchor with no
+ * drawn outline (text, image, sticky) adds nothing for its own stroke.
+ *
+ * @param {Object} anchor     the element the end is bound to
+ * @param {Object} [connector] the arrow/line
+ * @returns {number} board units, >= 0
+ */
+export function bindGap(anchor, connector) {
+  const own = anchor && OUTLINED_TYPES.has(anchor.type) ? strokeWidthOf(anchor) : DEFAULT_STROKE_WIDTH;
+  const line = strokeWidthOf(connector);
+  return Math.max(0, BIND_GAP + (own - DEFAULT_STROKE_WIDTH) / 2 + (line - DEFAULT_STROKE_WIDTH) / 2);
+}
+
+/**
+ * Corner radius of a round rect, and of each rounded vertex of a round
+ * diamond, for a side of `size` units: 25% of it, at most 32. The renderer
+ * (apps/web render/shape.js `cornerRadius`) draws exactly this, and a bound
+ * end must stop at the curve it draws, not at the sharp corner it cut off.
+ */
+export function cornerRadius(size) {
+  return Math.min(Math.max(0, size) * 0.25, 32);
+}
+
 /** Which outline an element presents to a connector. Anything unknown (and a
- *  bare `{x,y,w,h}` box) is a box. */
+ *  bare `{x,y,w,h}` box) is a box. `roundness: 'round'` rounds a rect's
+ *  corners and a diamond's vertices, exactly as they are drawn. */
 function outlineKind(el) {
   const t = el && el.type;
+  const round = el && el.roundness === 'round';
   if (t === 'ellipse') return 'ellipse';
-  if (t === 'diamond') return 'diamond';
+  if (t === 'diamond') return round ? 'round-diamond' : 'diamond';
+  if (t === 'rect' && round) return 'round-box';
   return 'box';
+}
+
+/** Samples per rounded corner when a rounded outline is turned into a polygon. */
+const CORNER_STEPS = 16;
+
+/**
+ * A rounded outline as a polygon about the centre (unrotated frame), traced
+ * like the renderer's paths: a round rect has quadratic corners from
+ * (r, 0) through the sharp corner to (0, r) (render/shape.js roundRectPath);
+ * a round diamond cuts each vertex at (±vr, ±hr) with a cubic whose two
+ * control points both sit on the vertex (roundDiamondPath).
+ */
+function roundedOutline(kind, hx, hy) {
+  const pts = [];
+  const quad = (p0, c, p2) => {
+    for (let i = 0; i <= CORNER_STEPS; i++) {
+      const t = i / CORNER_STEPS;
+      const a = (1 - t) * (1 - t);
+      const b = 2 * (1 - t) * t;
+      const d = t * t;
+      pts.push({ x: a * p0.x + b * c.x + d * p2.x, y: a * p0.y + b * c.y + d * p2.y });
+    }
+  };
+  const cubicAtVertex = (p0, v, p3) => {
+    for (let i = 0; i <= CORNER_STEPS; i++) {
+      const t = i / CORNER_STEPS;
+      const a = (1 - t) ** 3;
+      const b = 3 * (1 - t) * (1 - t) * t + 3 * (1 - t) * t * t;
+      const d = t ** 3;
+      pts.push({ x: a * p0.x + b * v.x + d * p3.x, y: a * p0.y + b * v.y + d * p3.y });
+    }
+  };
+  if (kind === 'round-box') {
+    const r = cornerRadius(Math.min(2 * hx, 2 * hy));
+    quad({ x: hx - r, y: -hy }, { x: hx, y: -hy }, { x: hx, y: -hy + r });
+    quad({ x: hx, y: hy - r }, { x: hx, y: hy }, { x: hx - r, y: hy });
+    quad({ x: -hx + r, y: hy }, { x: -hx, y: hy }, { x: -hx, y: hy - r });
+    quad({ x: -hx, y: -hy + r }, { x: -hx, y: -hy }, { x: -hx + r, y: -hy });
+  } else {
+    const vr = cornerRadius(hx);
+    const hr = cornerRadius(hy);
+    cubicAtVertex({ x: hx - vr, y: -hr }, { x: hx, y: 0 }, { x: hx - vr, y: hr }); // right
+    cubicAtVertex({ x: vr, y: hy - hr }, { x: 0, y: hy }, { x: -vr, y: hy - hr }); // bottom
+    cubicAtVertex({ x: -hx + vr, y: hr }, { x: -hx, y: 0 }, { x: -hx + vr, y: -hr }); // left
+    cubicAtVertex({ x: -vr, y: -hy + hr }, { x: 0, y: -hy }, { x: vr, y: -hy + hr }); // top
+  }
+  return pts;
+}
+
+/**
+ * Where the ray from the centre along (dx, dy) leaves a closed polygon given
+ * about that centre, as a multiple of (dx, dy). The outlines here are
+ * star-shaped about their centre, so the ray crosses them once; the farthest
+ * crossing is taken to be safe at a vertex. 0 when nothing is crossed.
+ */
+function rayPolygonScale(poly, dx, dy) {
+  let best = 0;
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i];
+    const b = poly[(i + 1) % poly.length];
+    const ex = b.x - a.x;
+    const ey = b.y - a.y;
+    const denom = dx * ey - dy * ex;
+    if (Math.abs(denom) < EPS) continue;
+    const t = (a.x * ey - a.y * ex) / denom;
+    const u = (a.x * dy - a.y * dx) / denom;
+    if (u >= -EPS && u <= 1 + EPS && t > best) best = t;
+  }
+  return best;
 }
 
 /**
@@ -438,6 +578,10 @@ function outlineScale(kind, hx, hy, dx, dy) {
   // A flat or thin element degenerates to its box, which handles one zero
   // half-extent (it is the segment itself) without dividing by zero.
   if (kind !== 'box' && (hx <= EPS || hy <= EPS)) kind = 'box';
+  if (kind === 'round-box' || kind === 'round-diamond') {
+    const t = rayPolygonScale(roundedOutline(kind, hx, hy), dx, dy);
+    return Number.isFinite(t) ? t : 0;
+  }
   if (kind === 'ellipse') {
     const q = (dx / hx) ** 2 + (dy / hy) ** 2;
     return q > 0 ? 1 / Math.sqrt(q) : 0;
@@ -457,16 +601,19 @@ function outlineScale(kind, hx, hy, dx, dy) {
  * the ray from its centre toward `toward`, pushed `gap` units further out
  * along that ray.
  *
- * The outline follows the shape — rect/sticky/text/image/cylinder use the box,
- * `ellipse` the ellipse, `diamond` the rhombus — and the element's `rotation`
+ * The outline follows the shape as it is DRAWN — rect/sticky/text/image/
+ * cylinder use the box, `ellipse` the ellipse, `diamond` the rhombus, and a
+ * `roundness: 'round'` rect or diamond its rounded corners (see
+ * cornerRadius) — and the element's `rotation`
  * (radians, clockwise, about the box centre): `toward` is rotated into the
  * element's unrotated frame, intersected there, and the result is rotated
  * back out. A bare `{x,y,w,h}` is treated as an unrotated box, which is what
  * callers written before this was shape-aware pass.
  *
- * We pick the intersection toward the other end rather than a fixed anchor
- * because it is stable as the other end moves and never runs through a corner
- * the way a fixed port does.
+ * Aiming toward the other end (rather than at a fixed port) is what an end
+ * does when the user did not drop it on a particular spot of the outline;
+ * one that was dropped there is pinned instead (see bindingFixedPoint and
+ * resolveConnectors).
  *
  * @param {{x:number,y:number,w:number,h:number,type?:string,rotation?:number}} el
  * @param {Point} toward  The point the connector comes from.
@@ -480,13 +627,22 @@ export function connectorEndpoint(el, toward, gap = 0) {
   const rotation = Number.isFinite(el.rotation) ? el.rotation : 0;
   // Into the unrotated frame: rotatePoint un-rotates by `rotation`.
   const local = rotation ? rotatePoint(toward, el, rotation) : toward;
-  const dx = local.x - cx;
-  const dy = local.y - cy;
-  const len = Math.hypot(dx, dy);
   // No direction (the other end sits on the centre): the centre is the only
   // honest answer, and it is stable.
-  if (!(len > EPS)) return { x: cx, y: cy };
+  return endpointAlong(el, local.x - cx, local.y - cy, gap) ?? { x: cx, y: cy };
+}
 
+/**
+ * The outline point of `el` along the direction (dx, dy) from its centre,
+ * given in the element's UNROTATED frame, pushed `gap` units further out and
+ * rotated back into board space. Null when there is no direction.
+ */
+function endpointAlong(el, dx, dy, gap) {
+  const len = Math.hypot(dx, dy);
+  if (!(len > EPS)) return null;
+  const cx = el.x + el.w / 2;
+  const cy = el.y + el.h / 2;
+  const rotation = Number.isFinite(el.rotation) ? el.rotation : 0;
   const t = outlineScale(outlineKind(el), el.w / 2, el.h / 2, dx, dy);
   const g = Number.isFinite(gap) && gap > 0 ? gap / len : 0;
   const k = t + g;
@@ -502,6 +658,197 @@ export function connectorEndpoint(el, toward, gap = 0) {
     y = cy + ox * s + oy * c;
   }
   return { x, y };
+}
+
+/**
+ * How far from the centre (as a fraction of the way to the outline) a drop
+ * must land for `bindingFixedPoint` to pin the end there. Closer in than
+ * this, the user pointed at the shape as a whole rather than at a spot on its
+ * outline, and the end keeps aiming (see resolveConnectors).
+ */
+export const FIXED_POINT_MIN_RATIO = 0.5;
+
+/** A usable fixed point: `{x, y}` with both finite. */
+function isFixedPoint(v) {
+  return !!v && typeof v === 'object' && Number.isFinite(v.x) && Number.isFinite(v.y);
+}
+
+/** Samples of an ellipse outline when it is treated as a polygon. */
+const ELLIPSE_STEPS = 128;
+
+/**
+ * An element's outline as a closed polygon about its centre, in its
+ * unrotated frame (the same outlines connectorEndpoint intersects).
+ */
+function outlinePolygon(kind, hx, hy) {
+  if (kind !== 'box' && (hx <= EPS || hy <= EPS)) kind = 'box';
+  if (kind === 'round-box' || kind === 'round-diamond') return roundedOutline(kind, hx, hy);
+  if (kind === 'diamond') return [{ x: 0, y: -hy }, { x: hx, y: 0 }, { x: 0, y: hy }, { x: -hx, y: 0 }];
+  if (kind === 'ellipse') {
+    const pts = [];
+    for (let i = 0; i < ELLIPSE_STEPS; i++) {
+      const a = (i / ELLIPSE_STEPS) * Math.PI * 2;
+      pts.push({ x: hx * Math.cos(a), y: hy * Math.sin(a) });
+    }
+    return pts;
+  }
+  return [{ x: -hx, y: -hy }, { x: hx, y: -hy }, { x: hx, y: hy }, { x: -hx, y: hy }];
+}
+
+/** The point of a closed polygon's boundary nearest to `p`. */
+function nearestOnPolygon(poly, p) {
+  let best = poly[0];
+  let bestD = Infinity;
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i];
+    const b = poly[(i + 1) % poly.length];
+    const ex = b.x - a.x;
+    const ey = b.y - a.y;
+    const len2 = ex * ex + ey * ey;
+    const u = len2 > EPS ? clamp(((p.x - a.x) * ex + (p.y - a.y) * ey) / len2, 0, 1) : 0;
+    const q = { x: a.x + ex * u, y: a.y + ey * u };
+    const d = (q.x - p.x) ** 2 + (q.y - p.y) ** 2;
+    if (d < bestD) {
+      bestD = d;
+      best = q;
+    }
+  }
+  return best;
+}
+
+/**
+ * The fixed point to store for a connector end dropped at `point` on the
+ * element `el` (its `startFixedPoint` / `endFixedPoint`), or null when the
+ * end should not be pinned.
+ *
+ * The result is the point of `el`'s outline NEAREST to the drop, as
+ * fractions of the element's UNROTATED box: `{x: 0, y: 0}` is its top-left
+ * corner, `{x: 1, y: 1}` its bottom-right, so `{x: 0.5, y: 0}` is the middle
+ * of the top edge. Being relative to the box, it rides along when the shape
+ * moves, rotates or is resized, which is what lets a straight arrow stay on
+ * the side it was dropped on (Excalidraw's `fixedPoint`). Rounded to 1e-4 to
+ * keep the stored value short.
+ *
+ * Null when the drop is closer to the centre than FIXED_POINT_MIN_RATIO of
+ * the way to the outline (`opts.minRatio`; the user pointed at the shape, not
+ * at a spot on it), or when `el` has no area.
+ *
+ * @param {{x:number,y:number,w:number,h:number,type?:string,rotation?:number,roundness?:string}} el
+ * @param {Point} point  where the end was dropped, board units
+ * @param {{minRatio?: number}} [opts]
+ * @returns {{x:number,y:number}|null}
+ */
+export function bindingFixedPoint(el, point, opts = {}) {
+  if (!el || !isFixedPoint(point)) return null;
+  const { x, y, w, h } = el;
+  if (![x, y, w, h].every(Number.isFinite) || !(w > EPS) || !(h > EPS)) return null;
+  const cx = x + w / 2;
+  const cy = y + h / 2;
+  const rotation = Number.isFinite(el.rotation) ? el.rotation : 0;
+  const local = rotation ? rotatePoint(point, el, rotation) : point;
+  const dx = local.x - cx;
+  const dy = local.y - cy;
+  if (!(Math.hypot(dx, dy) > EPS)) return null;
+  const kind = outlineKind(el);
+  const t = outlineScale(kind, w / 2, h / 2, dx, dy);
+  if (!(t > 0)) return null;
+  const minRatio = Number.isFinite(opts.minRatio) ? opts.minRatio : FIXED_POINT_MIN_RATIO;
+  if (1 / t < minRatio) return null;
+  const q = nearestOnPolygon(outlinePolygon(kind, w / 2, h / 2), { x: dx, y: dy });
+  const round = (v) => Math.round(clamp(v, 0, 1) * 1e4) / 1e4;
+  return { x: round(q.x / w + 0.5), y: round(q.y / h + 0.5) };
+}
+
+/** Half-angle (radians) of the chord a rounded outline's normal is taken from. */
+const NORMAL_DELTA = 1e-4;
+
+/**
+ * The outward unit normal of an outline at its point (ox, oy), which lies on
+ * the ray from the centre along (dx, dy) (unrotated frame, about the centre).
+ * Exact for the box (the diagonal at a corner), the rhombus and the ellipse;
+ * a rounded outline takes it from the chord between its points a hair either
+ * side of the ray.
+ */
+function outlineNormal(kind, hx, hy, ox, oy, dx, dy) {
+  if (kind !== 'box' && (hx <= EPS || hy <= EPS)) kind = 'box';
+  const sgn = (v) => (v > 0 ? 1 : v < 0 ? -1 : 0);
+  let nx;
+  let ny;
+  if (kind === 'box') {
+    const sx = Math.abs(dx) < EPS ? Infinity : hx / Math.abs(dx);
+    const sy = Math.abs(dy) < EPS ? Infinity : hy / Math.abs(dy);
+    if (Math.abs(sx - sy) <= 1e-9 * Math.max(sx, sy)) {
+      nx = sgn(dx);
+      ny = sgn(dy);
+    } else if (sx < sy) {
+      nx = sgn(dx);
+      ny = 0;
+    } else {
+      nx = 0;
+      ny = sgn(dy);
+    }
+  } else if (kind === 'diamond') {
+    nx = sgn(ox) / hx;
+    ny = sgn(oy) / hy;
+  } else if (kind === 'ellipse') {
+    nx = ox / (hx * hx);
+    ny = oy / (hy * hy);
+  } else {
+    const at = (a) => {
+      const k = outlineScale(kind, hx, hy, Math.cos(a), Math.sin(a));
+      return { x: Math.cos(a) * k, y: Math.sin(a) * k };
+    };
+    const theta = Math.atan2(dy, dx);
+    const p1 = at(theta - NORMAL_DELTA);
+    const p2 = at(theta + NORMAL_DELTA);
+    nx = p2.y - p1.y;
+    ny = p1.x - p2.x;
+    if (nx * dx + ny * dy < 0) {
+      nx = -nx;
+      ny = -ny;
+    }
+  }
+  const len = Math.hypot(nx, ny);
+  if (!(len > EPS)) {
+    // No usable normal: fall back to the ray itself.
+    const l = Math.hypot(dx, dy);
+    return { x: dx / l, y: dy / l };
+  }
+  return { x: nx / len, y: ny / len };
+}
+
+/**
+ * Where an end pinned at `fixed` (a bindingFixedPoint) lands on `el`: the
+ * outline point on the ray from the centre through the fixed point, `gap`
+ * units out along the outline's outward NORMAL there — so the arrowhead
+ * keeps the same clearance from the stroke wherever on the outline it is
+ * pinned (along the ray, a spot near the corner of a wide box would get only
+ * a fraction of it). A pure function of the anchor and the pin. Null when
+ * there is no pin, or it sits on the centre.
+ */
+function pinnedEndpoint(el, fixed, gap) {
+  if (!isFixedPoint(fixed)) return null;
+  const dx = (fixed.x - 0.5) * el.w;
+  const dy = (fixed.y - 0.5) * el.h;
+  if (!(Math.hypot(dx, dy) > EPS)) return null;
+  const kind = outlineKind(el);
+  const hx = el.w / 2;
+  const hy = el.h / 2;
+  const t = outlineScale(kind, hx, hy, dx, dy);
+  let ox = dx * t;
+  let oy = dy * t;
+  if (Number.isFinite(gap) && gap > 0) {
+    const n = outlineNormal(kind, hx, hy, ox, oy, dx, dy);
+    ox += n.x * gap;
+    oy += n.y * gap;
+  }
+  const cx = el.x + hx;
+  const cy = el.y + hy;
+  const rotation = Number.isFinite(el.rotation) ? el.rotation : 0;
+  if (!rotation) return { x: cx + ox, y: cy + oy };
+  const c = Math.cos(rotation);
+  const s = Math.sin(rotation);
+  return { x: cx + ox * c - oy * s, y: cy + ox * s + oy * c };
 }
 
 /** Centre of a box — the direction an attached connector points from. */
@@ -532,24 +879,33 @@ function anchorOf(byId, id) {
  * points of a multi-point connector are exactly where the user put them, and so
  * is an unbound end.
  *
- * A bound end aims at:
- *  - 2 points, BOTH ends bound: the centre of the OTHER anchor;
+ * A bound end with a fixed point (`startFixedPoint` / `endFixedPoint`, see
+ * bindingFixedPoint) is PINNED: it lands where the ray from its anchor's
+ * centre through that point meets the outline — the spot the user dropped it
+ * on, riding along as the shape moves, rotates or resizes — `bindGap` out
+ * along the outline's normal there. Any other bound end aims at:
+ *  - 2 points, BOTH ends bound: where the other end is pinned, or else the
+ *    centre of the OTHER anchor;
  *  - otherwise: its adjacent point (`points[1]` for the start, `points[n-2]`
  *    for the end) — the direction the user drew the connector in.
- * and lands BIND_GAP outside the anchor's outline (see connectorEndpoint).
+ * and lands `bindGap(anchor, connector)` outside the anchor's outline (see
+ * connectorEndpoint): BIND_GAP for default strokes, more for thicker ones.
+ * A fixed point without its `startId`/`endId` is inert (kept, not applied).
  *
  * IDEMPOTENT, and that is not a nicety: the server runs this on every batch
  * and persists the result, and peers run it again on what they receive. Every
- * aim point above is something this function never moves (an anchor centre,
- * an interior point, or an unbound end), so one pass is a pure function of the
- * anchors and the fixed points and a second pass is a no-op. Aiming an end at
- * the other end's RESOLVED position would make the two chase each other and
- * creep across the board a little on every save.
+ * aim point above is something this function never moves or derives from the
+ * connector's own ends (a pinned end, an anchor centre, an interior point, or
+ * an unbound end), so one pass is a pure function of the anchors, the pins
+ * and the fixed points, and a second pass is a no-op. Aiming an end at the
+ * other end's RESOLVED position (unless that end is pinned) would make the
+ * two chase each other and creep across the board a little on every save.
  *
  * A two-point connector bound at both ends to the SAME element has no stable
- * aim (each end would aim at the other's moving position, or both at the
- * centre and collapse), so it is left exactly as stored. A binding to another
- * connector, or to an id that is not in the list, is ignored.
+ * aim for an unpinned end (it would aim at the other's moving position, or
+ * both at the centre and collapse), so an unpinned end there is left exactly
+ * as stored. A binding to another connector, or to an id that is not in the
+ * list, is ignored.
  *
  * @param {Object[]} elements
  * @returns {Object[]} a NEW array; elements that do not change keep identity
@@ -581,15 +937,27 @@ export function resolveConnectors(elements) {
     let s = start;
     let e = end;
 
+    // Pinned ends first: each is a function of its own anchor alone.
+    const startPin = startTarget ? pinnedEndpoint(startTarget, el.startFixedPoint, bindGap(startTarget, el)) : null;
+    const endPin = endTarget ? pinnedEndpoint(endTarget, el.endFixedPoint, bindGap(endTarget, el)) : null;
+
     if (n === 2 && startTarget && endTarget) {
-      if (startTarget === endTarget) return el; // self-loop: no stable aim, see above
-      s = connectorEndpoint(startTarget, centreOf(endTarget), BIND_GAP);
-      e = connectorEndpoint(endTarget, centreOf(startTarget), BIND_GAP);
+      if (startTarget === endTarget) {
+        // Self-loop: only a pinned end has a stable aim, see above.
+        if (!startPin && !endPin) return el;
+        s = startPin ?? start;
+        e = endPin ?? end;
+      } else {
+        // An unpinned end aims at where the other end is pinned, or else at
+        // the other anchor's centre.
+        s = startPin ?? connectorEndpoint(startTarget, endPin ?? centreOf(endTarget), bindGap(startTarget, el));
+        e = endPin ?? connectorEndpoint(endTarget, startPin ?? centreOf(startTarget), bindGap(endTarget, el));
+      }
     } else {
       // n === 2 with one end bound aims at the other (free, unmoved) end;
       // n > 2 aims at the interior neighbour, which binding never moves.
-      if (startTarget) s = connectorEndpoint(startTarget, pts[1], BIND_GAP);
-      if (endTarget) e = connectorEndpoint(endTarget, pts[n - 2], BIND_GAP);
+      if (startTarget) s = startPin ?? connectorEndpoint(startTarget, pts[1], bindGap(startTarget, el));
+      if (endTarget) e = endPin ?? connectorEndpoint(endTarget, pts[n - 2], bindGap(endTarget, el));
     }
 
     if (s.x === start.x && s.y === start.y && e.x === end.x && e.y === end.y) return el;
@@ -899,27 +1267,23 @@ export function scaleAbout(p, anchor, f) {
 }
 
 /* ------------------------------------------------------------------ *
- * Compatibility layer
+ * Small helpers
  *
- * Two agents wrote geometry independently during the parallel build and
- * disagreed on ARGUMENT ORDER for the view transforms: the documented form
- * here is `screenToBoard(view, point)`, while the web side adopted
- * `screenToBoard(point, view)`. Both are in use, and rewriting call sites
- * across five in-flight agents costs far more than accepting both, so the
- * canonical transform detects the order it was handed. A view carries
- * zoom/pan; a bare point carries only x/y — the test is unambiguous.
- *
- * The rest of this block is the surface the store and the interaction reducer
- * were written against before the two geometries were reconciled.
+ * `screenToBoard` / `boardToScreen` (top of this file) take their two
+ * arguments in either order, `(view, point)` or `(point, view)`, telling them
+ * apart with `isView`: a view carries zoom/pan, a bare point only x/y, so the
+ * test is unambiguous. The web editor itself converts with its own
+ * `screenToBoardPoint(p, view)` (editor/actions.js); these are for tests and
+ * scripts. The web store clamps every zoom with `clampZoom` below.
  * ------------------------------------------------------------------ */
 
 /** A view carries zoom/pan; a bare point carries only x/y. */
 const isView = (v) => v != null && typeof v === 'object' && ('zoom' in v || 'panX' in v || 'panY' in v);
 
-/** Clamp a zoom level into range: `clampZoom(z)` or `clampZoom(z, min, max)`. */
+/** Clamp a zoom level into range: `clampZoom(z)` (ZOOM_LIMITS) or `clampZoom(z, min, max)`. */
 export function clampZoom(z, min, max) {
   if (!Number.isFinite(z) || z <= 0) return 1;
-  return clamp(z, min ?? 0.05, max ?? 8);
+  return clamp(z, min ?? ZOOM_LIMITS.min, max ?? ZOOM_LIMITS.max);
 }
 
 /** Centre of a rect. */
@@ -927,7 +1291,7 @@ export function rectCenter(r) {
   return { x: r.x + r.w / 2, y: r.y + r.h / 2 };
 }
 
-/** Centre of a rect, as a point — the name the canvas agent reaches for. */
+/** Alias of rectCenter. */
 export function rectCenterPoint(r) {
   return rectCenter(r);
 }
@@ -956,6 +1320,8 @@ export function snapPoint(p, step) {
  * Drop `startId`/`endId` pointing at elements no longer in the list. A
  * connector whose anchor was deleted can otherwise never be repositioned
  * again, because every resolve pass looks up an id that does not exist.
+ * A `startFixedPoint`/`endFixedPoint` stays: without its id it is inert, and
+ * the clients' own twins of this helper leave it too.
  * @param {Object[]} elements
  * @returns {Object[]} the same array, mutated in place
  */
@@ -973,7 +1339,7 @@ export function detachMissingConnectors(elements) {
 /**
  * Fit a list of boxes into a viewport, padded and centred:
  * `fitViewCompat(boxes, vw, vh, pad)`, or `fitViewCompat(bounds, vw, vh, pad)`
- * for a single box. This is the array form the store's `fitToContent` uses.
+ * for a single box: fitView over the union of the boxes.
  */
 export function fitViewCompat(boxes, vw, vh, pad) {
   const list = Array.isArray(boxes) ? boxes : boxes ? [boxes] : [];

@@ -15,7 +15,24 @@ COPY apps/api/package.json ./apps/api/
 RUN npm ci --no-audit --no-fund
 
 COPY packages/shared ./packages/shared
-COPY apps/web ./apps/web
+# Only the build inputs, never the whole apps/web directory: a developer's
+# untracked apps/web/.env.local (the README has them create one, often with
+# VITE_API_URL=http://localhost:3001/api) would otherwise ride along, and
+# `vite build` loads .env.local in production mode too, baking their localhost
+# into the image. Their dist/ and node_modules/ stay out as well.
+COPY apps/web/index.html apps/web/vite.config.js ./apps/web/
+COPY apps/web/public ./apps/web/public
+COPY apps/web/src ./apps/web/src
+
+# Vite inlines VITE_* at BUILD time, so they must reach `vite build` as build
+# args (docker-compose.yml passes them). Unset/empty means the defaults: the
+# same-origin '/api' and '/api/ws' that nginx.conf proxies to the API. Set them
+# only for a split deployment (API on another host), e.g.
+#   docker build --build-arg VITE_API_URL=https://api.example.com/api ...
+ARG VITE_API_URL=
+ARG VITE_WS_URL=
+ENV VITE_API_URL=${VITE_API_URL} \
+    VITE_WS_URL=${VITE_WS_URL}
 
 RUN npm run build -w @whiteboard/web
 

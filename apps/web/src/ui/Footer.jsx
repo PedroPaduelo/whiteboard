@@ -1,12 +1,13 @@
 /**
- * Footer.jsx — bottom-left zoom (− NN% +) and undo/redo islands, and the
- * bottom-right help button, as in Excalidraw. The percentage resets to 100%
- * about the viewport centre (not a jump back to the board origin).
+ * Footer.jsx — bottom-left zoom (− NN% +) and undo/redo islands, the
+ * bottom-right help button, and the bottom-centre "Voltar ao conteúdo" pill,
+ * as in Excalidraw. The percentage resets to 100% about the viewport centre
+ * (not a jump back to the board origin).
  */
 
 import React from 'react';
-import { actions } from '../editor/actions.js';
-import { useActions, useCanRedo, useCanUndo, useView } from '../store/index.js';
+import { actions, anyElementVisible, viewportSize } from '../editor/actions.js';
+import { useActions, useBoardStore, useCanRedo, useCanUndo, useView } from '../store/index.js';
 import { useUi } from './uiStore.js';
 import { IconButton, Island } from './common.jsx';
 import { IconHelp, IconRedo, IconUndo, IconZoomIn, IconZoomOut } from './Icons.jsx';
@@ -61,6 +62,30 @@ export function Footer() {
       <ZoomControls />
       <UndoRedo />
     </div>
+  );
+}
+
+/** Content exists but none of it is on screen (a primitive, so renders stay rare). */
+const contentOffscreen = (s) => s.elements.length > 0 && !anyElementVisible(s.elements, s.view, viewportSize(s));
+
+/**
+ * Excalidraw's "Scroll back to content": shown while the board has elements
+ * and none is in view — a board opened far from its content, or panned away
+ * from it, otherwise looked empty with nothing pointing the way back.
+ */
+export function ScrollBackButton() {
+  const offscreen = useBoardStore(contentOffscreen);
+  if (!offscreen) return null;
+  return (
+    <button
+      type="button"
+      className="scroll-back island"
+      data-testid="scroll-back"
+      onMouseDown={(e) => e.preventDefault()}
+      onClick={() => actions.scrollToContent()}
+    >
+      {t.footer.scrollBack}
+    </button>
   );
 }
 

@@ -8,6 +8,10 @@
  *   - drag with a mouse/pen: native pointer events, a ghost follows the
  *     pointer and the release point on the board is the drop point. No
  *     dnd library — dropping anywhere that is not the canvas cancels.
+ * After a placement the keyboard goes back to the board (Excalidraw), so
+ * Delete, the arrows, Ctrl+D and Ctrl+Z act on what was just placed. On a
+ * phone, where the panel is a sheet over the board, a placement also closes
+ * it, so the placed item is seen.
  */
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -42,9 +46,39 @@ function canvasUnder(clientX, clientY) {
   return canvas;
 }
 
+/**
+ * Give the keyboard back to the board: blur whatever inside the library
+ * holds focus. The search field is focused when the panel opens, and the
+ * items keep it there on click (they prevent mousedown focus) — so after a
+ * placement every key went to the empty search box, which the shortcut map
+ * rightly treats as typing: Delete, arrows, Ctrl+D/Z/V did nothing.
+ */
+function releaseLibraryFocus() {
+  const active = typeof document !== 'undefined' ? document.activeElement : null;
+  if (active && typeof active.blur === 'function' && active.closest?.('[data-testid="library-panel"]')) active.blur();
+}
+
+/**
+ * The phone layout, where the library is a sheet over nearly the whole board
+ * (editor.css, `@media (max-width: 640px)`) — keep the two in step.
+ */
+const SHEET_LAYOUT = '(max-width: 640px)';
+
+function isSheetLayout() {
+  return Boolean(globalThis.matchMedia?.(SHEET_LAYOUT).matches);
+}
+
 function place(preset, at) {
   const els = buildPreset(preset, at, useBoardStore.getState().style);
-  actions.insertElements(els, `library-${preset.id}`);
+  const placed = actions.insertElements(els, `library-${preset.id}`);
+  if (!placed.length) return;
+  releaseLibraryFocus();
+  // On a phone the item lands at the viewport centre, which the sheet
+  // covers: it looked like nothing happened (and a second tap stacked a
+  // hidden duplicate). Close it, as Excalidraw closes an undocked library
+  // after an insert, so what was placed shows, selected. The desktop
+  // sidebar leaves the centre clear and stays open for the next item.
+  if (isSheetLayout()) useUi.getState().close('libraryOpen');
 }
 
 function LibraryItem({ preset, svg }) {
@@ -55,19 +89,24 @@ function LibraryItem({ preset, svg }) {
   const onPointerDown = (e) => {
     if (e.button !== 0) return;
     suppressClick.current = false;
-    drag.current = { x: e.clientX, y: e.clientY, pointerId: e.pointerId, dragging: false, touch: e.pointerType === 'touch' };
-  };
-  const onPointerMove = (e) => {
-    const d = drag.current;
-    if (!d || d.touch || d.pointerId !== e.pointerId) return;
-    if (!d.dragging && Math.hypot(e.clientX - d.x, e.clientY - d.y) > DRAG_THRESHOLD * 2) {
-      d.dragging = true;
+    const touch = e.pointerType === 'touch';
+    drag.current = { x: e.clientX, y: e.clientY, pointerId: e.pointerId, dragging: false, touch };
+    // Captured right away (mouse/pen): a quick flick whose first move event
+    // is already outside the item must still become a drag — capturing only
+    // once the threshold was crossed OVER the item lost those. A plain click
+    // still clicks (pointerup lands on the item either way).
+    if (!touch) {
       try {
         e.currentTarget.setPointerCapture(e.pointerId);
       } catch {
         /* pointer gone */
       }
     }
+  };
+  const onPointerMove = (e) => {
+    const d = drag.current;
+    if (!d || d.touch || d.pointerId !== e.pointerId) return;
+    if (!d.dragging && Math.hypot(e.clientX - d.x, e.clientY - d.y) > DRAG_THRESHOLD * 2) d.dragging = true;
     if (d.dragging) setGhost({ x: e.clientX, y: e.clientY });
   };
   const finish = (e, cancelled) => {

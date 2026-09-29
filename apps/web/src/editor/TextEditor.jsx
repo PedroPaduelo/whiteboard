@@ -11,24 +11,33 @@
  * the dark-mode filter — so the words do not jump when editing starts or ends.
  * The renderer skips painting the edited element's text (`editingId`).
  *
- * Keys (Excalidraw): Enter inserts a newline; Escape, Ctrl/⌘+Enter or
- * leaving the field all COMMIT. Every key is stopped here so the global
- * shortcuts (Delete, tool letters…) never fire while typing.
+ * Keys (Excalidraw): editing an existing text or label starts with all of it
+ * selected, so typing replaces it; Enter inserts a newline; Escape,
+ * Ctrl/⌘+Enter or leaving the field all COMMIT. Every key is stopped here so
+ * the global shortcuts (Delete, tool letters…) never fire while typing.
  *
- * The parent can force a commit through the ref (`ref.current.commit()`):
+ * The parent can force a commit through the ref (`ref.current.commit(opts)`):
  * Canvas does this when the user clicks the canvas, so that click both ends
- * the edit and does what it would normally do. Commit runs at most once.
+ * the edit and does what it would normally do, and when the edit is closed
+ * from outside (a tool picked in the tool island — those buttons keep focus
+ * in the textarea, so it never blurs). `opts` reaches `onCommit` as its
+ * second argument. Commit runs at most once.
+ *
+ * `onChange(value)` reports every edit of the value, so a container can grow
+ * to fit its label while it is typed.
  */
 
 import { forwardRef, useCallback, useImperativeHandle, useLayoutEffect, useRef, useState } from 'react';
 import { LIMITS } from '@whiteboard/shared';
-import { DARK_MODE_FILTER, FONT_SIZES, LINE_HEIGHT } from './constants.js';
+import { DARK_MODE_FILTER, FONT_FAMILIES, FONT_SIZES, LINE_HEIGHT } from './constants.js';
 import { fitTextElement, fontString, labelBox, lineHeightPx, textColorOf, textOf, wrapText } from './text.js';
 
 /**
  * Screen geometry of the editor for `element` showing `value`.
  * @returns {{left:number, top:number, width:number, height:number, originX:number, originY:number,
- *   rotation:number, font:string, align:string, wrap:boolean}}
+ *   rotation:number, font:string, fontSize:number, fontFamily:string, align:string, wrap:boolean}}
+ *   `font` is the canvas font string; `fontSize` (screen px) and `fontFamily`
+ *   (CSS stack) are the same font for the textarea's style.
  */
 export function editorGeometry(element, value, view) {
   const zoom = view?.zoom || 1;
@@ -71,6 +80,8 @@ export function editorGeometry(element, value, view) {
     originY: (centre.y - box.y) * zoom,
     rotation: element.rotation || 0,
     font: fontString(fontFamily, fontSize * zoom),
+    fontSize: fontSize * zoom,
+    fontFamily: FONT_FAMILIES[fontFamily] ?? FONT_FAMILIES.hand,
     align,
     wrap,
   };
@@ -82,23 +93,30 @@ export function editorGeometry(element, value, view) {
  * @param {boolean} [props.isNew]
  * @param {{zoom,panX,panY}} props.view
  * @param {'light'|'dark'} [props.theme]
- * @param {(text: string) => void} props.onCommit
+ * @param {(text: string, opts?: {external?: boolean}) => void} props.onCommit
  * @param {() => void} [props.onCancel]
+ * @param {(text: string) => void} [props.onChange]
  */
-function TextEditor({ element, isNew = false, view, theme = 'light', onCommit, onCancel }, ref) {
+function TextEditor({ element, isNew = false, view, theme = 'light', onCommit, onCancel, onChange }, ref) {
   const [value, setValue] = useState(() => textOf(element));
   const taRef = useRef(null);
   const doneRef = useRef(false);
   const valueRef = useRef(value);
   valueRef.current = value;
-  const cbRef = useRef({ onCommit, onCancel });
-  cbRef.current = { onCommit, onCancel };
+  const cbRef = useRef({ onCommit, onCancel, onChange });
+  cbRef.current = { onCommit, onCancel, onChange };
 
-  const finish = useCallback(() => {
+  const finish = useCallback((opts) => {
     if (doneRef.current) return;
     doneRef.current = true;
-    cbRef.current.onCommit?.(valueRef.current);
+    cbRef.current.onCommit?.(valueRef.current, opts);
   }, []);
+
+  const update = (next) => {
+    valueRef.current = next;
+    setValue(next);
+    cbRef.current.onChange?.(next);
+  };
 
   useImperativeHandle(ref, () => ({ commit: finish, cancel: () => {
     if (doneRef.current) return;
@@ -106,17 +124,18 @@ function TextEditor({ element, isNew = false, view, theme = 'light', onCommit, o
     cbRef.current.onCancel?.();
   } }), [finish]);
 
-  // Focus once per edited element, caret at the end (select-all would make
-  // the first keystroke wipe the text, which surprises more than it helps).
+  // Focus once per edited element with ALL its text selected, like
+  // Excalidraw's textWysiwyg (editable.select() on init): typing replaces the
+  // text, an arrow key or a click puts the caret where it is wanted. (A new
+  // text is empty, so it simply gets the caret.)
   useLayoutEffect(() => {
     const ta = taRef.current;
     if (!ta) return;
     ta.focus({ preventScroll: true });
-    const end = ta.value.length;
     try {
-      ta.setSelectionRange(end, end);
+      ta.setSelectionRange(0, ta.value.length, 'forward');
     } catch {
-      /* some input types refuse; a textarea never does */
+      ta.select();
     }
   }, [element.id]);
 
@@ -134,7 +153,7 @@ function TextEditor({ element, isNew = false, view, theme = 'light', onCommit, o
       const ta = e.currentTarget;
       const { selectionStart: a, selectionEnd: b } = ta;
       const next = ta.value.slice(0, a) + '    ' + ta.value.slice(b);
-      setValue(next);
+      update(next);
       requestAnimationFrame(() => {
         try {
           ta.setSelectionRange(a + 4, a + 4);
@@ -160,7 +179,13 @@ function TextEditor({ element, isNew = false, view, theme = 'light', onCommit, o
     resize: 'none',
     overflow: 'hidden',
     background: 'transparent',
-    font: g.font,
+    // Longhands, not the `font` shorthand: React re-applying a changed
+    // shorthand (a size or family picked while typing) would reset
+    // `lineHeight` to "normal" and the lines would jump.
+    fontStyle: 'normal',
+    fontWeight: 'normal',
+    fontSize: `${g.fontSize}px`,
+    fontFamily: g.fontFamily,
     lineHeight: LINE_HEIGHT,
     textAlign: g.align,
     whiteSpace: g.wrap ? 'pre-wrap' : 'pre',
@@ -195,10 +220,10 @@ function TextEditor({ element, isNew = false, view, theme = 'light', onCommit, o
       autoCapitalize="off"
       wrap={g.wrap ? 'soft' : 'off'}
       style={style}
-      onChange={(e) => setValue(e.target.value)}
+      onChange={(e) => update(e.target.value)}
       onKeyDown={onKeyDown}
       onKeyUp={(e) => e.stopPropagation()}
-      onBlur={finish}
+      onBlur={() => finish()}
       onPointerDown={(e) => e.stopPropagation()}
       onDoubleClick={(e) => e.stopPropagation()}
       onWheel={(e) => e.stopPropagation()}

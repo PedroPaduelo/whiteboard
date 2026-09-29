@@ -9,6 +9,32 @@
  * boots a fully functional dev instance.
  */
 
+import { fileURLToPath } from 'node:url';
+
+/**
+ * `apps/api/.env`, when there is one (`.env.example` documents every key).
+ * Located next to this package, not the working directory, so `npm run
+ * dev:api` from the repo root and `npm start` from apps/api read the same
+ * file. Real environment variables always win: Node's loader never overwrites
+ * a key that is already set, so a container's `environment:` or a shell
+ * `PORT=4000 npm start` still decides. A missing file is the normal case and
+ * is silently skipped; a malformed one is not something to crash over either.
+ * Before this, the file was silently ignored while the docs said to create it.
+ */
+export const ENV_FILE = fileURLToPath(new URL('../.env', import.meta.url));
+
+function loadEnvFile(file) {
+  if (typeof process.loadEnvFile !== 'function') return false;
+  try {
+    process.loadEnvFile(file);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+loadEnvFile(ENV_FILE);
+
 const isProduction = process.env.NODE_ENV === 'production';
 
 function str(key, fallback) {

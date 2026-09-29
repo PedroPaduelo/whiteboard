@@ -1,8 +1,9 @@
 /**
  * The binding between the realtime client and the board store: every server
  * message becomes a store write here, and nowhere else. Plain JS (no React),
- * so the whole protocol — ready, broadcasts, acks, resync, cursors, presence —
- * is exercised in node by `apps/web/test/realtime.test.js`.
+ * so the whole protocol — ready, broadcasts, acks, resync, cursors, presence,
+ * collaborators' selections — is exercised in node by
+ * `apps/web/test/realtime.test.js`.
  *
  * The one idea that makes collaboration converge: **the server applies ops in
  * arrival order, so the local board must look like "server state + my ops
@@ -19,15 +20,100 @@
  *
  * All of it runs inside `withRemote`, so the sync bridge never ships the
  * network's own state back as new ops.
+ *
+ * A resync snapshot can be OLDER than what this client already shows: while
+ * the GET is in flight, peers keep editing and their broadcasts (and our own
+ * acks) keep arriving. Applying it as is rolled those edits back for good —
+ * a broadcast only carries its own ops, so nothing would ever bring them
+ * back. So every applied batch whose ops we know is remembered by rev (the
+ * server bumps the rev exactly once per applied batch), and a snapshot at rev
+ * R is brought up to date by replaying the remembered batches after R before
+ * the pending ops go on top. Only when a rev in between is unknown does the
+ * resync fetch again, with backoff.
  */
 
-import { CURSOR_TTL_MS, useBoardStore } from '../store/boardStore.js';
+import { CURSOR_TTL_MS, useBoardStore, applyOpsToElements, settleConnectors } from '../store/boardStore.js';
 import { api } from '../api/client.js';
 import { realtime as defaultClient } from './realtime.js';
 import { storeSync as defaultSync, withRemote } from './sync.js';
 
-/** How many times a resync refetches a snapshot that is older than what we have seen. */
-const MAX_STALE_REFETCH = 3;
+/**
+ * How many times a resync refetches a snapshot it cannot bring up to date (a
+ * rev in between is unknown — rare: every applied batch reaches this client
+ * as a broadcast or an ack). After that the snapshot is applied with what is
+ * known, as before.
+ */
+const MAX_STALE_REFETCH = 4;
+
+/** Backoff between those refetches: 50 ms, 100 ms, 200 ms, 400 ms. */
+const REFETCH_BASE_MS = 50;
+const REFETCH_MAX_MS = 1000;
+
+/** How many applied batches (by rev) are remembered for replaying over an older snapshot. */
+const BATCH_LOG_LIMIT = 1000;
+
+/** What the store's error says when the board does not exist (any of the three signals). */
+export const BOARD_MISSING_MESSAGE = 'Este quadro não existe mais.';
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * The batches the server applied, by rev, as far as this client knows them
+ * (broadcasts from others, and our own acked batches).
+ */
+export class BatchLog {
+  constructor(limit = BATCH_LOG_LIMIT) {
+    this.limit = limit;
+    /** @type {Map<number, object[]>} */
+    this.byRev = new Map();
+  }
+
+  add(rev, ops) {
+    if (!Number.isFinite(rev) || rev <= 0 || !Array.isArray(ops) || ops.length === 0) return;
+    this.byRev.set(rev, ops);
+    while (this.byRev.size > this.limit) this.byRev.delete(this.byRev.keys().next().value);
+  }
+
+  /** Forget everything at or below `rev` (a snapshot at `rev` already holds it). */
+  dropThrough(rev) {
+    if (!Number.isFinite(rev)) return;
+    for (const r of this.byRev.keys()) if (r <= rev) this.byRev.delete(r);
+  }
+
+  clear() {
+    this.byRev.clear();
+  }
+
+  /**
+   * The remembered batches with a rev in (from, to], in rev order, and
+   * whether every rev in that range was known.
+   * @returns {{batches: object[][], complete: boolean}}
+   */
+  between(from, to) {
+    const batches = [];
+    if (to - from > this.limit) return { batches, complete: false };
+    let complete = true;
+    for (let r = Math.floor(from) + 1; r <= to; r++) {
+      const ops = this.byRev.get(r);
+      if (ops) batches.push(ops);
+      else complete = false;
+    }
+    return { batches, complete };
+  }
+}
+
+/**
+ * A snapshot brought forward by `batches` (each applied like the server
+ * does: in order, then one connector pass). Pure.
+ */
+export function replayOnto(elements, batches) {
+  let out = elements;
+  for (const ops of batches) {
+    const step = applyOpsToElements(out, ops);
+    out = step.geometry ? settleConnectors(step.elements) : step.elements;
+  }
+  return out;
+}
 
 /** GET the board snapshot (`{board, elements, rev}`). */
 export function fetchBoardSnapshot(boardId) {
@@ -86,6 +172,16 @@ export function attachRealtime({
   const S = () => store.getState();
   const pending = () => pendingOf(client, sync);
   let alive = true;
+  /** Applied batches by rev, for bringing an older resync snapshot up to date. */
+  const log = new BatchLog();
+  let logBoard = client.boardId;
+  const logFor = (boardId) => {
+    if (boardId !== logBoard) {
+      log.clear();
+      logBoard = boardId;
+    }
+    return log;
+  };
 
   // ------------------------------------------------------------- resync
   let resyncing = false;
@@ -103,7 +199,7 @@ export function attachRealtime({
       do {
         again = false;
         const boardId = client.boardId;
-        if (!boardId || !alive) break;
+        if (!boardId || !alive || client.fatal) break;
         let snap;
         try {
           snap = await fetchSnapshot(boardId);
@@ -113,22 +209,32 @@ export function attachRealtime({
             kind: 'resync',
             code: notFound ? 'BOARD_NOT_FOUND' : err?.code ?? null,
           });
-          if (notFound) S().setError('Este quadro não existe mais.');
           break;
         }
         if (!alive || client.boardId !== boardId) break; // switched boards meanwhile
         if (!snap || !snap.board || !Array.isArray(snap.elements)) break;
 
         // A broadcast or ack newer than this snapshot was already applied
-        // here; applying the snapshot would roll it back. Ask again.
-        if (Number.isFinite(snap.rev) && snap.rev < client.rev && staleRefetches < MAX_STALE_REFETCH) {
-          staleRefetches += 1;
-          again = true;
-          continue;
+        // here; applying the snapshot alone would roll it back. Replay the
+        // batches after its rev on top — or, when one of them is unknown,
+        // ask again (a little later) for a newer snapshot.
+        let target = snap;
+        if (Number.isFinite(snap.rev) && snap.rev < client.rev) {
+          const { batches, complete } = logFor(boardId).between(snap.rev, client.rev);
+          if (!complete && staleRefetches < MAX_STALE_REFETCH) {
+            staleRefetches += 1;
+            again = true;
+            await sleep(Math.min(REFETCH_BASE_MS * 2 ** (staleRefetches - 1), REFETCH_MAX_MS));
+            continue;
+          }
+          target = { ...snap, elements: replayOnto(snap.elements, batches), rev: client.rev };
         }
 
-        withRemote(() => S().resyncSnapshot(snap, pending()));
-        if (Number.isFinite(snap.rev)) client.rev = Math.max(client.rev, snap.rev);
+        withRemote(() => S().resyncSnapshot(target, pending()));
+        if (Number.isFinite(snap.rev)) {
+          client.rev = Math.max(client.rev, snap.rev);
+          logFor(boardId).dropThrough(snap.rev);
+        }
       } while (again && alive);
     } finally {
       resyncing = false;
@@ -137,6 +243,12 @@ export function attachRealtime({
 
   function report(message, info = {}) {
     if (typeof console !== 'undefined' && isDev()) console.warn('[realtime]', message, info);
+    // However the server said it (unknown id at join, a `missing` ack, a
+    // deleted board's eviction, a 404 on resync), the store says it the same way.
+    if (info?.code === 'BOARD_NOT_FOUND') {
+      S().setError(BOARD_MISSING_MESSAGE);
+      S().setStatus('missing');
+    }
     try {
       onError?.(message, info);
     } catch {
@@ -148,6 +260,9 @@ export function attachRealtime({
   const handlers = {
     onReady(msg) {
       const snapshot = { board: msg.board, elements: Array.isArray(msg.elements) ? msg.elements : [], rev: msg.rev };
+      // Everything up to this rev is in the snapshot; a gap before it (the
+      // socket was down) no longer matters.
+      logFor(client.boardId).dropThrough(Number(msg.rev));
       withRemote(() => {
         const s = S();
         if (snapshot.board) s.resyncSnapshot(snapshot, pending());
@@ -160,18 +275,29 @@ export function attachRealtime({
 
     onOp(ops, msg) {
       if (Array.isArray(ops) && ops.length > 0) {
+        logFor(client.boardId).add(msg?.rev, ops);
         const mine = pending();
         withRemote(() => S().applyRemoteOps(ops, mine));
       }
       if (Number.isFinite(msg?.rev)) S().setRev(msg.rev);
     },
 
-    onAck(result) {
+    onAck(result, info) {
+      // Our own batch is part of the board at this rev now (and no longer
+      // pending): remember it, so an older resync snapshot does not lose it.
+      if (result?.status === 'applied') {
+        const ops = Array.isArray(result.appliedOps) ? result.appliedOps : info?.ops;
+        logFor(client.boardId).add(result.rev, ops);
+      }
       if (Number.isFinite(result?.rev) && result.rev > 0) S().setRev(result.rev);
     },
 
     onPeerCursor(peerId, cursor) {
       S().upsertCursor(peerId, { ...cursor, at: Date.now() });
+    },
+
+    onPeerSelection(peerId, selection) {
+      S().setPeerSelection(peerId, selection);
     },
 
     onPresence(peers) {
@@ -214,8 +340,24 @@ export function attachRealtime({
     client.sendActivity(tool);
   };
   announceTool(S().tool);
-  const unsubscribeTool = store.subscribe((state) => {
+
+  // ------------------------------------------ selection -> peer-selection
+  // What this user is working on, for the others to see outlined in this
+  // user's colour: the selection, plus the text being edited (which is not
+  // always selected). The client throttles and skips unchanged lists.
+  let lastSelection = null;
+  let lastEditing = null;
+  const announceSelection = (state) => {
+    if (state.selection === lastSelection && state.editingId === lastEditing) return;
+    lastSelection = state.selection;
+    lastEditing = state.editingId;
+    client.sendSelection(selectionOf(state));
+  };
+  announceSelection(S());
+
+  const unsubscribeLocal = store.subscribe((state) => {
     if (state.tool !== lastTool) announceTool(state.tool);
+    announceSelection(state);
   });
 
   // ------------------------------------------------ cursor sweep
@@ -227,12 +369,20 @@ export function attachRealtime({
     if (!alive) return;
     alive = false;
     if (pruneTimer) clearInterval(pruneTimer);
-    unsubscribeTool();
+    unsubscribeLocal();
     sync.stop(); // flushes the debounce window into the client's outbox
     for (const key of Object.keys(handlers)) {
       if (client.handlers[key] === handlers[key]) client.handlers[key] = null;
     }
   };
+}
+
+/** The element ids this user is working on: the selection, plus the text being edited. */
+export function selectionOf(state) {
+  const ids = state?.selection ? [...state.selection] : [];
+  const editing = state?.editingId;
+  if (editing && !state.selection?.has?.(editing)) ids.push(editing);
+  return ids;
 }
 
 function isDev() {

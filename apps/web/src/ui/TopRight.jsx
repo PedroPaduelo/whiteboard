@@ -15,8 +15,10 @@ import { useBoard, useBoardId, useConnection, useMyPeerId, usePeers } from '../s
 import { useUi } from './uiStore.js';
 import { copyShareLink } from './share.js';
 import { toast } from './toast.js';
+import { errorMessage } from './errors.js';
 import { IconButton, Island } from './common.jsx';
 import { IconLibrary, IconShare } from './Icons.jsx';
+import { titleToSave } from './titleEdit.js';
 import { t } from './strings.js';
 
 const MAX_AVATARS = 4;
@@ -32,6 +34,11 @@ export function BoardTitle() {
   const update = useUpdateBoard(boardId);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState('');
+  // The title the field opened with. Saving is decided against THIS, not the
+  // live title: a collaborator's rename arriving while the field is open (the
+  // `{type:'board'}` broadcast) must not turn an untouched field into a
+  // "change" that writes the old title back over theirs.
+  const startRef = useRef('');
   const inputRef = useRef(null);
   // One edit ends exactly once: Enter/Escape unmount the input, and a blur
   // that follows must neither save a cancelled edit nor save twice.
@@ -46,17 +53,31 @@ export function BoardTitle() {
     }
   }, [editing]);
 
+  // A remote rename while the field is open and still untouched: show it (and
+  // treat it as the new starting point), so the field never holds a stale title.
+  const liveTitle = board?.title || '';
+  useEffect(() => {
+    if (!editing || liveTitle === startRef.current) return;
+    if (draft === startRef.current) {
+      setDraft(liveTitle);
+      startRef.current = liveTitle;
+      // Keep the whole title selected, as when the field opened.
+      requestAnimationFrame(() => inputRef.current?.select());
+    }
+  }, [editing, liveTitle, draft]);
+
   const finish = (save) => {
     if (doneRef.current) return;
     doneRef.current = true;
     setEditing(false);
-    const next = draft.trim();
-    if (!save || !next || next === board?.title || !boardId) return;
+    if (!save || !boardId) return;
+    const next = titleToSave(draft, startRef.current, board?.title);
+    if (!next) return;
     update.mutate(
       { title: next },
       {
         onSuccess: () => toast.success(t.toast.renamed),
-        onError: (e) => toast.error(e?.message || t.toast.renameFailed),
+        onError: (e) => toast.error(errorMessage(e, t.toast.renameFailed)),
       },
     );
   };
@@ -91,7 +112,8 @@ export function BoardTitle() {
       title={`${title} — ${t.board.renameHint}`}
       data-testid="board-title"
       onClick={() => {
-        setDraft(board?.title || '');
+        startRef.current = board?.title || '';
+        setDraft(startRef.current);
         setEditing(true);
       }}
     >
@@ -147,7 +169,7 @@ export function ShareButton() {
   return (
     <button
       type="button"
-      className="share-btn"
+      className={`share-btn ${count > 1 ? 'share-btn--crowded' : ''}`}
       data-connection={connection}
       data-testid="share-button"
       title={`${status}\n${people}`}
@@ -166,7 +188,7 @@ export function ShareButton() {
 export function LibraryButton() {
   const open = useUi((s) => s.libraryOpen);
   return (
-    <Island className="island--button">
+    <Island className="island--button top-right__library">
       <IconButton
         label={t.toolIsland.library}
         active={open}

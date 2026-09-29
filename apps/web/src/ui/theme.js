@@ -6,7 +6,12 @@
  *     `whiteboard:theme` and always wins.
  *   - Without a stored choice, the OS preference is the start value and a
  *     board's own `theme` is a DEFAULT: it is applied but NOT persisted, so
- *     the next board (or the OS) can still decide.
+ *     the next board (or the OS) can still decide. Leaving the board goes
+ *     back to the start value.
+ *   - Only a board's 'dark' counts as a default (`boardDefaultTheme`). Every
+ *     board is created 'light' — the server's default, and nothing in the UI
+ *     ever sets a board's theme — so honouring 'light' overrode a dark OS on
+ *     every board (and, after going back, on the list too).
  *   - Applying a theme never writes storage by itself; only `persistTheme`
  *     does, and only a user action calls it.
  *
@@ -42,6 +47,16 @@ export function initialTheme() {
     /* no matchMedia (node) */
   }
   return 'light';
+}
+
+/**
+ * The theme a board's own `theme` field asks for as a default, or null for
+ * "no preference". 'light' is what every board carries unless someone chose
+ * otherwise, so it is indistinguishable from no choice and never overrides
+ * the OS preference.
+ */
+export function boardDefaultTheme(theme) {
+  return theme === 'dark' ? 'dark' : null;
 }
 
 /** Put a theme on <html>. No storage side effect. */

@@ -13,7 +13,7 @@ import { TOOLBAR } from '../editor/tools.js';
 import { actions } from '../editor/actions.js';
 import { useBoardStore, useTool, useToolLocked, useActions } from '../store/index.js';
 import { useUi } from './uiStore.js';
-import { IconButton, Island, menuKeyNav, useOutsideClose } from './common.jsx';
+import { IconButton, Island, menuKeyNav, useMenuFocus, useOutsideClose } from './common.jsx';
 import { ICONS, IconChevronDown, IconHand, IconLibrary, IconLock, IconShapes, IconUnlock } from './Icons.jsx';
 import { toolChords, formatKeys } from './shortcuts.js';
 import { t } from './strings.js';
@@ -45,6 +45,7 @@ function MoreTools({ tool, locked }) {
   const open = useUi((s) => s.moreToolsOpen);
   const libraryOpen = useUi((s) => s.libraryOpen);
   const ref = useRef(null);
+  const menuRef = useMenuFocus(open);
   const close = () => useUi.getState().close('moreToolsOpen');
   useOutsideClose(ref, open, close);
   const activeMore = MORE.find((m) => m.id === tool);
@@ -53,7 +54,7 @@ function MoreTools({ tool, locked }) {
   return (
     <div className="more-tools" ref={ref}>
       <IconButton
-        className="tool-btn more-tools__btn"
+        className={`tool-btn more-tools__btn ${tool === 'hand' ? 'more-tools__btn--hand' : ''}`}
         label={activeMore ? `${t.toolIsland.more}: ${t.tools[activeMore.id]}` : t.toolIsland.more}
         active={Boolean(activeMore) || open}
         aria-haspopup="menu"
@@ -65,8 +66,8 @@ function MoreTools({ tool, locked }) {
         <IconChevronDown size={11} className="more-tools__chevron" strokeWidth={2.5} />
       </IconButton>
       {open ? (
-        <Island className="menu-panel more-tools__menu" role="menu" aria-label={t.toolIsland.more} onKeyDown={menuKeyNav}>
-          {/* Phones only: the lock and the hand are hidden from the island. */}
+        <Island ref={menuRef} className="menu-panel more-tools__menu" role="menu" aria-label={t.toolIsland.more} onKeyDown={menuKeyNav}>
+          {/* Narrow screens only (≤ 900px): the lock and the hand are hidden from the island. */}
           <button
             type="button"
             role="menuitemcheckbox"
@@ -145,7 +146,8 @@ export function ToolIsland() {
       <IconButton
         className="tool-btn tool-btn--lock"
         label={locked ? t.toolIsland.lockOn : t.toolIsland.lock}
-        shortcut="Q"
+        // The "on" label already says "Q para destravar": no second " — Q".
+        shortcut={locked ? undefined : 'Q'}
         active={locked}
         pressed={locked}
         onClick={() => store.toggleToolLocked()}

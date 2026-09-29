@@ -12,17 +12,15 @@
  *     reference on every change, so `useSyncExternalStore` sees a changed
  *     snapshot and re-renders even when the contents are identical. A
  *     `Set` for selection, a `Map` for cursors and an array for elements are
- *     all exactly this shape — which is why `useSelection` and `usePeers`
- *     below are wrapped.
+ *     all exactly this shape — which is why `useView`, `useStyle` and
+ *     `usePeers` below are wrapped.
  */
 
 import { useShallow } from 'zustand/react/shallow';
-import { useStoreWithEqualityFn } from 'zustand/traditional';
 import { useBoardStore } from './boardStore.js';
 
 export { useBoardStore };
 export { subscribe, getState, initialState, CURSOR_TTL_MS, CONNECTION_STATES } from './boardStore.js';
-export * as selectors from './selectors.js';
 // Presets are NOT re-exported: import them from './presets.js' directly, so
 // every store consumer does not load (and validate) the preset library.
 
@@ -33,61 +31,14 @@ export * as selectors from './selectors.js';
  */
 export const store = useBoardStore;
 
-/**
- * Generic selector hook — the escape hatch for anything the named hooks
- * below do not cover.
- *
- * Identity comparison is the default, and that is the right default: a
- * selector returning a primitive or a stable reference re-renders only when
- * that value actually changes. For a selector that builds a NEW object or
- * array every call, identity comparison re-renders on every store change,
- * so pass `shallow` as the second argument:
- *
- *     const { stroke, fill } = useSelector((s) => s.style, shallow); // shallow from 'zustand/shallow'
- *
- * This is a thin wrapper over zustand's own hook, so it inherits the same
- * `useSyncExternalStore` behaviour and the same StrictMode safety. With an
- * equality function it goes through `zustand/traditional` (passing one to the
- * plain hook is deprecated in zustand 4 and removed in 5).
- *
- * @param {(state: object) => unknown} selector
- * @param {(a: unknown, b: unknown) => boolean} [equality]
- */
-export function useSelector(selector, equality) {
-  // Hook order is stable per call site: a caller either always passes an
-  // equality function or never does.
-  return equality ? useStoreWithEqualityFn(useBoardStore, selector, equality) : useBoardStore(selector);
-}
-
-/** `useSelector` pre-wrapped for the common "object/array result" case. */
-export function useShallowSelector(selector) {
-  return useBoardStore(useShallow(selector));
-}
-
 /** The active tool. A string — no shallow needed. */
 export const useTool = () => useBoardStore((s) => s.tool);
 
 /** Excalidraw's tool lock (Q): keep the drawing tool after creating an element. */
 export const useToolLocked = () => useBoardStore((s) => s.toolLocked);
 
-/** The canvas' CSS size `{w, h}`, as reported by the Canvas' ResizeObserver. */
-export const useViewportSize = () => useBoardStore((s) => s.viewportSize);
-
 /** Realtime connection: 'idle' | 'connecting' | 'connected' | 'offline' | 'disconnected'. */
 export const useConnection = () => useBoardStore((s) => s.connection);
-
-/** The active selection as a stable ARRAY. Never return the Set itself. */
-export const useSelection = () => useBoardStore(useShallow((s) => Array.from(s.selection)));
-
-/** The number of selected elements, for "3 selected" labels. */
-export const useSelectionCount = () => useBoardStore((s) => s.selection.size);
-
-/** The hovered / in-place-edited element id, or null. */
-export const useHoveredId = () => useBoardStore((s) => s.hoveredId);
-export const useEditingId = () => useBoardStore((s) => s.editingId);
-
-/** The live marquee rectangle while drag-selecting, or null. */
-export const useMarquee = () => useBoardStore((s) => s.marquee);
 
 /** The view transform. An object, so it needs the shallow wrapper. */
 export const useView = () => useBoardStore(useShallow((s) => s.view));
@@ -95,8 +46,7 @@ export const useView = () => useBoardStore(useShallow((s) => s.view));
 /** The style palette. An object — shallow wrapper keeps it from churning. */
 export const useStyle = () => useBoardStore(useShallow((s) => s.style));
 
-/** Grid size (0 = snapping off) and whether snapping is enabled. */
-export const useGridSize = () => useBoardStore((s) => s.gridSize);
+/** Whether grid snapping is enabled. */
 export const useSnapEnabled = () => useBoardStore((s) => s.snapEnabled);
 
 /** The peer roster. An array that is replaced wholesale on presence events. */
@@ -105,33 +55,14 @@ export const usePeers = () => useBoardStore(useShallow((s) => s.peers));
 /** Our own peer id — null until the socket says `ready`. */
 export const useMyPeerId = () => useBoardStore((s) => s.myPeerId);
 
-/**
- * Remote cursors: the store's `Map<peerId, {x, y, name, color, at}>` itself.
- * The store replaces the Map only when a cursor actually changes, so this
- * re-renders on cursor moves and on nothing else. (Building an array of
- * fresh objects here would defeat any equality check and re-render on EVERY
- * store write.) The canvas should not use this hook at all — it reads
- * `remoteCursors` in its rAF loop via `useBoardStore.subscribe`.
- */
-export const useRemoteCursors = () => useBoardStore((s) => s.remoteCursors);
-
-/** Load status, board id, board rev, last error. */
-export const useStatus = () => useBoardStore((s) => s.status);
+/** Board id, last error, board metadata. */
 export const useBoardId = () => useBoardStore((s) => s.boardId);
-export const useRev = () => useBoardStore((s) => s.rev);
 export const useError = () => useBoardStore((s) => s.error);
 export const useBoard = () => useBoardStore((s) => s.board);
 
-/**
- * The full element list, in z-order. This array changes on every element
- * mutation — that is the point, it is what makes the canvas redraw.
- */
-export const useElements = () => useBoardStore((s) => s.elements);
-
-/** Undo/redo availability and stack depths, for the toolbar's disabled state. */
+/** Undo/redo availability, for the toolbar's disabled state. */
 export const useCanUndo = () => useBoardStore((s) => s.canUndo);
 export const useCanRedo = () => useBoardStore((s) => s.canRedo);
-export const useHistoryDepth = () => useBoardStore(useShallow((s) => ({ past: s.pastDepth, future: s.futureDepth })));
 
 /**
  * Actions are stable for the lifetime of the store, so they are read through

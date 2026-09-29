@@ -14,12 +14,12 @@ All routes are prefixed with the app's own prefix from `config.js`
 
 | File | Purpose |
 | --- | --- |
-| `src/config.js` | env parsing, single source of runtime config (frozen) |
+| `src/config.js` | env parsing (plus `apps/api/.env` when present), single source of runtime config (frozen) |
 | `src/store/index.js` | `createStore({storage, sqlitePath, opDedupeTtlMs})` picks a driver |
 | `src/store/sqlite.js` | `node:sqlite` driver + schema |
 | `src/store/memory.js` | in-memory driver, same interface (tests/dev) |
 | `src/store/ops.js` | `applyOpBatch`: the batch rules, shared by both drivers |
-| `src/routes/boards.js` | REST: boards CRUD + snapshot, `board` broadcast on PATCH |
+| `src/routes/boards.js` | REST: boards CRUD + snapshot, `board` broadcast on PATCH, room eviction on DELETE |
 | `src/routes/ops.js` | REST: op batch apply, board-wide clear |
 | `src/ws/hub.js` | presence, rooms, fan-out (framework-free) |
 | `src/ws/plugin.js` | `@fastify/websocket` wiring (registered unencapsulated via `fastify-plugin`) |
@@ -38,6 +38,24 @@ A board is an ordered element list; index = z-order (0 paints first). Types:
 every element: `id` (1..40 chars), `type`, finite `x y w h` (the UNROTATED
 box; `rotation` is radians about its centre). `validateElement` rejects bad
 values and STRIPS unknown fields (and fields a type does not use).
+
+**Bounds.** Every stored coordinate lies within ±`LIMITS.MAX_COORD` (1e7, the
+same bound the WS cursor is clamped to): `x`, `y`, the far edges `x + w` and
+`y + h` of a box, and every point of a pen/connector (whose box is derived
+from its points, so a stale client `x/y/w/h` there is ignored rather than
+rejected). `naturalWidth`/`naturalHeight` are 0..1e7. A finite-but-absurd
+value (1.7e308) is rejected with the field's path instead of overflowing to
+Infinity/NaN downstream. A rect/ellipse/diamond/cylinder (the roughjs-filled
+shapes, whose hachure/cross-hatch cost grows with their area) is at most
+`LIMITS.MAX_SHAPE_SIZE` (200,000) units a side — more than an 8K screen shows
+at the minimum zoom; a 2e7-unit cross-hatch rect froze every visitor's tab
+for 40 s.
+
+**Whole-board caps** (checked by the store after a batch): at most
+`LIMITS.MAX_BOARD_IMAGE_CHARS` (40,000,000) characters of image `src` and
+`LIMITS.MAX_BOARD_POINTS` (2,000,000) points across the board, besides
+`MAX_ELS` (5000). Only a batch that GROWS a board past a cap is refused
+(`BOARD_TOO_LARGE`); a board already over one can still be edited and shrunk.
 
 | Field | Types | Values |
 | --- | --- | --- |
@@ -58,6 +76,7 @@ values and STRIPS unknown fields (and fields a type does not use).
 | `text` | text | string ≤ 4000 |
 | `points` | pen (1..20000), arrow/line (**2**..20000) | absolute `{x, y}`; the box is re-derived from them |
 | `startId`, `endId` | arrow, line | id of the element the first/last point is bound to |
+| `startFixedPoint`, `endFixedPoint` | arrow, line | `{x, y}`, each 0..1: where on the anchor's UNROTATED box the bound end is pinned (see Connectors) |
 | `startArrowhead`, `endArrowhead` | arrow, line | `ARROWHEADS`: `none` `arrow` `triangle` `bar` `dot` |
 | `src`, `naturalWidth`, `naturalHeight` | image | https URL or base64 `data:image/*` ≤ 2,000,000 chars |
 
@@ -65,30 +84,62 @@ All hand-drawn fields are optional; absent means the renderer default
 (roughness 1, fillStyle `solid`, roundness `sharp`, fontFamily `hand`, arrow
 arrowheads none→arrow, line none→none, seed = FNV-1a of the id).
 
+**View constants** (used by the web only; the view is never stored):
+`ZOOM_LIMITS` = 0.1..30 (10%..3000%, Excalidraw's range; `zoomAt`, `fitView`
+and `clampZoom` default to it), `ZOOM_STEP` = 0.1, the additive step of the
+zoom buttons (`stepZoom(zoom, ±1)`: 100% → 110% → 120%).
+
 **Update patches** (`validateOps` → `sanitisePatch`) accept exactly the
-fields above except `id`/`type` (a patch naming either is rejected). A patch
-value of `null` REMOVES the field for `startId`, `endId`, `groupId` and
-`label` (unbinding a connector end, leaving a group, clearing a shape label);
-for every other field `null` is invalid. The store merges the patch and then
-re-validates the MERGED element, so a patch can never produce an invalid
-element.
+fields above except `id`/`type` (a patch naming either is rejected), and
+type-check EVERY key they keep (including `x`, `y`, `naturalWidth`,
+`naturalHeight`, `updatedAt`, all bounded as above). A patch value of `null`
+REMOVES the field for `startId`, `endId`, `groupId`, `label`,
+`startFixedPoint` and `endFixedPoint` (`NULLABLE_PATCH_KEYS`: unbinding or
+un-pinning a connector end, leaving a group, clearing a shape label); for every other
+field `null` is rejected (`null is only allowed for …`). The store merges the
+patch and then re-validates the MERGED element, so a patch can never produce
+an invalid element. The op the store reports in `appliedOps` carries the
+patch AS IT TOOK EFFECT: each key with the value the stored element now has,
+a `null` for a removal, and no key the element's type does not store (a
+`text` sent to a rect, a pen's `x/w`, which are re-derived from its points),
+so peers applying the broadcast end up with exactly the server's element.
 
 **Connectors** (`resolveConnectors`, run by the store after every batch that
 creates, updates, deletes or clears): only the first and last point of a
-bound connector are ever moved. A bound end lands `BIND_GAP` (4) units
-outside its anchor's OUTLINE — the box for rect/sticky/text/image/cylinder,
-the ellipse for `ellipse`, the rhombus for `diamond`, all honouring the
-anchor's `rotation` — on the ray from the anchor centre toward its aim:
+bound connector are ever moved. A bound end lands `bindGap(anchor,
+connector)` units outside its anchor's OUTLINE as it is drawn — the box for
+rect/sticky/text/image/cylinder, the ellipse for `ellipse`, the rhombus for
+`diamond`; a `roundness: 'round'` rect or diamond uses its rounded corners
+(`cornerRadius(size)` = 25% of the side, at most 32, the renderer's own
+curves) — all honouring the anchor's `rotation`, on the ray from the anchor
+centre toward its aim. `bindGap` is `BIND_GAP` (4) for default 2-unit strokes
+and grows by half a unit per extra unit of stroke on each side (the anchor's
+own stroke counts only for outlined types: rect, ellipse, diamond, cylinder),
+so the visible air between arrowhead and outline is the same at every width.
+The aim:
 
-- 2 points, both ends bound: the other anchor's centre;
+- an end with a fixed point (`startFixedPoint` / `endFixedPoint`) is PINNED:
+  it aims at that point of its anchor's box, so it stays on the spot of the
+  outline it was dropped on as the anchor moves, rotates or resizes. The
+  editor takes it with `bindingFixedPoint(anchor, dropPoint)`, which gives
+  the outline point on the ray from the centre through the drop, as `{x, y}`
+  fractions of the unrotated box (`{x: 0.5, y: 0}` = middle of the top edge),
+  or `null` for a drop closer to the centre than half the way to the outline
+  (`FIXED_POINT_MIN_RATIO`): that end is not pinned;
+- otherwise, 2 points with both ends bound: where the other end is pinned,
+  or else the other anchor's centre;
 - otherwise: the adjacent point (`points[1]` for the start, `points[n-2]` for
   the end).
 
-Every aim point is something the resolver never moves, so the function is
-idempotent (a second pass returns the same objects). Bindings to a missing
-id are dropped first (`detachMissingConnectors`); bindings to another
-connector, and a 2-point connector bound at both ends to the same element,
-are left as stored.
+Every aim point is something the resolver never moves (a pin depends only on
+its own anchor), so the function is idempotent (a second pass returns the
+same objects). A fixed point without its `startId`/`endId` is kept but inert;
+a client that binds an end to another element sets that end's fixed point
+(or `null`) in the same patch. Bindings to a missing id are dropped first
+(`detachMissingConnectors`, which keeps the fixed points); bindings to
+another connector are ignored, and a 2-point connector bound at both ends to
+the same element resolves only its pinned ends (an unpinned one is left as
+stored).
 
 ## Store interface
 
@@ -159,10 +210,27 @@ are left as stored.
    - `reorder` — listed ids first in the given order; unknown ids ignored;
      unlisted ids keep their relative order at the end.
    - `clear` — delete all elements.
-   After any create/update/delete/clear: `detachMissingConnectors`, then
-   `resolveConnectors` (see above), and the resolved points are persisted.
+   After any create/update/delete/clear: drop dangling bindings (like
+   `detachMissingConnectors`, without mutating), then `resolveConnectors`
+   (see above); every connector either step changed is re-validated (a
+   resolved end pushed off the board is a `VALIDATION_FAILED`, never a stored
+   NaN) and the resolved points are persisted. Then the whole-board caps are
+   checked (`BOARD_TOO_LARGE`).
 6. **Rev.** Bump by 1 per applied batch (not per op).
 7. **Record opIds** in `seen_ops` with a TTL (`OP_DEDUPE_TTL_MS`).
+
+An EMPTY batch is refused (`INVALID_OP`, "expected at least one op") before
+anything is read: it writes nothing and does not bump the rev. Both edges
+refuse it first (REST 400, WS error ack `VALIDATION_FAILED`).
+
+**Cost.** A batch costs O(elements) of pointer work plus O(what it changed)
+of serialising and writing, never O(board bytes): element objects are never
+modified in place (each change makes a new object, and everything a batch
+created or changed is deep-frozen before `save`), `save(next, prev)` receives
+the list before the batch so a driver can write only what changed, and the
+sqlite driver keeps recently used boards parsed (keyed by rev) instead of
+parsing the board on every drag frame. Results and snapshots handed to
+callers never alias mutable stored state.
 
 ## REST surface
 
@@ -180,13 +248,17 @@ unknown board), `ROUTE_NOT_FOUND`, `REV_CONFLICT` (409), `PAYLOAD_TOO_LARGE`
 | GET | `/boards/:id` | — | `BoardSnapshot` | — |
 | GET | `/boards/:id/snapshot` | — | `BoardSnapshot` | — |
 | PATCH | `/boards/:id` | `{title?, theme?, ownerId?}` (at least one) | `Board` | `{type:'board', boardId, board}` |
-| DELETE | `/boards/:id` | — | `{deleted: true}` | — |
+| DELETE | `/boards/:id` | — | `{deleted: true}` | every socket on the board gets `{type:'error', text:'board deleted', code:'BOARD_NOT_FOUND', boardId}` and is closed with 1008 |
 | POST | `/boards/:id/ops` | `{ops: Op[] (1..200), actorId?}` | `{status, rev, applied, appliedOps, elements}` | `{type:'op', boardId, ops: appliedOps, rev}` when applied |
 | DELETE | `/boards/:id/elements` | — | `{status:'applied', rev, applied:[opId], appliedOps:[clearOp], elements: []}` | `{type:'op', boardId, ops:[{opId, kind:'clear', at}], rev}` |
 | GET | `/ws` | websocket upgrade | see below | |
 
 `BoardSnapshot` = `{board, elements, rev}`. `Board` = `{id, title, theme, rev,
 ownerId, createdAt, updatedAt}`; `BoardSummary` adds `elementCount`.
+`POST /boards` always assigns the id itself (a UUID; an `id` in the body is
+ignored like any other unknown field) and defaults `title` to
+`'Untitled board'` and `theme` to `'light'`. `GET /boards` pages: read
+`total` and step `offset` by `limit` to see every board.
 `duplicate` is a 200 (a harmless retry) and is not re-broadcast.
 
 The board-wide clear goes through `applyOps` as a real
@@ -220,10 +292,12 @@ Client → server:
     [], message}`, then `{type:'resync', boardId, rev}` to the SENDER ONLY
     (never the room — other peers keep their outboxes).
   - `error`: `result = {status:'error', message, code, applied: []}` when
-    `validateOps` rejects the batch (`code: 'VALIDATION_FAILED'`) or the store
-    throws (`DUPLICATE_ELEMENT`, `TOO_MANY_ELEMENTS`, `INVALID_OP`,
-    `VALIDATION_FAILED` for an invalid merged element, `INTERNAL` otherwise).
-    Nothing was applied; the client must drop the batch, not re-send it.
+    `validateOps` rejects the batch or it is empty (`code:
+    'VALIDATION_FAILED'`), or the store throws (`DUPLICATE_ELEMENT`,
+    `TOO_MANY_ELEMENTS`, `BOARD_TOO_LARGE`, `INVALID_OP`, `VALIDATION_FAILED`
+    for an invalid merged element or resolved connector, `INTERNAL`
+    otherwise). Nothing was applied; the client must drop the batch, not
+    re-send it.
 - `{type:'cursor', x, y}` (or `{cursor:{x,y}}`), board units → `peer-cursor
   {boardId, peerId, cursor, name, color}` to the others; never persisted;
   clamped to ±1e7; rate-limited per peer (`WS_CURSOR_RATE_MS`) with a
@@ -236,16 +310,33 @@ Server → client, unprompted: `presence {boardId, peers:[{id, name, color,
 lastSeen, tool}]}` after any roster change; `op` (above, and from REST
 writes); `board {boardId, board}` after `PATCH /boards/:id`; `bye`.
 
-The sweeper drops a peer silent for `WS_PEER_TTL_MS` (default 30 s) and
-re-broadcasts `presence`. The hub is a plain class (`add`, `seat`, `remove`,
+The sweeper drops a peer silent for `WS_PEER_TTL_MS` (default 30 s),
+re-broadcasts `presence`, and CLOSES that peer's socket with code 4000
+(`CLOSE_IDLE`, reason `idle timeout`): a silent peer is often only asleep (a
+closed laptop, a throttled background tab), and without the close it stayed
+out of every room while its own acks kept it looking connected. The client
+treats the close like any dropped connection: reconnect, re-join, resync. A
+socket that still talks after the hub has forgotten it (a ping, ops, cursor or
+activity from a pruned peer) is closed the same way and its batch is NOT
+applied (the client re-sends it after the re-join; opIds make that safe).
+
+A socket is parked in the `_pending` room from open until it joins. Parking
+rooms are never broadcast to: an unjoined socket receives nothing but the
+answers to its own messages (`ready`, `error`, `bye`).
+
+The hub is a plain class (`add`, `seat`, `remove`,
 `broadcast(boardId, envelope, exceptPeerId)`, `peersOf`, `presence`,
-`touch`, `prune`, `send`, `close`); it must not import Fastify, which is what
-makes it testable with a fake socket and an injected clock.
+`touch`, `prune`, `closeRoom(boardId, {envelope, code, reason})`, `send`,
+`close`); it must not import Fastify, which is what makes it testable with a
+fake socket and an injected clock.
 
 ## Config (`src/config.js`)
 
 Read once, export a frozen object. Every value overridable by env, with a
-sensible default so `node src/server.js` works with no env at all.
+sensible default so `node src/server.js` works with no env at all. Before
+reading, `config.js` loads `apps/api/.env` when it exists (located next to the
+package, not the working directory, via `process.loadEnvFile`); a variable
+already set in the real environment always wins over the file.
 
 `PORT` (3001), `HOST` (0.0.0.0), `API_PREFIX` (/api), `CORS_ORIGIN` (`*`, or a
 comma-separated allowlist), `STORAGE` (`sqlite`|`memory`), `SQLITE_PATH`
@@ -272,9 +363,14 @@ on filled shapes, `roundness: 'round'` on rects. `scripts/seed-showcase.mjs`
 ## Persistence notes
 
 `node:sqlite` is built into Node 22.5+ behind `--experimental-sqlite`. The
-`start` script must pass that flag. Elements are one JSON blob per board, so
-new optional element fields need only a shared-validator change, never a
-migration. Schema:
+`start` script must pass that flag. Elements are stored one JSON document per
+ROW (one row per element, ordered by `pos`), so new optional element fields
+still need only a shared-validator change, never a migration, while a
+one-field update rewrites one row instead of the whole board. (They used to
+be one JSON blob per board: every op batch — one per 50 ms of dragging —
+parsed, re-serialised and rewrote the entire board, inline images included,
+blocking the event loop for 100-600 ms on a board with a few photos.)
+Schema:
 
 ```sql
 CREATE TABLE boards (
@@ -282,18 +378,32 @@ CREATE TABLE boards (
   rev INTEGER NOT NULL DEFAULT 0, owner_id TEXT,
   created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
 );
--- Elements as one JSON blob per board: the whole board is one document, and
--- every read wants all of it. Rows-per-element would only add joins and
--- N+1s on the one query that matters.
-CREATE TABLE elements (
-  board_id TEXT PRIMARY KEY REFERENCES boards(id) ON DELETE CASCADE,
-  data TEXT NOT NULL          -- JSON array, in z-order
+CREATE TABLE element_rows (
+  board_id TEXT NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
+  id TEXT NOT NULL,
+  pos INTEGER NOT NULL,        -- z-order; strictly increasing, gaps allowed
+  data TEXT NOT NULL,          -- the element, as JSON
+  PRIMARY KEY (board_id, id)
 );
+CREATE INDEX idx_element_rows_pos ON element_rows(board_id, pos);
 CREATE TABLE seen_ops (
   board_id TEXT NOT NULL, op_id TEXT NOT NULL, seen_at INTEGER NOT NULL,
   PRIMARY KEY (board_id, op_id)
 );
 CREATE INDEX idx_seen_ops_at ON seen_ops(seen_at);
+CREATE INDEX idx_boards_owner ON boards(owner_id);
 ```
+
+A database written by the old schema (`elements(board_id, data)` blobs) is
+migrated on open, in one transaction: each blob becomes rows in its z-order
+and the old table is dropped. Positions are only renumbered where a batch
+actually changed the order, so appends and deletes touch no other row.
+
+`listBoards` pages in SQL (`LIMIT/OFFSET`, `total` from `COUNT(*)`) and takes
+`elementCount` from the `element_rows` key index, so listing never parses an
+element. `search` is a literal, Unicode-aware, case-insensitive substring of
+the title, evaluated with JavaScript's `toLowerCase().includes()` on both
+drivers (SQLite's `LOWER`/`LIKE` fold ASCII only, so 'área' did not find
+'Área de testes' on sqlite while memory found it).
 
 `memory.js` mirrors this with `Map`s so the test suite needs no disk.

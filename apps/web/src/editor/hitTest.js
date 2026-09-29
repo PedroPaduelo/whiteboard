@@ -14,6 +14,12 @@
  *    whatever is behind it. A shape that carries a non-empty label is treated
  *    as filled — the label is ink you can click.
  *  - text, sticky notes and images are always hit anywhere in their box.
+ *  - A cylinder is its painted drum (render/shape.js cylinderPaths), not its
+ *    box: the corners outside its elliptical caps are empty, and the front
+ *    half of the top cap, drawn across the body, is ink you can click.
+ *  - A connector with `roundness: 'round'` and more than two points is
+ *    painted as a smooth curve (render/shape.js), so it is hit along that
+ *    same curve, not along the straight chords between its points.
  *  - Rotated shapes are tested in their own unrotated frame (the point is
  *    rotated back about the box centre), so hit areas turn with the shape.
  *  - Elements with opacity 0 are invisible and therefore not clickable.
@@ -24,6 +30,7 @@
 import { rotatePoint, pointNearPolyline, pointInPolygon, diamondPolygon, distToSegmentSq } from '@whiteboard/shared';
 import { HIT_TOLERANCE, POINT_HANDLE_RADIUS } from './constants.js';
 import { elementBounds, rotateAround } from './handles.js';
+import { curveSegments, cylinderCap } from './render/shape.js';
 
 const hasFill = (el) => typeof el.fill === 'string' && el.fill !== 'none' && el.fill !== 'transparent' && el.fill !== '';
 const hasLabel = (el) => typeof el.label === 'string' && el.label.trim() !== '';
@@ -109,10 +116,63 @@ function diamondSdf(q, box) {
   return pointInPolygon(q, poly) ? -d : d;
 }
 
+/** Samples per half ellipse of a cylinder cap: the chord error stays under half a pixel even for a very wide drum. */
+const CAP_SAMPLES = 48;
+
+/** Half of the ellipse centred on (cx, cy) with semi-axes rx, ry — the upper (y ≤ cy) or the lower half — as points from left to right. */
+function halfEllipse(cx, cy, rx, ry, upper) {
+  const out = [];
+  for (let i = 0; i <= CAP_SAMPLES; i++) {
+    const a = Math.PI - (Math.PI * i) / CAP_SAMPLES;
+    out.push({ x: cx + rx * Math.cos(a), y: cy + (upper ? -ry : ry) * Math.sin(a) });
+  }
+  return out;
+}
+
+/**
+ * A cylinder as the renderer paints it (render/shape.js cylinderPaths, same
+ * cap height `cylinderCap`), in its unrotated frame: `outline` is the closed
+ * silhouette — the back half of the top cap, the right side, the front half
+ * of the bottom cap, the left side — and `rim` the front half of the top cap,
+ * drawn across the body. Cached per element object (the store replaces
+ * objects on change), re-checked against the box.
+ * @returns {{outline: {x,y}[], rim: {x,y}[]}}
+ */
+const cylinderCache = new WeakMap();
+function cylinderGeometry(el) {
+  const c = cylinderCache.get(el);
+  if (c && c.x === el.x && c.y === el.y && c.w === el.w && c.h === el.h) return c.geo;
+  const ry = cylinderCap(el.w, el.h);
+  const rx = el.w / 2;
+  const cx = el.x + rx;
+  const top = halfEllipse(cx, el.y + ry, rx, ry, true);
+  const bottom = halfEllipse(cx, el.y + el.h - ry, rx, ry, false).reverse();
+  const geo = { outline: [...top, ...bottom], rim: halfEllipse(cx, el.y + ry, rx, ry, false) };
+  cylinderCache.set(el, { x: el.x, y: el.y, w: el.w, h: el.h, geo });
+  return geo;
+}
+
+/** Squared distance from `q` to a polyline (closed: back to its first point too). */
+function polylineDistSq(q, pts, closed = false) {
+  let best = Infinity;
+  const n = pts.length;
+  for (let i = 0; i < n - 1; i++) best = Math.min(best, distToSegmentSq(q, pts[i], pts[i + 1]));
+  if (closed && n > 1) best = Math.min(best, distToSegmentSq(q, pts[n - 1], pts[0]));
+  return best;
+}
+
+/** Signed distance to a cylinder's silhouette (negative inside). */
+function cylinderSdf(q, el) {
+  const { outline } = cylinderGeometry(el);
+  const d = Math.sqrt(polylineDistSq(q, outline, true));
+  return pointInPolygon(q, outline) ? -d : d;
+}
+
 /** Signed distance to a closed shape's outline, in its unrotated frame. */
 function shapeSdf(el, q) {
   if (el.type === 'ellipse') return ellipseSdf(q, el);
   if (el.type === 'diamond') return diamondSdf(q, el);
+  if (el.type === 'cylinder') return cylinderSdf(q, el);
   return roundedBoxSdf(q, el, cornerRadius(el));
 }
 
@@ -120,6 +180,76 @@ function shapeSdf(el, q) {
 function nearBounds(el, p, pad) {
   const b = elementBounds(el);
   return p.x >= b.x - pad && p.x <= b.x + b.w + pad && p.y >= b.y - pad && p.y <= b.y + b.h + pad;
+}
+
+/** Is this connector painted as a smooth curve (render contract: round, > 2 points)? */
+const isCurved = (el) => el.roundness === 'round' && Array.isArray(el.points) && el.points.length > 2;
+
+/** Samples per cubic segment: enough that the chord error stays well under a pixel for any sane arrow. */
+const CURVE_SAMPLES = 24;
+
+/** Point on a cubic bezier. */
+function bezierAt(p0, p1, p2, p3, t) {
+  const u = 1 - t;
+  const a = u * u * u;
+  const b = 3 * u * u * t;
+  const c = 3 * u * t * t;
+  const d = t * t * t;
+  return { x: a * p0.x + b * p1.x + c * p2.x + d * p3.x, y: a * p0.y + b * p1.y + c * p2.y + d * p3.y };
+}
+
+/**
+ * The path a connector is PAINTED along, as polylines, one per segment
+ * between consecutive points: the straight segments themselves, or — for a
+ * curved connector — each cubic of the renderer's `curveSegments` (the exact
+ * Catmull-Rom curve roughjs draws) sampled finely. Cached per element object:
+ * the store replaces objects on change, so the cache invalidates itself.
+ * @returns {{x,y}[][]}
+ */
+const pathCache = new WeakMap();
+function paintedSegments(el) {
+  const cached = pathCache.get(el);
+  if (cached && cached.points === el.points && cached.round === el.roundness) return cached.segs;
+  let segs;
+  if (isCurved(el)) {
+    segs = curveSegments(el.points).map(([p0, c1, c2, p3]) => {
+      const out = [];
+      for (let i = 0; i <= CURVE_SAMPLES; i++) out.push(bezierAt(p0, c1, c2, p3, i / CURVE_SAMPLES));
+      return out;
+    });
+  } else {
+    segs = [];
+    for (let i = 0; i < el.points.length - 1; i++) segs.push([el.points[i], el.points[i + 1]]);
+    if (segs.length === 0) segs.push([el.points[0]]);
+  }
+  pathCache.set(el, { points: el.points, round: el.roundness, segs });
+  return segs;
+}
+
+/** Bounds of a set of polylines (a curve can overshoot the bounds of its points). */
+function segmentsBounds(segs) {
+  let x1 = Infinity;
+  let y1 = Infinity;
+  let x2 = -Infinity;
+  let y2 = -Infinity;
+  for (const seg of segs) {
+    for (const q of seg) {
+      if (q.x < x1) x1 = q.x;
+      if (q.y < y1) y1 = q.y;
+      if (q.x > x2) x2 = q.x;
+      if (q.y > y2) y2 = q.y;
+    }
+  }
+  return { x1, y1, x2, y2 };
+}
+
+/** Is `p` within `t` of the connector as painted (chords, or the sampled curve)? */
+function nearConnector(el, p, t) {
+  if (!isCurved(el)) return nearBounds(el, p, t) && pointNearPolyline(p, el.points, t);
+  const segs = paintedSegments(el);
+  const b = segmentsBounds(segs);
+  if (p.x < b.x1 - t || p.x > b.x2 + t || p.y < b.y1 - t || p.y > b.y2 + t) return false;
+  return segs.some((seg) => pointNearPolyline(p, seg, t));
 }
 
 /**
@@ -137,8 +267,7 @@ export function hitShape(el, p, tol) {
     case 'arrow':
     case 'line': {
       if (!Array.isArray(el.points) || el.points.length === 0) return false;
-      const t = tol + strokeHalf(el);
-      return nearBounds(el, p, t) && pointNearPolyline(p, el.points, t);
+      return nearConnector(el, p, tol + strokeHalf(el));
     }
     default:
       break;
@@ -157,8 +286,35 @@ export function hitShape(el, p, tol) {
       const d = shapeSdf(el, q);
       const band = tol + strokeHalf(el);
       if (hasFill(el) || hasLabel(el)) return d <= band;
-      return Math.abs(d) <= band;
+      if (Math.abs(d) <= band) return true;
+      // The front half of a cylinder's top cap is painted across its body.
+      return el.type === 'cylinder' && polylineDistSq(q, cylinderGeometry(el).rim) <= band * band;
     }
+    default:
+      return false;
+  }
+}
+
+/**
+ * Is `p` INSIDE the element's closed shape (or its box, for text, sticky
+ * notes and images), however it is filled, give or take `tol` board units?
+ * Rotation-aware. This is not a click test (an unfilled shape's middle is
+ * not ink): it is how a text gesture finds the container whose label it
+ * writes when the pointer is over a transparent shape's empty middle.
+ */
+export function pointInShape(el, p, tol = 0) {
+  if (!el || !p || !(el.w >= 0) || !(el.h >= 0)) return false;
+  const q = el.rotation ? rotatePoint(p, el, el.rotation) : p;
+  switch (el.type) {
+    case 'text':
+    case 'sticky':
+    case 'image':
+      return q.x >= el.x - tol && q.x <= el.x + el.w + tol && q.y >= el.y - tol && q.y <= el.y + el.h + tol;
+    case 'rect':
+    case 'ellipse':
+    case 'diamond':
+    case 'cylinder':
+      return shapeSdf(el, q) <= tol;
     default:
       return false;
   }
@@ -242,15 +398,21 @@ export function hitLinearPoint(el, p, zoom = 1) {
  * Used to insert a point where the user double-clicks a segment.
  */
 export function hitLinearSegment(el, p, zoom = 1) {
-  if (!el || !Array.isArray(el.points)) return -1;
+  if (!el || !Array.isArray(el.points) || el.points.length < 2) return -1;
   const t = HIT_TOLERANCE / (zoom || 1) + strokeHalf(el);
+  // Segment i of the painted path (a straight chord, or the curve piece
+  // between points i and i+1 of a round connector).
+  const segs = paintedSegments(el);
   let best = -1;
   let bestD = t * t;
-  for (let i = 0; i < el.points.length - 1; i++) {
-    const d2 = distToSegmentSq(p, el.points[i], el.points[i + 1]);
-    if (d2 <= bestD) {
-      best = i;
-      bestD = d2;
+  for (let i = 0; i < segs.length; i++) {
+    const seg = segs[i];
+    for (let j = 0; j < seg.length - 1; j++) {
+      const d2 = distToSegmentSq(p, seg[j], seg[j + 1]);
+      if (d2 <= bestD) {
+        best = i;
+        bestD = d2;
+      }
     }
   }
   return best;

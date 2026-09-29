@@ -2,35 +2,31 @@
  * BoardList.jsx — the landing screen: the boards you own plus the ones nobody
  * has claimed yet, with create, open, rename, duplicate, claim and delete.
  *
- * The list is SCOPED BY NICKNAME (`useBoards` sends `?owner=<nickname>` and
- * keys its cache by it). Every row says whose board it is, and an unclaimed
- * row says so and offers to take it — ownership must be legible, or your work
- * and a stranger's look identical.
+ * The list is SCOPED BY NICKNAME (`?owner=<nickname>`, and the cache is keyed
+ * by it). Every row says whose board it is, and an unclaimed row says so and
+ * offers to take it — ownership must be legible, or your work and a
+ * stranger's look identical. It is PAGED (`limit`/`offset`, "Carregar mais")
+ * and searchable by title, and its counts come from the server's `total`.
  *
- * Duplicate = create a board, then replay the source elements as `create`
- * ops cloned with `cloneElements` (fresh short ids, bindings and groups
- * remapped), so the copy is independent of the original.
+ * Duplicate = create a board, then replay the source elements into the COPY
+ * as `create` ops cloned with `cloneElements` (fresh short ids, bindings and
+ * groups remapped), so the copy is independent of the original — see
+ * ui/boardOps.js.
  *
  * The root URL never auto-creates a board: creating one is a click.
  */
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useQueryClient } from '@tanstack/react-query';
-import {
-  keys as queryKeys,
-  useApplyOps,
-  useBoards,
-  useClaimBoard,
-  useCreateBoard,
-  useDeleteBoard,
-  useNickname,
-  useUpdateBoard,
-} from '../api/queries.js';
-import { api, newOpId } from '../api/client.js';
-import { cloneElements } from '../editor/elements.js';
+import { useInfiniteQuery, useQuery, useQueryClient } from '@tanstack/react-query';
+import { keys as queryKeys, useClaimBoard, useCreateBoard, useDeleteBoard, useNickname, useUpdateBoard } from '../api/queries.js';
+import { api } from '../api/client.js';
+import { boardListQuery, copyBoardElements, mergeBoardPages, nextPageOffset, pageTotal } from './boardOps.js';
+import { previewKind, previewQueryKey, previewSrc } from './boardPreview.js';
+import { useUi } from './uiStore.js';
 import { toast } from './toast.js';
+import { errorMessage, errorSentence } from './errors.js';
 import { NicknameSwitcher } from './NicknameGate.jsx';
-import { IconBoards, IconCheck, IconClose, IconDuplicate, IconEdit, IconPlus, IconTrash } from './Icons.jsx';
+import { IconBoards, IconCheck, IconClose, IconDuplicate, IconEdit, IconPlus, IconSearch, IconTrash } from './Icons.jsx';
 import { t } from './strings.js';
 
 const TICK_MS = 30_000;
@@ -49,42 +45,68 @@ export function relativeTime(ts, now = Date.now()) {
   return new Date(ts).toLocaleDateString('pt-BR');
 }
 
-/** A small deterministic sketch derived from the board id (not a real render). */
-function BoardPreview({ seed }) {
-  const w = 104;
-  const h = 68;
-  const shapes = useMemo(() => {
-    let hsh = 2166136261;
-    const s = String(seed || 'board');
-    for (let i = 0; i < s.length; i++) {
-      hsh ^= s.charCodeAt(i);
-      hsh = Math.imul(hsh, 16777619);
+/**
+ * True once `ref`'s element has come near the viewport (and stays true), so
+ * a thumbnail is fetched only for rows someone scrolls to.
+ */
+function useSeen(ref, margin = '200px') {
+  const [seen, setSeen] = useState(false);
+  useEffect(() => {
+    const el = ref.current;
+    if (seen || !el) return undefined;
+    if (typeof IntersectionObserver === 'undefined') {
+      setSeen(true);
+      return undefined;
     }
-    const rnd = () => {
-      hsh = Math.imul(hsh ^ (hsh >>> 15), 2246822519);
-      return ((hsh ^ (hsh >>> 13)) >>> 0) / 4294967296;
-    };
-    const out = [];
-    const n = 2 + Math.floor(rnd() * 3);
-    for (let i = 0; i < n; i++) {
-      const sw = 18 + rnd() * 26;
-      const sh = 12 + rnd() * 18;
-      out.push({ x: 8 + rnd() * (w - sw - 16), y: 8 + rnd() * (h - sh - 16), w: sw, h: sh, kind: Math.floor(rnd() * 3) });
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) setSeen(true);
+      },
+      { rootMargin: margin },
+    );
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [ref, seen, margin]);
+  return seen;
+}
+
+/**
+ * The board's real content, drawn small (ui/boardPreview.js): fetched once
+ * the row is on screen, cached per revision. An empty board says so; a very
+ * large one shows its element count.
+ */
+function BoardPreview({ board }) {
+  const ref = useRef(null);
+  const kind = previewKind(board);
+  const seen = useSeen(ref);
+  const dark = useUi((s) => s.theme === 'dark');
+  const { data } = useQuery({
+    queryKey: previewQueryKey(board),
+    queryFn: ({ signal }) => api.get(`/boards/${encodeURIComponent(board.id)}/snapshot`, { signal }),
+    enabled: seen && kind === 'content',
+    staleTime: Infinity,
+    gcTime: 10 * 60_000,
+    retry: false,
+  });
+  const elements = data?.elements;
+  const src = useMemo(() => {
+    try {
+      return previewSrc(elements, { dark });
+    } catch (err) {
+      console.warn('[boards] preview failed', err);
+      return null;
     }
-    return out;
-  }, [seed]);
+  }, [elements, dark]);
   return (
-    <svg className="board-preview" width={w} height={h} viewBox={`0 0 ${w} ${h}`} aria-hidden="true" focusable="false">
-      {shapes.map((s, i) =>
-        s.kind === 1 ? (
-          <ellipse key={i} cx={s.x + s.w / 2} cy={s.y + s.h / 2} rx={s.w / 2} ry={s.h / 2} />
-        ) : s.kind === 2 ? (
-          <path key={i} d={`M${s.x} ${s.y + s.h / 2} L${s.x + s.w / 2} ${s.y} L${s.x + s.w} ${s.y + s.h / 2} L${s.x + s.w / 2} ${s.y + s.h} Z`} />
-        ) : (
-          <rect key={i} x={s.x} y={s.y} width={s.w} height={s.h} rx={4} />
-        ),
-      )}
-    </svg>
+    <span ref={ref} className="board-preview" data-preview={src ? 'drawn' : kind} aria-hidden="true">
+      {src ? (
+        <img className="board-preview__img" src={src} alt="" draggable="false" />
+      ) : kind === 'empty' ? (
+        <span className="board-preview__note">{T.previewEmpty}</span>
+      ) : kind === 'large' ? (
+        <span className="board-preview__note">{T.previewCount(board.elementCount)}</span>
+      ) : null}
+    </span>
   );
 }
 
@@ -138,7 +160,6 @@ function BoardCard({ board, onOpen, nickname }) {
   const createBoard = useCreateBoard();
   const deleteBoard = useDeleteBoard();
   const claimBoard = useClaimBoard();
-  const applyOps = useApplyOps(board.id);
   const qc = useQueryClient();
   const title = board.title || T.defaultTitle;
 
@@ -159,7 +180,7 @@ function BoardCard({ board, onOpen, nickname }) {
       if (!save || !next || next === board.title) return;
       updateBoard.mutate(
         { title: next },
-        { onSuccess: () => toast.success(T.renamed), onError: (e) => toast.error(e?.message || T.renameFailed) },
+        { onSuccess: () => toast.success(T.renamed), onError: (e) => toast.error(errorMessage(e, T.renameFailed)) },
       );
     },
     [board.title, draft, updateBoard],
@@ -168,7 +189,7 @@ function BoardCard({ board, onOpen, nickname }) {
   const claim = useCallback(() => {
     claimBoard.mutate(
       { id: board.id, owner: nickname },
-      { onSuccess: () => toast.success(T.claimed(nickname)), onError: (e) => toast.error(e?.message || T.claimFailed) },
+      { onSuccess: () => toast.success(T.claimed(nickname)), onError: (e) => toast.error(errorMessage(e, T.claimFailed)) },
     );
   }, [board.id, claimBoard, nickname]);
 
@@ -179,48 +200,32 @@ function BoardCard({ board, onOpen, nickname }) {
       {
         onSuccess: async (created) => {
           try {
-            const snap = await api.get(`/boards/${encodeURIComponent(board.id)}`);
-            const source = Array.isArray(snap?.elements) ? snap.elements : [];
-            if (!source.length) {
-              toast.success(T.duplicated(created.title, 0));
-              onOpen?.(created.id);
-              return;
-            }
-            // Fresh ids with bindings/groups remapped. cloneElements drops
-            // `locked`; restore it when the copy lines up with the source.
-            const cloned = cloneElements(source);
-            const copies = cloned.length === source.length ? cloned.map((el, i) => (source[i].locked ? { ...el, locked: true } : el)) : cloned;
-            const now = Date.now();
-            const ops = copies.map((element) => ({ opId: newOpId(), boardId: created.id, kind: 'create', element, at: now }));
-            // The server accepts a bounded batch; send big boards in chunks.
-            let ok = true;
-            for (let i = 0; i < ops.length && ok; i += 150) {
-              const res = await applyOps.applyOps({ ops: ops.slice(i, i + 150) });
-              ok = Boolean(res?.ok);
-            }
-            if (ok) toast.success(T.duplicated(created.title, ops.length));
+            // Posted to the COPY's endpoint (ui/boardOps.js): the server puts
+            // a batch on the board in the URL, whatever `op.boardId` says.
+            const res = await copyBoardElements(board.id, created.id);
+            if (res.ok) toast.success(T.duplicated(created.title, res.count));
             else toast.error(T.duplicateEmpty(created.title));
             qc.invalidateQueries({ queryKey: queryKeys.allBoards });
             qc.invalidateQueries({ queryKey: queryKeys.board(created.id) });
             onOpen?.(created.id);
           } catch (e) {
-            toast.error(e?.message || T.duplicateFailed);
+            toast.error(errorMessage(e, T.duplicateFailed));
           } finally {
             setBusy(false);
           }
         },
         onError: (e) => {
           setBusy(false);
-          toast.error(e?.message || T.duplicateFailed);
+          toast.error(errorMessage(e, T.duplicateFailed));
         },
       },
     );
-  }, [board.id, title, applyOps, createBoard, nickname, onOpen, qc]);
+  }, [board.id, title, createBoard, nickname, onOpen, qc]);
 
   const remove = useCallback(() => {
     deleteBoard.mutate(board.id, {
       onSuccess: () => toast.success(T.deleted),
-      onError: (e) => toast.error(e?.message || T.deleteFailed),
+      onError: (e) => toast.error(errorMessage(e, T.deleteFailed)),
     });
   }, [board.id, deleteBoard]);
 
@@ -228,7 +233,7 @@ function BoardCard({ board, onOpen, nickname }) {
 
   return (
     <li className="board-row" data-board-id={board.id} onClick={() => !renaming && onOpen(board.id)}>
-      <BoardPreview seed={board.id} />
+      <BoardPreview board={board} />
       <div className="board-row__main">
         {renaming ? (
           <input
@@ -309,11 +314,52 @@ function BoardCard({ board, onOpen, nickname }) {
   );
 }
 
+/**
+ * The list, one server page at a time (`limit`/`offset`), plus an optional
+ * title search. The server pages by creation date, so without paging a board
+ * that is old but still in use fell off the only page ever requested, and
+ * nothing in the UI could reach it.
+ *
+ * The key sits under the shared `['boards']` prefix, so every create, rename,
+ * claim and delete that invalidates the lists refreshes this one too. The
+ * trailing object keeps it apart from `useBoards`' string-keyed entries.
+ */
+function useBoardPages(nickname, search) {
+  return useInfiniteQuery({
+    queryKey: [...queryKeys.allBoards, nickname ?? '', { paged: true, search }],
+    queryFn: ({ pageParam, signal }) => api.get(boardListQuery({ owner: nickname, search, offset: pageParam }), { signal }),
+    initialPageParam: 0,
+    getNextPageParam: nextPageOffset,
+    enabled: Boolean(nickname),
+    staleTime: 5000,
+    // While a new search loads, keep showing the last result rather than
+    // flashing skeletons on every keystroke — but never another nickname's list.
+    placeholderData: (prev, prevQuery) => (prevQuery?.queryKey?.[1] === (nickname ?? '') ? prev : undefined),
+  });
+}
+
+const SEARCH_DEBOUNCE_MS = 250;
+
 export function BoardList({ onOpen }) {
-  const { data: boards, isLoading, isError, error, refetch } = useBoards();
   const createBoard = useCreateBoard();
   const nickname = useNickname();
   const [tick, setTick] = useState(0);
+  const [searchText, setSearchText] = useState('');
+  const [search, setSearch] = useState('');
+
+  useEffect(() => {
+    const id = setTimeout(() => setSearch(searchText.trim()), SEARCH_DEBOUNCE_MS);
+    return () => clearTimeout(id);
+  }, [searchText]);
+
+  const { data, isLoading, isError, error, refetch, fetchNextPage, hasNextPage, isFetchingNextPage, isPlaceholderData } = useBoardPages(
+    nickname,
+    search,
+  );
+  const pages = data?.pages;
+  const boards = useMemo(() => mergeBoardPages(pages), [pages]);
+  // The server's count for the whole list (not just the pages in hand).
+  const total = pages?.length ? pageTotal(pages[pages.length - 1]) ?? boards.length : 0;
 
   useEffect(() => {
     const id = setInterval(() => setTick((n) => n + 1), TICK_MS);
@@ -321,14 +367,27 @@ export function BoardList({ onOpen }) {
   }, []);
 
   const list = useMemo(
-    () => (boards ?? []).slice().sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0)),
+    () => boards.slice().sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0)),
     // `tick` is a dependency on purpose: it re-renders the relative times.
     [boards, tick],
   );
   const counts = useMemo(() => {
     const mine = list.filter((b) => b.ownerId && b.ownerId === nickname).length;
-    return { mine, unclaimed: list.filter((b) => !b.ownerId).length, total: list.length };
+    return { mine, unclaimed: list.filter((b) => !b.ownerId).length, loaded: list.length };
   }, [list, nickname]);
+  // Mine / unclaimed can only be told apart for rows in hand: say the split
+  // when everything is loaded, and "N of TOTAL" otherwise — never a split of
+  // one page presented as the whole.
+  const complete = !hasNextPage && counts.loaded >= total;
+  const subtitle = isPlaceholderData
+    ? T.searching
+    : search
+      ? T.searchCount(total, search)
+      : total === 0
+        ? T.subtitleEmpty
+        : complete
+          ? T.subtitle(counts.mine, counts.unclaimed)
+          : T.subtitlePartial(counts.loaded, total);
 
   const create = useCallback(() => {
     createBoard.mutate(
@@ -338,7 +397,8 @@ export function BoardList({ onOpen }) {
           toast.success(T.created);
           onOpen?.(b.id);
         },
-        onError: (e) => toast.error(e?.message || T.createFailed),
+        // A 404 here is a misrouted API, not a missing board.
+        onError: (e) => toast.error(errorMessage(e, T.createFailed, { notFound: null })),
       },
     );
   }, [createBoard, nickname, onOpen]);
@@ -352,9 +412,30 @@ export function BoardList({ onOpen }) {
           </div>
           <div className="board-list__heading">
             <h1 className="board-list__title">{T.title}</h1>
-            <p className="board-list__subtitle">{counts.total === 0 ? T.subtitleEmpty : T.subtitle(counts.mine, counts.unclaimed)}</p>
+            <p className="board-list__subtitle" data-testid="board-count" data-total={total}>
+              {subtitle}
+            </p>
           </div>
           <div className="board-list__tools">
+            <label className="board-search">
+              <IconSearch size={16} className="board-search__icon" />
+              <input
+                type="search"
+                className="field board-search__input"
+                data-testid="board-search"
+                placeholder={T.searchPlaceholder}
+                aria-label={T.searchLabel}
+                value={searchText}
+                maxLength={120}
+                onChange={(e) => setSearchText(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Escape' && searchText) {
+                    e.preventDefault();
+                    setSearchText('');
+                  }
+                }}
+              />
+            </label>
             <NicknameSwitcher />
             <button type="button" className="btn btn--primary" onClick={create} disabled={createBoard.isPending} data-testid="new-board">
               <IconPlus size={18} />
@@ -373,9 +454,20 @@ export function BoardList({ onOpen }) {
           ) : isError ? (
             <div className="island board-list__state" role="alert">
               <h2>{T.loadError}</h2>
-              <p>{error?.message || T.loadErrorText}</p>
+              <p>{errorSentence(error, { notFound: null }) || T.loadErrorText}</p>
               <button type="button" className="btn btn--primary" onClick={() => refetch()}>
                 {T.retry}
+              </button>
+            </div>
+          ) : list.length === 0 && search ? (
+            <div className="island board-list__state" data-board-list-state="no-match">
+              <span className="board-list__state-icon">
+                <IconSearch size={24} />
+              </span>
+              <h2>{T.searchEmpty(search)}</h2>
+              <p>{T.searchEmptyText}</p>
+              <button type="button" className="btn" onClick={() => setSearchText('')}>
+                {T.searchClear}
               </button>
             </div>
           ) : list.length === 0 ? (
@@ -405,11 +497,26 @@ export function BoardList({ onOpen }) {
               </button>
             </div>
           ) : (
-            <ul className="board-rows" data-board-list-state="ready">
-              {list.map((b) => (
-                <BoardCard key={b.id} board={b} onOpen={onOpen} nickname={nickname} />
-              ))}
-            </ul>
+            <>
+              <ul className="board-rows" data-board-list-state="ready">
+                {list.map((b) => (
+                  <BoardCard key={b.id} board={b} onOpen={onOpen} nickname={nickname} />
+                ))}
+              </ul>
+              {hasNextPage ? (
+                <div className="board-list__more">
+                  <button
+                    type="button"
+                    className="btn"
+                    data-testid="load-more-boards"
+                    disabled={isFetchingNextPage}
+                    onClick={() => void fetchNextPage()}
+                  >
+                    {isFetchingNextPage ? T.loadingMore : T.loadMore(Math.max(0, total - counts.loaded))}
+                  </button>
+                </div>
+              ) : null}
+            </>
           )}
         </div>
       </div>

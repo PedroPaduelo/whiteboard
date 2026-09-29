@@ -20,11 +20,30 @@
 }
 
 .editor-ui {
+  /* Widths of the side islands, which the centred hint line keeps clear of. */
+  --props-w: 204px;
+  --library-w: 312px;
   position: absolute;
   inset: 0;
   z-index: var(--z-ui);
   pointer-events: none;
   font-family: var(--ui-font);
+}
+
+/* The chrome is not text to select (Excalidraw): a label or a toast
+   double-clicked by accident left a page selection that took Ctrl+C / Ctrl+X
+   away from the board's selected elements. Fields stay selectable. */
+.app-shell,
+.app-shell ~ .toast-area {
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.app-shell input,
+.app-shell textarea,
+.app-shell [contenteditable='true'] {
+  -webkit-user-select: text;
+  user-select: text;
 }
 
 .editor-ui .island,
@@ -43,7 +62,14 @@
   left: var(--gutter);
   right: var(--gutter);
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  /* Side columns share the space equally, so the tool island sits in the
+     middle of the screen — until the right cluster (title, people, Share,
+     Library) needs more than half: `minmax(auto, …)` never makes a column
+     narrower than its content's minimum, so the right column then takes what
+     it needs from the mostly empty left one and the island moves over a
+     little. (With `minmax(0, …)` the right column was capped at half, and the
+     title — its only flexible item — was squeezed down to nothing.) */
+  grid-template-columns: minmax(auto, 1fr) auto minmax(auto, 1fr);
   align-items: start;
   gap: 12px;
   /* Above the side panels and the bottom row, so its dropdowns are too. */
@@ -63,12 +89,12 @@
 }
 
 .top-right {
-  justify-self: end;
+  /* Fills its column (the title grows into the room), content to the right. */
+  justify-self: stretch;
   display: flex;
   align-items: center;
+  justify-content: flex-end;
   gap: 8px;
-  min-width: 0;
-  max-width: 100%;
 }
 
 .island--button {
@@ -241,8 +267,29 @@
 
 /* --- hint line & error banner -------------------------------------------------------- */
 
+/* Under the tool island, centred on the SCREEN (the top bar spans gutter to
+   gutter), at the height where the properties panel (left) and the library
+   (right) start. Its width leaves a panel's width free on both sides, so it
+   wraps instead of covering them: centred on the island's column, which
+   moves left when the right cluster is wide, it covered the panel's corner
+   at 641-863px. No transform (it would trap the phone banner's `fixed`). */
+.top-hints {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 0;
+  right: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  width: fit-content;
+  max-width: min(560px, calc(100% - 2 * (var(--props-w) + 12px)));
+  margin: 0 auto;
+  pointer-events: none;
+}
+
 .hint-line {
-  max-width: min(560px, calc(100vw - 32px));
+  max-width: 100%;
   padding: 2px 10px;
   border-radius: var(--radius-sm);
   background: color-mix(in srgb, var(--canvas-bg) 82%, transparent);
@@ -257,7 +304,7 @@
   display: flex;
   align-items: center;
   gap: 8px;
-  max-width: min(560px, calc(100vw - 32px));
+  max-width: min(560px, 100%);
   padding: 6px 6px 6px 12px;
   color: var(--danger);
   font-size: 13px;
@@ -266,13 +313,20 @@
 /* --- top right ------------------------------------------------------------------------ */
 
 .top-right__title {
-  flex: 0 1 auto;
-  min-width: 0;
+  /* The title takes whatever room the column has left, and never less than
+     --title-min: that minimum is what the grid reserves for it (the
+     `contain` stops the full title width from counting as a minimum too). */
+  --title-min: 120px;
+  flex: 1 1 0;
+  min-width: var(--title-min);
   display: flex;
+  justify-content: flex-end;
+  contain: inline-size;
 }
 
 .board-title {
   display: block;
+  flex: 0 1 auto;
   max-width: 240px;
   min-width: 0;
   height: var(--touch);
@@ -296,6 +350,7 @@
 
 .board-title--input {
   width: 240px;
+  max-width: 100%;
   line-height: normal;
   background: var(--island-bg);
   box-shadow: 0 0 0 2px var(--accent);
@@ -398,6 +453,11 @@
   font-weight: 700;
 }
 
+/* With the (wider) library open they keep clear of it too. */
+.editor-ui:has(.library-panel) .top-hints {
+  max-width: min(560px, calc(100% - 2 * (var(--library-w) + 12px)));
+}
+
 /* --- properties panel --------------------------------------------------------------- */
 
 .props-panel {
@@ -408,7 +468,7 @@
   display: flex;
   flex-direction: column;
   gap: 14px;
-  width: 204px;
+  width: var(--props-w);
   max-height: calc(100% - var(--gutter) - var(--touch) - 12px - 76px);
   padding: 12px;
   overflow-y: auto;
@@ -643,7 +703,7 @@ html[data-theme='dark'] .swatch::before {
   display: flex;
   flex-direction: column;
   gap: 10px;
-  width: 312px;
+  width: var(--library-w);
   padding: 12px;
   box-shadow: var(--island-shadow-strong);
 }
@@ -833,6 +893,29 @@ html[data-theme='dark'] .lib-ghost {
   background: var(--hover);
 }
 
+/* --- "Voltar ao conteúdo" (no element in view) -------------------------------------- */
+
+.scroll-back {
+  position: absolute;
+  left: 50%;
+  bottom: calc(var(--gutter) + 2px);
+  z-index: var(--z-panel);
+  height: 36px;
+  padding: 0 16px;
+  border: 0;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  transform: translateX(-50%);
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+.scroll-back:hover {
+  background: var(--hover);
+}
+
 /* --- welcome screen ----------------------------------------------------------------- */
 
 .welcome {
@@ -954,6 +1037,17 @@ html[data-theme='dark'] .lib-ghost {
   color: var(--text);
 }
 
+/* Short windows (a 1366x768 laptop with the browser's bars, or a zoomed-in
+   page): the toolbar hint is pinned under the tool island while the centred
+   block rises as the height shrinks, so below ~650px they overlapped and
+   "comece a desenhar!" printed over the logo. The hint goes there, as
+   Excalidraw's decorations do on short screens. */
+@media (max-height: 660px) {
+  .welcome-hint--toolbar {
+    display: none;
+  }
+}
+
 /* --- toasts ------------------------------------------------------------------------- */
 
 .toast-area {
@@ -1049,6 +1143,18 @@ html[data-theme='dark'] .lib-ghost {
 
 /* --- medium widths: keep the top row on one line ---------------------------------------- */
 
+/* With people on the board the avatars and the count say "shared" already;
+   the word makes room for the title (and keeps the tool island centred). */
+@media (max-width: 1440px) {
+  .share-btn--crowded .share-btn__label {
+    display: none;
+  }
+
+  .share-btn--crowded {
+    padding: 0 10px;
+  }
+}
+
 @media (max-width: 1180px) {
   .board-title {
     max-width: 180px;
@@ -1062,13 +1168,9 @@ html[data-theme='dark'] .lib-ghost {
   .more-tools__btn {
     width: 40px;
   }
-}
 
-@media (max-width: 1040px) {
-  .avatars {
-    display: none;
-  }
-
+  /* The Share button keeps its dot, icon and people count; the word goes
+     (it is still the tooltip and the accessible name). */
   .share-btn__label {
     display: none;
   }
@@ -1078,8 +1180,64 @@ html[data-theme='dark'] .lib-ghost {
   }
 }
 
+/* The 32px tool buttons above keep the icon and the digit badge clear of
+   each other: at the full 20px icon and the 36px button's badge, "2" ran
+   into the square, "9" into the image frame and "1" into the arrow. (Phones
+   size the buttons their own way and hide the badges.) */
+@media (min-width: 641px) and (max-width: 1180px) {
+  .tool-btn > svg:not(.more-tools__chevron) {
+    width: 17px;
+    height: 17px;
+  }
+
+  .tool-btn .icon-btn__badge {
+    right: 2px;
+    bottom: 1px;
+    font-size: 9px;
+  }
+}
+
+@media (max-width: 1040px) {
+  .avatars {
+    display: none;
+  }
+}
+
+/* Tablets and small windows: the title stays (it is the only rename control
+   inside a board), so the island gets narrower instead — the tool lock and
+   the hand move into the "more" menu, as on phones — and the Library button
+   goes (the "more" menu has it too). The title's minimum follows the width. */
 @media (max-width: 900px) {
   .top-right__title {
+    --title-min: clamp(56px, calc(100vw - 600px), 140px);
+  }
+
+  .tool-island .tool-btn {
+    width: 32px;
+    min-width: 32px;
+  }
+
+  .tool-island .more-tools__btn {
+    width: 36px;
+  }
+
+  .tool-island .tool-btn--lock,
+  .tool-island .tool-btn[data-tool='hand'],
+  .tool-island > .island-divider:first-of-type {
+    display: none;
+  }
+
+  .menu-item.mobile-only {
+    display: flex;
+  }
+
+  /* The hand is in the "more" menu here: its button shows that it is active. */
+  .more-tools__btn--hand {
+    background: var(--active-bg);
+    color: var(--accent);
+  }
+
+  .top-right__library {
     display: none;
   }
 
@@ -1090,6 +1248,23 @@ html[data-theme='dark'] .lib-ghost {
   .welcome-hint--library,
   .welcome-hint--menu span {
     display: none;
+  }
+
+  /* The library leaves no room for the hint beside it. */
+  .editor-ui:has(.library-panel) .hint-line {
+    display: none;
+  }
+}
+
+/* Too narrow for the hint between the properties panel and the right edge;
+   a (rare) error banner may use the whole width rather than a sliver. */
+@media (max-width: 720px) {
+  .hint-line {
+    display: none;
+  }
+
+  .top-hints {
+    max-width: min(560px, 100%);
   }
 }
 
@@ -1112,8 +1287,8 @@ html[data-theme='dark'] .lib-ghost {
     grid-column: 2;
   }
 
-  .top-right__title {
-    display: flex;
+  .top-right__library {
+    display: inline-flex;
   }
 
   .board-title {
@@ -1138,27 +1313,43 @@ html[data-theme='dark'] .lib-ghost {
     display: none;
   }
 
+  /* The tools share the island's width: 10 of them plus "more" must fit a
+     360px phone. A fixed width did not, because the touch rule in global.css
+     (`.icon-btn { min-width: 36px }` under pointer:coarse) beat it, which
+     pushed the "more tools" button — the only way to sticky, cylinder, tool
+     lock and hand on a phone — off the island's hidden-scrollbar edge. */
   .tool-island .tool-btn {
-    width: 32px;
+    flex: 1 1 32px;
+    width: auto;
+    min-width: 28px;
+    max-width: 40px;
     height: 38px;
   }
 
-  /* Lock and hand live in the "more" menu on phones (two fingers pan). */
-  .tool-island .tool-btn--lock,
-  .tool-island .tool-btn[data-tool='hand'],
-  .tool-island > .island-divider:first-of-type {
-    display: none;
+  /* Pinned to the island's right edge, so even on the narrowest phone, where
+     the tools must scroll, "more" never scrolls away. */
+  .tool-island .more-tools {
+    position: sticky;
+    right: 0;
+    flex: none;
+    border-radius: var(--radius);
+    background: var(--island-bg);
   }
 
   .tool-island .more-tools__btn {
+    flex: none;
     width: 36px;
+    max-width: none;
   }
 
   .more-tools__chevron {
     display: none;
   }
 
-  .welcome-action .kbd {
+  /* No keyboard on a phone: the menus (main, context, more tools) drop
+     their shortcut column, like the welcome screen's key chips. */
+  .welcome-action .kbd,
+  .menu-item__hint {
     display: none;
   }
 
@@ -1181,6 +1372,10 @@ html[data-theme='dark'] .lib-ghost {
   .hint-line,
   .welcome-hint {
     display: none;
+  }
+
+  .top-hints {
+    display: contents;
   }
 
   .error-banner {
@@ -1220,10 +1415,6 @@ html[data-theme='dark'] .lib-ghost {
     display: none;
   }
 
-  .menu-item.mobile-only {
-    display: flex;
-  }
-
   .props-panel {
     position: fixed;
     top: auto;
@@ -1244,8 +1435,14 @@ html[data-theme='dark'] .lib-ghost {
   }
 
   .props-panel[data-open='true'] ~ .bottom-bar,
-  .library-panel ~ .bottom-bar {
+  .library-panel ~ .bottom-bar,
+  .props-panel[data-open='true'] ~ .scroll-back,
+  .library-panel ~ .scroll-back {
     display: none;
+  }
+
+  .scroll-back {
+    bottom: calc(62px + env(safe-area-inset-bottom, 0px));
   }
 
   .props-panel__sheet-head {
@@ -1285,5 +1482,17 @@ html[data-theme='dark'] .lib-ghost {
 
   .app-shell ~ .toast-area {
     bottom: calc(112px + env(safe-area-inset-bottom, 0px));
+  }
+}
+
+/* --- touch-only devices (tablets included) ----------------------------------------------- */
+
+/* A touch screen with no mouse (and so, as a rule, no keyboard in hand):
+   shortcut hints are keys nobody can press. A tablet with a trackpad
+   reports a fine pointer or hover and keeps them. */
+@media (hover: none) and (pointer: coarse) {
+  .welcome-action .kbd,
+  .menu-item__hint {
+    display: none;
   }
 }

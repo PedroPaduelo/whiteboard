@@ -215,6 +215,33 @@ test("'?' with Shift opens help", () => {
   assert.deepEqual(c.ui.calls, ['toggle:helpOpen']);
 });
 
+test("with a modal open only Escape and the help toggle run: '?' closes the help sheet it opened", () => {
+  const open = new Set(['helpOpen']);
+  const c = ctx({ isOpen: (k) => open.has(k), toggle: (k) => (open.has(k) ? open.delete(k) : open.add(k)) });
+  S().select(['a']);
+  const ev = key('?', 'Slash', { shiftKey: true });
+  assert.equal(runShortcut(ev, c, { modal: true }), 'view.help');
+  assert.equal(open.has('helpOpen'), false, 'help closed by its own key');
+  // Another modal (export) is open: '?' does not stack help on top of it.
+  open.add('exportOpen');
+  assert.equal(runShortcut(ev, c, { modal: true }), null);
+  assert.equal(open.has('helpOpen'), false);
+  // Every other key belongs to the dialog: no board shortcut behind it.
+  assert.equal(runShortcut(key('Delete', 'Delete'), c, { modal: true }), null);
+  assert.equal(runShortcut(letter('r'), c, { modal: true }), null);
+  assert.equal(S().elements.length, 2);
+  assert.equal(S().tool, 'select');
+  // Escape still closes the modal.
+  let closed = false;
+  const c2 = ctx({ closeTopOverlay: () => (closed = true) });
+  assert.equal(runShortcut(key('Escape', 'Escape'), c2, { modal: true }), 'edit.escape');
+  assert.equal(closed, true);
+  // '?' typed into a dialog field is text, not a shortcut.
+  const typed = key('?', 'Slash', { shiftKey: true, target: { tagName: 'INPUT', type: 'text' } });
+  open.add('helpOpen');
+  assert.equal(runShortcut(typed, c, { modal: true }), null);
+});
+
 test('Backspace deletes the selection, as Delete does', () => {
   S().select(['a']);
   assert.equal(runShortcut(key('Backspace', 'Backspace'), ctx()), 'edit.delete');
@@ -227,7 +254,7 @@ test('Backspace deletes the selection, as Delete does', () => {
   assert.deepEqual(S().elements.map((el) => el.id), ['a']);
 });
 
-test('legacy contract: edit.delete calls commit("delete") -> removeElements(ids) -> clearSelection()', () => {
+test('legacy contract: edit.delete calls commit("delete:<unique>") -> removeElements(ids) -> clearSelection()', () => {
   const entry = SHORTCUTS.find((c) => c.id === 'edit.delete');
   const calls = [];
   entry.handler({
@@ -239,7 +266,8 @@ test('legacy contract: edit.delete calls commit("delete") -> removeElements(ids)
     },
   });
   assert.deepEqual(calls.map((c) => c[0]), ['commit', 'removeElements', 'clearSelection']);
-  assert.equal(calls[0][1], 'delete');
+  // A unique label per delete: two quick deletes stay two undo steps.
+  assert.match(calls[0][1], /^delete:/);
   assert.deepEqual(calls[1][1], ['a', 'b']);
 
   const calls2 = [];
@@ -263,6 +291,17 @@ test('arrows nudge the selection (Shift = 10x) and are not handled without one',
   S().clearSelection();
   const ev = key('ArrowLeft', 'ArrowLeft');
   assert.equal(runShortcut(ev, ctx()), null, 'nothing selected: not handled, so no preventDefault');
+});
+
+test('in grid mode an arrow moves one grid cell and Shift+arrow one unit, so a snapped element stays snapped', () => {
+  S().toggleSnap();
+  const grid = S().gridSize;
+  assert.ok(grid > 1);
+  S().select(['a']);
+  runShortcut(key('ArrowRight', 'ArrowRight'), ctx());
+  assert.equal(S().elements[0].x, grid);
+  runShortcut(key('ArrowDown', 'ArrowDown', { shiftKey: true }), ctx());
+  assert.equal(S().elements[0].y, NUDGE);
 });
 
 test('Ctrl+C / Ctrl+X / Ctrl+V are left to the native clipboard events', () => {

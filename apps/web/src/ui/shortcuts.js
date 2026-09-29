@@ -10,12 +10,14 @@
  * A binding is:
  *   { id, group, label, keys: string[], handler({store, ui, actions, event}),
  *     when?(ctx) => boolean, native?: true, hold?: true, allowInInput?: true,
- *     repeat?: false, display?: string[] }
+ *     inModal?: true | (ctx) => boolean, repeat?: false, display?: string[] }
  * `keys` lists alternative chords like 'Mod+Shift+Z' or '?'. A handler may
  * return `false` to say "not handled" — the event then keeps its default and
  * the next binding gets a chance. `native` bindings (Ctrl+C/X/V) are shown in
  * help but never run from keydown: the real copy/cut/paste events do the work,
  * so this handler must not preventDefault them. `hold` rows are help-only.
+ * While a modal dialog is open only `inModal` bindings run (Escape, and '?'
+ * to close the help it opened); every other key belongs to the dialog.
  *
  * Key matching (`matchesEvent`):
  *   - letters: `event.key` when it is a Latin letter, else `event.code`
@@ -30,8 +32,7 @@
  */
 
 import { TOOLBAR } from '../editor/tools.js';
-import { NUDGE, NUDGE_SHIFT } from '../editor/constants.js';
-import { actions as editorActions } from '../editor/actions.js';
+import { actions as editorActions, nudgeStep } from '../editor/actions.js';
 import { t } from './strings.js';
 
 const DEV = (() => {
@@ -238,10 +239,11 @@ export const SHORTCUTS = [
     label: t.actions.nudge,
     keys: ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Shift+ArrowUp', 'Shift+ArrowDown', 'Shift+ArrowLeft', 'Shift+ArrowRight'],
     display: ['ArrowUp', 'Shift+ArrowUp'],
-    handler: ({ actions, event }) => {
+    // One grid cell per press in grid mode (Shift: 1 unit), else 1 (Shift ×10).
+    handler: ({ store, actions, event }) => {
       const d = ARROW_DELTAS[event?.key];
       if (!d) return false;
-      const step = event.shiftKey ? NUDGE_SHIFT : NUDGE;
+      const step = nudgeStep(event.shiftKey, store?.getState?.());
       return actions.nudge(d[0] * step, d[1] * step);
     },
   },
@@ -272,6 +274,7 @@ export const SHORTCUTS = [
     label: t.actions.escape,
     keys: ['Escape'],
     allowInInput: true,
+    inModal: true,
     // Close overlay -> finish text edit -> clear selection -> select tool.
     handler: ({ store, ui, event }) => {
       if (ui?.closeTopOverlay?.()) return true;
@@ -307,7 +310,17 @@ export const SHORTCUTS = [
   { id: 'view.wheel', group: GROUP.view, label: t.actions.wheelZoom, keys: ['Mod+Wheel'], hold: true, display: ['Mod+Roda'], handler: () => false },
   { id: 'view.grid', group: GROUP.view, label: t.actions.toggleGrid, keys: ["Mod+'"], repeat: false, handler: ({ actions }) => actions.toggleGrid() },
   { id: 'view.theme', group: GROUP.view, label: t.actions.toggleTheme, keys: ['Alt+Shift+D'], repeat: false, handler: ({ ui }) => ui.toggleTheme() },
-  { id: 'view.help', group: GROUP.view, label: t.actions.help, keys: ['?'], repeat: false, handler: ({ ui }) => ui.toggle('helpOpen') },
+  {
+    id: 'view.help',
+    group: GROUP.view,
+    label: t.actions.help,
+    keys: ['?'],
+    repeat: false,
+    // '?' toggles, as in Excalidraw: with the help sheet open (a modal) it is
+    // the one other key that still runs — only to close that sheet.
+    inModal: ({ ui }) => Boolean(ui?.isOpen?.('helpOpen')),
+    handler: ({ ui }) => ui.toggle('helpOpen'),
+  },
 
   /* --- board -------------------------------------------------------------- */
   { id: 'board.export', group: GROUP.board, label: t.actions.exportImage, keys: ['Mod+Shift+E'], repeat: false, handler: ({ ui }) => ui.toggle('exportOpen') },
@@ -352,13 +365,14 @@ export function shortcutHint(id) {
  * `ctx` = `{store, ui, actions}`; `actions` defaults to editor/actions.js.
  * A handler that throws is reported with console.error (never silently) and
  * counts as not handled; in development it is re-thrown so it cannot hide.
+ * `modal`: a modal dialog is open, so only `inModal` bindings may run.
  *
  * @param {KeyboardEvent} event
  * @param {{store:object, ui?:object, actions?:object}} ctx
- * @param {{dev?: boolean}} [opts]
+ * @param {{dev?: boolean, modal?: boolean}} [opts]
  * @returns {string|null}
  */
-export function runShortcut(event, ctx, { dev = DEV } = {}) {
+export function runShortcut(event, ctx, { dev = DEV, modal = false } = {}) {
   if (!event || event.isComposing) return null;
   const typing = isTypingTarget(event.target);
   // Enter/Space/arrows on a focused button, slider or menu are that control's.
@@ -369,6 +383,7 @@ export function runShortcut(event, ctx, { dev = DEV } = {}) {
     if (typing && !s.allowInInput) continue;
     if (event.repeat && s.repeat === false) continue;
     if (!matchesEvent(event, s.keys)) continue;
+    if (modal && !(typeof s.inModal === 'function' ? s.inModal(full) : s.inModal)) continue;
     if (s.when && !s.when(full)) continue;
     let result;
     try {

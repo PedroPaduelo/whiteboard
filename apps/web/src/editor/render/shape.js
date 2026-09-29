@@ -356,6 +356,27 @@ export function connectorEnds(pts, curved) {
   return out;
 }
 
+/**
+ * Where each segment of a connector is halfway, as drawn: on a round
+ * multi-point connector the middle (t = 0.5) of each curve piece, otherwise
+ * the plain midpoint. The point editor marks these as the places a new point
+ * can be added.
+ * @param {{x:number,y:number}[]} points
+ * @param {boolean} curved
+ * @returns {{x:number,y:number}[]} one per segment
+ */
+export function segmentMidpoints(points, curved) {
+  if (!Array.isArray(points) || points.length < 2) return [];
+  if (curved && points.length > 2) {
+    return curveSegments(points).map((s) => bezierAt(s[0], s[1], s[2], s[3], 0.5));
+  }
+  const out = [];
+  for (let i = 0; i + 1 < points.length; i++) {
+    out.push({ x: (points[i].x + points[i + 1].x) / 2, y: (points[i].y + points[i + 1].y) / 2 });
+  }
+  return out;
+}
+
 /** roughjs Drawables for one arrowhead (empty for 'none'). */
 function arrowheadDrawables(head, spec, base) {
   if (!head) return [];
@@ -464,6 +485,8 @@ export function outlineToPath(outline) {
  * @property {object[]} drawables           roughjs Drawables (kind 'rough')
  * @property {string} [path]                pen outline path data (kind 'pen')
  * @property {string} [fill]                pen colour (kind 'pen')
+ * @property {object} [geom]                pen: the outline object shared by
+ *   every desc of the same stroke shape (moved copies), for Path2D caching
  */
 
 const ROUGH_TYPES = new Set(['rect', 'ellipse', 'diamond', 'cylinder', 'arrow', 'line']);
@@ -585,19 +608,75 @@ export function buildShape(el) {
 }
 
 /*
- * Two cache levels:
+ * Three cache levels:
  *  1. WeakMap keyed by the element OBJECT. The store replaces an element
  *     object on every change, so a hit is always current and a stale entry is
  *     garbage-collected with its element.
  *  2. A bounded map keyed by the geometry spec (position excluded), for the
  *     rough types. A moved element is a new object with the same spec, so a
  *     drag re-uses the Drawables instead of re-generating hachure every frame.
- *     Pen strokes are not in it: their key would be as long as the stroke.
+ *  3. Pen strokes: their spec key would be as long as the stroke, so instead
+ *     each stroke id keeps the last outline built for it plus a fingerprint
+ *     of what it was built from (points relative to their min corner, hashed,
+ *     and the style). A dragged stroke is a new object with new absolute
+ *     points but the same fingerprint, so it re-uses the outline (and the
+ *     Path2D compiled from it) instead of re-running perfect-freehand and
+ *     re-parsing the path on every frame. One entry per id: resizing a
+ *     stroke replaces its entry rather than piling up versions.
  */
 let byObject = new WeakMap();
 const bySpec = new Map();
 const SPEC_CACHE_MAX = 1500;
 const SPEC_KEY_MAX_POINTS = 64;
+const penById = new Map(); // id -> {key, built}
+const PEN_CACHE_MAX = 4000;
+
+/**
+ * Fingerprint of a pen stroke's shape, position excluded: the point count,
+ * two independent 32-bit hashes of the points relative to `b` (quantised to
+ * 1/1024 unit, so the float noise of a translation does not change it) and
+ * the style fields the outline depends on. O(points), no allocation.
+ */
+function penKey(points, b, st) {
+  let h1 = 0x811c9dc5;
+  let h2 = 0x9747b28c ^ points.length;
+  for (let i = 0; i < points.length; i++) {
+    const p = points[i];
+    const qx = Math.round((p.x - b.x) * 1024) | 0;
+    const qy = Math.round((p.y - b.y) * 1024) | 0;
+    h1 = Math.imul(h1 ^ qx, 0x01000193);
+    h1 = Math.imul(h1 ^ qy, 0x01000193);
+    h2 = Math.imul(h2 ^ qy, 0x5bd1e995);
+    h2 ^= h2 >>> 15;
+    h2 = Math.imul(h2 ^ qx, 0x5bd1e995);
+    h2 ^= h2 >>> 13;
+  }
+  return `${points.length}|${h1 >>> 0}|${h2 >>> 0}|${st.strokeWidth}|${st.stroke}`;
+}
+
+function penShape(el) {
+  const points = Array.isArray(el.points) ? el.points : [];
+  const b = boundsOfPoints(points);
+  const origin = { x: b.x, y: b.y };
+  const st = resolveStyle(el);
+  const key = penKey(points, b, st);
+  const id = typeof el.id === 'string' ? el.id : null;
+  const prev = id !== null ? penById.get(id) : undefined;
+  let built;
+  if (prev && prev.key === key) {
+    built = prev.built;
+    penById.delete(id); // LRU bump
+  } else {
+    built = buildFromSpec(shapeSpec(el));
+  }
+  if (id !== null) {
+    penById.set(id, { key, built });
+    if (penById.size > PEN_CACHE_MAX) penById.delete(penById.keys().next().value);
+  }
+  // `geom` is shared by every desc built from the same outline: the painter
+  // keys its compiled Path2D by it.
+  return { ...built, origin, geom: built };
+}
 
 /**
  * The (cached) ShapeDesc for an element. Same object -> the same ShapeDesc
@@ -609,6 +688,11 @@ const SPEC_KEY_MAX_POINTS = 64;
 export function getShape(el) {
   const hit = byObject.get(el);
   if (hit) return hit;
+  if (el && el.type === 'pen') {
+    const desc = penShape(el);
+    byObject.set(el, desc);
+    return desc;
+  }
   const spec = shapeSpec(el);
   let desc;
   if (ROUGH_TYPES.has(el.type) && (!spec.pts || spec.pts.length <= SPEC_KEY_MAX_POINTS)) {
@@ -633,10 +717,13 @@ export function getShape(el) {
 
 /** Forget the cached shape of one element (or of all, with no argument). */
 export function invalidateShape(el) {
-  if (el) byObject.delete(el);
-  else {
+  if (el) {
+    byObject.delete(el);
+    if (el.type === 'pen') penById.delete(el.id);
+  } else {
     byObject = new WeakMap();
     bySpec.clear();
+    penById.clear();
   }
 }
 
@@ -689,4 +776,57 @@ export function darkRgb(r, g, b) {
   const bb = b / 255;
   const out = m.map((row) => clamp(row[0] * rr + row[1] * gg + row[2] * bb + offset, 0, 1) * 255);
   return [Math.round(out[0]), Math.round(out[1]), Math.round(out[2])];
+}
+
+/**
+ * A `ctx.filter` that undoes DARK_MODE_FILTER. Raster images are drawn
+ * through it in dark mode, so after the canvas's own dark filter a photo
+ * shows its real colours instead of a negative (Excalidraw does the same with
+ * its IMAGE_INVERT_FILTER). Derivation: the dark filter is, per channel,
+ * `y = 0.93 - 0.86·H·x` (H = hue-rotate(180°), which is its own inverse), so
+ * `x = (0.93 - H·y) / 0.86`, which is hue-rotate(180°), then invert(100%)
+ * (1 - v), then contrast(1/0.86) ((v - 0.5)/0.86 + 0.5). Exact for every
+ * colour the dark filter can show; very saturated ones (pure red) come out
+ * as the nearest colour it can show. Measured in Chromium, photo-like colours
+ * round-trip within ~2/255.
+ */
+export const DARK_MODE_COUNTER_FILTER = `hue-rotate(180deg) invert(100%) contrast(${(100 / (2 * DARK_MATRIX.offset - 1)).toFixed(3)}%)`;
+
+/** Inverse of a 3x3 matrix (rows). */
+function inverse3(a) {
+  const [[a0, a1, a2], [b0, b1, b2], [c0, c1, c2]] = a;
+  const d = a0 * (b1 * c2 - b2 * c1) - a1 * (b0 * c2 - b2 * c0) + a2 * (b0 * c1 - b1 * c0);
+  return [
+    [(b1 * c2 - b2 * c1) / d, (a2 * c1 - a1 * c2) / d, (a1 * b2 - a2 * b1) / d],
+    [(b2 * c0 - b0 * c2) / d, (a0 * c2 - a2 * c0) / d, (a2 * b0 - a0 * b2) / d],
+    [(b0 * c1 - b1 * c0) / d, (a1 * c0 - a0 * c1) / d, (a0 * b1 - a1 * b0) / d],
+  ];
+}
+
+/**
+ * The inverse of darkRgb: the colour to PAINT on a dark-filtered canvas so
+ * that it SHOWS as (r, g, b). Used for things that must keep their real
+ * colour in dark mode — a collaborator's cursor must match their avatar.
+ * The filter cannot show every colour (its output never reaches pure white
+ * or pure red, say); such a colour is pulled toward mid grey along a straight
+ * line until the filter can show it, which keeps its hue and keeps greys grey
+ * (white shows as the lightest grey the filter makes, 237).
+ * @returns {[number, number, number]} 0..255
+ */
+export function darkPreimage(r, g, b) {
+  const { m, offset } = DARK_MATRIX;
+  const inv = inverse3(m);
+  const apply = (v) => inv.map((row) => row[0] * v[0] + row[1] * v[1] + row[2] * v[2]);
+  // Mid grey is paintable (by mid grey), so y(λ) = yGrey + λ·d stays in the
+  // paintable cube [0,1]³ for λ in [0, λmax]; take the largest λ <= 1.
+  const grey = 0.5;
+  const yGrey = apply([grey - offset, grey - offset, grey - offset]);
+  const d = apply([r / 255 - grey, g / 255 - grey, b / 255 - grey]);
+  let lambda = 1;
+  for (let j = 0; j < 3; j++) {
+    if (d[j] > 1e-12) lambda = Math.min(lambda, (1 - yGrey[j]) / d[j]);
+    else if (d[j] < -1e-12) lambda = Math.min(lambda, (0 - yGrey[j]) / d[j]);
+  }
+  lambda = Math.max(0, lambda);
+  return yGrey.map((v, j) => Math.round(clamp(v + lambda * d[j], 0, 1) * 255));
 }

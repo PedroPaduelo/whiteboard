@@ -26,9 +26,10 @@
  */
 
 import { boundsOfPoints, reboxPolyline, resolveConnectors, normalizeAngle, snapValue } from '@whiteboard/shared';
-import { BIND_DISTANCE } from './constants.js';
+import { BIND_DISTANCE, FONT_SIZES } from './constants.js';
 import { hasPoints, isLinear, isText, isBindable } from './elements.js';
 import { commonBounds, rotateAround } from './handles.js';
+import { labelBox, labelKeyOf, lineHeightPx, wrapText } from './text.js';
 import { hitShape } from './hitTest.js';
 
 const EPS = 1e-6;
@@ -155,25 +156,96 @@ export function applyPatches(elements, patches) {
 
 /**
  * Translate `originals` by (dx, dy). Boxes patch x/y; polylines patch fresh
- * points. A moved connector whose bound element is NOT moving with it comes
- * unbound at that end (`startId: null`), as in Excalidraw — otherwise the
- * binding pass would snap the end straight back onto the shape.
- * Locked elements are skipped.
+ * points. Locked elements are skipped.
+ *
+ * A moved connector whose bound element is NOT moving with it comes unbound
+ * at that end (`startId: null`) — otherwise the binding pass would snap the
+ * end straight back onto the shape while it is being dragged. With
+ * `opts.elements` (the scene), an end that still sits within the shape's
+ * binding gap after the move KEEPS its binding instead (Excalidraw's
+ * getOriginalBindingsIfStillCloseToArrowEnds): that is what a one-shot move
+ * such as an arrow-key nudge wants; the caller's resolveBindingPatches then
+ * puts the end back on the outline. A live drag passes no scene (the end
+ * follows the pointer) and restores close bindings on release with
+ * `rebindMovedConnectors`.
+ *
+ * @param {object[]} originals
+ * @param {number} dx
+ * @param {number} dy
+ * @param {{elements?: object[], zoom?: number}} [opts]
  */
-export function moveElements(originals, dx, dy) {
+export function moveElements(originals, dx, dy, { elements = null, zoom = 1 } = {}) {
   const movable = originals.filter((el) => !el.locked);
   const moving = new Set(movable.map((el) => el.id));
+  const byId = elements ? new Map(elements.map((el) => [el.id, el])) : null;
   return movable.map((el) => {
     if (hasPoints(el)) {
-      const patch = { points: el.points.map((p) => ({ x: p.x + dx, y: p.y + dy })) };
+      const points = el.points.map((p) => ({ x: p.x + dx, y: p.y + dy }));
+      const patch = { points };
       if (isLinear(el)) {
-        if (el.startId && !moving.has(el.startId)) patch.startId = null;
-        if (el.endId && !moving.has(el.endId)) patch.endId = null;
+        const keep = byId ? keptBindings(el, points, byId, moving, zoom) : {};
+        if (el.startId && !moving.has(el.startId) && !keep.startId) patch.startId = null;
+        if (el.endId && !moving.has(el.endId) && !keep.endId) patch.endId = null;
       }
       return { id: el.id, patch };
     }
     return { id: el.id, patch: { x: el.x + dx, y: el.y + dy } };
   });
+}
+
+/**
+ * The ORIGINAL bindings of connector `el` that survive moving its points to
+ * `points`: an end bound to a shape that is not moving with it (`moving`)
+ * and still within that shape's binding gap of the moved end.
+ * @returns {{startId?: string, endId?: string}}
+ */
+function keptBindings(el, points, byId, moving, zoom) {
+  const out = {};
+  const n = points.length;
+  if (n < 2) return out;
+  for (const [key, q] of [
+    ['startId', points[0]],
+    ['endId', points[n - 1]],
+  ]) {
+    const id = el[key];
+    if (!id || moving.has(id)) continue;
+    const target = byId.get(id);
+    if (target && isBindable(target) && hitShape(target, q, bindingGap(target, zoom))) out[key] = id;
+  }
+  return out;
+}
+
+/**
+ * After a live drag moved connectors by their shaft (which unbinds them while
+ * dragging, see moveElements), restore every ORIGINAL binding whose end is
+ * still close to its shape, with the bound ends resolved back onto the
+ * outlines. Returns the patches to send with the gesture's last update (no
+ * new commit: they are part of the same edit).
+ *
+ * @param {object[]} originals  the moved elements as they were at pointerdown
+ * @param {object[]} elements   the scene now (after the move)
+ * @param {number} [zoom]
+ * @returns {{id, patch}[]}
+ */
+export function rebindMovedConnectors(originals, elements, zoom = 1) {
+  if (!Array.isArray(elements) || !originals || originals.length === 0) return [];
+  const moving = new Set(originals.filter((el) => !el.locked).map((el) => el.id));
+  const byId = new Map(elements.map((el) => [el.id, el]));
+  const patches = [];
+  for (const orig of originals) {
+    if (!isLinear(orig) || orig.locked || (!orig.startId && !orig.endId)) continue;
+    const now = byId.get(orig.id);
+    if (!now || !Array.isArray(now.points)) continue;
+    const keep = keptBindings(orig, now.points, byId, moving, zoom);
+    const patch = {};
+    if (keep.startId && now.startId !== keep.startId) patch.startId = keep.startId;
+    if (keep.endId && now.endId !== keep.endId) patch.endId = keep.endId;
+    if (Object.keys(patch).length) patches.push({ id: orig.id, patch });
+  }
+  if (!patches.length) return [];
+  const ids = patches.map((p) => p.id);
+  const resolved = new Map(resolveBindingPatches(applyPatches(elements, patches), ids).map((p) => [p.id, p.patch]));
+  return patches.map((p) => ({ id: p.id, patch: { ...p.patch, ...(resolved.get(p.id) ?? {}) } }));
 }
 
 /* ------------------------------------------------------------------ *
@@ -188,6 +260,12 @@ function handleAxes(handle) {
 }
 
 const ratio = (num, den) => (Math.abs(den) < EPS ? 1 : num / den);
+
+/** Is `r` (radians) a multiple of 90°? */
+function isRightAngle(r) {
+  const q = r / (Math.PI / 2);
+  return Math.abs(q - Math.round(q)) < 1e-9;
+}
 
 /**
  * The scale transform produced by dragging `handle` of `box` to `p` (all in
@@ -248,14 +326,17 @@ function resizeSingle(el, frame, handle, pointer, opts) {
   const patch = {};
 
   if (isText(el)) {
-    // Text never mirrors; its font scales with the box and is clamped to
-    // what the validator accepts, and the box follows the clamped scale.
+    // Text scales uniformly: its font follows the box and is clamped to what
+    // the validator accepts, and the box follows the clamped scale. Dragged
+    // past the anchor, the BOX flips to the other side of it (with the
+    // pointer, like every other shape) — the glyphs never mirror, there is
+    // nothing to mirror them with — so the scale keeps its sign per axis.
     const s0 = t.hx !== 0 ? Math.abs(t.sx) : Math.abs(t.sy);
     const f0 = textFont(el);
     const f = clamp(f0 * s0, FONT_MIN, FONT_MAX);
     const s = f / f0;
-    t.sx = s;
-    t.sy = s;
+    t.sx = t.sx < 0 ? -s : s;
+    t.sy = t.sy < 0 ? -s : s;
     patch.fontSize = f;
   }
 
@@ -292,7 +373,11 @@ function resizeSingle(el, frame, handle, pointer, opts) {
  * Several: positions and sizes scale about the anchor of the common box;
  * rotated members keep their angle (mirrored when flipped on one axis);
  * polylines scale their points; text scales its font on corner (or
- * aspect-locked) drags and only moves on a free side drag.
+ * aspect-locked) drags and only moves on a free side drag. A member turned
+ * by an angle that is not a multiple of 90° cannot follow a non-uniform
+ * scale without shearing, so such a selection always scales uniformly
+ * (Excalidraw's resizeMultipleElements does the same for rotated members):
+ * every member keeps its angle and stays inside the frame being dragged.
  */
 export function resizeElements(originals, frame, handle, pointer, opts = {}) {
   const list = originals.filter((el) => !el.locked);
@@ -300,7 +385,8 @@ export function resizeElements(originals, frame, handle, pointer, opts = {}) {
   const f = frame ?? transformFrame(list);
   if (list.length === 1 && originals.length === 1) return [resizeSingle(list[0], f, handle, pointer, opts)];
 
-  const t = resizeTransform(f, handle, pointer, opts);
+  const skewed = list.some((el) => !hasPoints(el) && !isRightAngle(el.rotation || 0));
+  const t = resizeTransform(f, handle, pointer, { ...opts, keepAspect: Boolean(opts.keepAspect) || skewed });
   const asx = Math.abs(t.sx);
   const asy = Math.abs(t.sy);
   const mirrored = t.sx < 0 !== t.sy < 0;
@@ -325,8 +411,10 @@ export function resizeElements(originals, frame, handle, pointer, opts = {}) {
       w = el.w * s;
       h = el.h * s;
     } else if (rot) {
-      // A rotated box under a non-uniform scale: keep its angle, stretch each
-      // of its own axes by how much the scale stretches that direction.
+      // A rotated box: the scale is uniform (see `skewed`) or the box is
+      // turned by a right angle, so its own axes map onto the frame's axes —
+      // each is stretched by the scale along the direction it points in and
+      // the angle is unchanged (atan2 below returns `rot` in both cases).
       const cos = Math.cos(rot);
       const sin = Math.sin(rot);
       w = el.w * Math.hypot(asx * cos, asy * sin);
@@ -358,13 +446,16 @@ const STEP_15 = Math.PI / 12;
  * element) or the turn (several elements) to 15° steps.
  *
  * Boxes turn their `rotation` (and orbit the centre when several are
- * selected); polylines have the turn baked into their points. A lone
- * connector is not rotatable (shared resolveConnectors ignores rotation).
+ * selected); polylines have the turn baked into their points (shared
+ * resolveConnectors ignores `rotation`, so a connector never carries one).
+ * A lone 2-point connector is not rotated: it shows no transform box, its
+ * two point handles do that job (Excalidraw); one with more points turns
+ * like any polyline.
  */
 export function rotateElements(originals, frame, pointer, { snap15 = false } = {}) {
   const list = originals.filter((el) => !el.locked);
   if (list.length === 0 || !pointer) return [];
-  if (list.length === 1 && isLinear(list[0])) return [];
+  if (list.length === 1 && isLinear(list[0]) && !(Array.isArray(list[0].points) && list[0].points.length > 2)) return [];
   const f = frame ?? transformFrame(list);
   const c = centreOf(f);
   let target = Math.atan2(pointer.y - c.y, pointer.x - c.x) + Math.PI / 2;
@@ -459,6 +550,65 @@ export function findBindTarget(elements, point, zoom = 1, excludeIds = []) {
     if (hitShape(el, point, bindingGap(el, zoom))) return el;
   }
   return null;
+}
+
+/* ------------------------------------------------------------------ *
+ * Labels
+ * ------------------------------------------------------------------ */
+
+/**
+ * The height container `el` needs for `label` to fit its label box, wrapped
+ * at the container's CURRENT width (the width never changes: a label grows
+ * its shape downward, like Excalidraw's bound text). Uses the same
+ * labelBox/wrapText as the renderer and the editor, so what fits here is
+ * exactly what is painted. 0 for an empty label.
+ */
+export function labelFitHeight(el, label) {
+  if (!labelKeyOf(el)) return 0;
+  const text = String(label ?? '');
+  if (text === '') return 0;
+  const fontFamily = el.fontFamily ?? 'hand';
+  const fontSize = el.fontSize ?? FONT_SIZES.M;
+  const lines = wrapText(text, labelBox(el).w, fontFamily, fontSize);
+  const need = Math.max(1, lines.length) * lineHeightPx(fontSize);
+  // The label box height is linear in the element's height (an inset, and
+  // a factor for ellipses and diamonds) once past its 1-unit floor: solve
+  // labelBox({...el, h}).h === need from two probes on that line.
+  const H0 = 1000;
+  const H1 = 2000;
+  const b0 = labelBox({ ...el, h: H0 }).h;
+  const b1 = labelBox({ ...el, h: H1 }).h;
+  const slope = (b1 - b0) / (H1 - H0);
+  if (!(slope > 0)) return 0;
+  return H0 + (need - b0) / slope;
+}
+
+/**
+ * The patch that makes container `el` tall enough for `label`, or null when
+ * its height is already right. Only the height changes, and the TOP edge
+ * stays where it is on screen (for a rotated shape too). The result is never
+ * shorter than `minH` (default: the current height, i.e. grow only); the
+ * text editor passes the height the shape had when editing started, so
+ * deleting text shrinks it back down to that, never below (Excalidraw).
+ *
+ * Used by the text editor while a label is typed and when it is committed.
+ * (A font change goes through actions.fitContainerToLabel, which may also
+ * widen the shape so no word is split.)
+ * @returns {{h:number, x?:number, y?:number}|null}
+ */
+export function growContainerForLabel(el, label, { minH } = {}) {
+  if (!el || !labelKeyOf(el) || !(el.w > 0) || !(el.h >= 0)) return null;
+  const floor = Number.isFinite(minH) ? minH : el.h;
+  const h = Math.max(floor, Math.ceil(labelFitHeight(el, label) - 1e-6));
+  if (Math.abs(h - el.h) < 0.5) return null;
+  const r = el.rotation || 0;
+  if (!r) return { h };
+  // Keep the top edge fixed on screen: the centre moves half the growth
+  // along the shape's own (rotated) downward axis.
+  const d = rotateAround({ x: 0, y: (h - el.h) / 2 }, { x: 0, y: 0 }, r);
+  const cx = el.x + el.w / 2 + d.x;
+  const cy = el.y + el.h / 2 + d.y;
+  return { h, x: cx - el.w / 2, y: cy - h / 2 };
 }
 
 /* ------------------------------------------------------------------ *

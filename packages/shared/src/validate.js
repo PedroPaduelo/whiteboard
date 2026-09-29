@@ -40,7 +40,38 @@ export const LIMITS = Object.freeze({
   MAX_IMAGE_CHARS: 2000000, // ~1.5MB of base64
   MAX_OPS_PER_BATCH: 200,
   MAX_ID: 40,
+  /**
+   * Every coordinate an element stores (x, y, the far edges x+w / y+h, and
+   * every point) lies within ±MAX_COORD board units — the same bound the WS
+   * cursor is clamped to. The board is "infinite" for any human purpose (at
+   * the minimum zoom, 10%, a 4K screen shows ~38,000 units), but 1e308 is not a
+   * coordinate: it overflows to Infinity/NaN in the connector maths and gets
+   * persisted, and a 1e8-unit hachure fill hangs every visitor's tab.
+   */
+  MAX_COORD: 10000000,
+  /**
+   * Width and height of a rect/ellipse/diamond/cylinder, the shapes drawn
+   * with a roughjs fill. A hachure or cross-hatch fill is one stroke every
+   * few units ACROSS THE WHOLE SHAPE, so its cost grows with its size: a
+   * 2e7-unit cross-hatch rect (inside MAX_COORD) froze a tab for 40s+, while
+   * 2e5 costs well under a second. 2e5 is still more than a full 8K screen
+   * at the minimum zoom, i.e. more than one gesture can draw.
+   */
+  MAX_SHAPE_SIZE: 200000,
+  /**
+   * Whole-board caps, checked by the store after a batch (a batch that GROWS
+   * a board past one is refused; one that shrinks an already-too-big board is
+   * not). Without them 5000 elements x a 2MB image each was a legal 10GB board.
+   * ~40M chars is about 20 photos at MAX_IMAGE_CHARS.
+   */
+  MAX_BOARD_IMAGE_CHARS: 40000000,
+  MAX_BOARD_POINTS: 2000000,
 });
+
+const MAX_COORD = LIMITS.MAX_COORD;
+
+/** The shapes whose fill is generated across their whole area (see MAX_SHAPE_SIZE). */
+const FILLED_SHAPES = new Set(['rect', 'ellipse', 'diamond', 'cylinder']);
 
 const HEX_OR_CSS = /^(#[0-9a-fA-F]{3,8}|rgba?\([\d\s.,%]+\)|hsla?\([\d\s.,%]+\)|[a-zA-Z]{3,20})$/;
 
@@ -86,9 +117,45 @@ function optStr(v, path, max) {
   return v;
 }
 
+/** A finite number within ±MAX_COORD: a position on the board. */
+function coord(v, path) {
+  reqNum(v, path);
+  if (v < -MAX_COORD || v > MAX_COORD) fail(`must be within ±${MAX_COORD}`, path);
+  return v;
+}
+
+/** A width/height: finite, negatives clamp to 0, at most the whole world. */
+function extent(v, path) {
+  const n = Math.max(0, reqNum(v, path));
+  if (n > 2 * MAX_COORD) fail(`must be at most ${2 * MAX_COORD}`, path);
+  return n;
+}
+
+/** An optional finite number in [0, max] (image natural size and the like). */
+function optNonNeg(v, path, max) {
+  const n = optNum(v, path);
+  if (n === undefined) return undefined;
+  if (n < 0 || n > max) fail(`must be 0..${max}`, path);
+  return n;
+}
+
 function point(v, path) {
   if (!v || typeof v !== 'object') fail('expected a point', path);
-  return { x: reqNum(v.x, `${path}.x`), y: reqNum(v.y, `${path}.y`) };
+  return { x: coord(v.x, `${path}.x`), y: coord(v.y, `${path}.y`) };
+}
+
+/**
+ * A connector end's fixed point (bindingFixedPoint): `{x, y}`, each a
+ * fraction 0..1 of the anchor's unrotated box. Undefined when absent/null.
+ */
+function optFixedPoint(v, path) {
+  if (v === undefined || v === null) return undefined;
+  if (typeof v !== 'object' || Array.isArray(v)) fail('expected {x, y} fractions of the anchor box', path);
+  const x = reqNum(v.x, `${path}.x`);
+  const y = reqNum(v.y, `${path}.y`);
+  if (x < 0 || x > 1) fail('must be 0..1', `${path}.x`);
+  if (y < 0 || y > 1) fail('must be 0..1', `${path}.y`);
+  return { x, y };
 }
 
 /** A value from a fixed list; absent or null is an error. */
@@ -176,6 +243,9 @@ export function validateElement(raw, path = 'element') {
     fail(`type must be one of ${ELEMENT_TYPES.join(', ')}`, `${path}.type`);
   }
 
+  // Finite here; BOUNDED below, once we know whether the box is the stored
+  // truth (shapes) or derived from points (pen, connectors: a client's stale
+  // x/y/w/h there is ignored, so it must not be what gets a batch rejected).
   const base = {
     id,
     type,
@@ -277,6 +347,14 @@ export function validateElement(raw, path = 'element') {
       const endId = optId(raw.endId, `${path}.endId`);
       if (startId) base.startId = startId;
       if (endId) base.endId = endId;
+      // Where on its anchor each end was dropped (see resolveConnectors).
+      // Kept even while the end is unbound: it is inert without the id, and
+      // dropping it here but not in the clients' own merge would make the
+      // server's copy differ from everyone else's.
+      const startFixedPoint = optFixedPoint(raw.startFixedPoint, `${path}.startFixedPoint`);
+      const endFixedPoint = optFixedPoint(raw.endFixedPoint, `${path}.endFixedPoint`);
+      if (startFixedPoint) base.startFixedPoint = startFixedPoint;
+      if (endFixedPoint) base.endFixedPoint = endFixedPoint;
       const startArrowhead = optEnum(raw.startArrowhead, ARROWHEADS, `${path}.startArrowhead`);
       if (startArrowhead !== undefined) base.startArrowhead = startArrowhead;
       const endArrowhead = optEnum(raw.endArrowhead, ARROWHEADS, `${path}.endArrowhead`);
@@ -319,8 +397,8 @@ export function validateElement(raw, path = 'element') {
         fail('image src must be an https URL or a base64 data:image', `${path}.src`);
       }
       base.src = src;
-      const nw = optNum(raw.naturalWidth, `${path}.naturalWidth`);
-      const nh = optNum(raw.naturalHeight, `${path}.naturalHeight`);
+      const nw = optNonNeg(raw.naturalWidth, `${path}.naturalWidth`, MAX_COORD);
+      const nh = optNonNeg(raw.naturalHeight, `${path}.naturalHeight`, MAX_COORD);
       if (nw !== undefined) base.naturalWidth = nw;
       if (nh !== undefined) base.naturalHeight = nh;
       break;
@@ -343,6 +421,22 @@ export function validateElement(raw, path = 'element') {
       fail(`unhandled type ${type}`, `${path}.type`);
   }
 
+  // The box of a pen/connector came from points that are each bounded. Every
+  // other box is the stored truth, so all four of its edges must be on the
+  // board: a finite 1.7e308 passes isFinite, and `x + w/2` then overflows.
+  if (!base.points) {
+    coord(base.x, `${path}.x`);
+    coord(base.y, `${path}.y`);
+    extent(base.w, `${path}.w`);
+    extent(base.h, `${path}.h`);
+    if (base.x + base.w > MAX_COORD) fail(`x + w must be within ±${MAX_COORD}`, `${path}.w`);
+    if (base.y + base.h > MAX_COORD) fail(`y + h must be within ±${MAX_COORD}`, `${path}.h`);
+    if (FILLED_SHAPES.has(type)) {
+      if (base.w > LIMITS.MAX_SHAPE_SIZE) fail(`must be at most ${LIMITS.MAX_SHAPE_SIZE} for a ${type}`, `${path}.w`);
+      if (base.h > LIMITS.MAX_SHAPE_SIZE) fail(`must be at most ${LIMITS.MAX_SHAPE_SIZE} for a ${type}`, `${path}.h`);
+    }
+  }
+
   return base;
 }
 
@@ -356,22 +450,44 @@ const PATCHABLE = new Set([
   'opacity', 'label', 'text', 'fontSize', 'align', 'points', 'startId', 'endId',
   'src', 'naturalWidth', 'naturalHeight', 'updatedAt', 'locked', 'groupId',
   'seed', 'roughness', 'fillStyle', 'roundness', 'fontFamily',
-  'startArrowhead', 'endArrowhead',
+  'startArrowhead', 'endArrowhead', 'startFixedPoint', 'endFixedPoint',
 ]);
 
 /**
  * Patch keys where `null` means "remove this field" (the store's shallow merge
  * writes the null and validateElement then drops it). Unbinding a connector
- * end and leaving a group are real operations, not the same as "no change".
+ * end, un-pinning it, and leaving a group are real operations, not the same
+ * as "no change".
  */
-export const NULLABLE_PATCH_KEYS = Object.freeze(['startId', 'endId', 'groupId', 'label']);
+export const NULLABLE_PATCH_KEYS = Object.freeze([
+  'startId',
+  'endId',
+  'groupId',
+  'label',
+  'startFixedPoint',
+  'endFixedPoint',
+]);
 
-/** Drop unknown keys from a patch so they cannot smuggle fields into an element. */
+/**
+ * Drop unknown keys from a patch so they cannot smuggle fields into an
+ * element, and TYPE-CHECK every key it keeps.
+ *
+ * Every PATCHABLE key has its own branch below, and a key without one is an
+ * error rather than a pass-through: an unchecked value is broadcast to every
+ * peer verbatim (up to the body limit) before the merged validation can strip
+ * it. `null` is a removal for NULLABLE_PATCH_KEYS and INVALID everywhere else
+ * (it used to be silently dropped for some keys and passed through as a
+ * removal for others). `undefined` cannot come over JSON; it means "absent".
+ */
 function sanitisePatch(patch, path) {
   const out = {};
   for (const [k, v] of Object.entries(patch)) {
     if (!PATCHABLE.has(k)) continue;
-    if (v === null && NULLABLE_PATCH_KEYS.includes(k)) {
+    if (v === undefined) continue;
+    if (v === null) {
+      if (!NULLABLE_PATCH_KEYS.includes(k)) {
+        fail(`null is only allowed for ${NULLABLE_PATCH_KEYS.join(', ')}`, `${path}.${k}`);
+      }
       // Kept as an explicit null: the merge must overwrite the stored value.
       out[k] = null;
       continue;
@@ -379,17 +495,19 @@ function sanitisePatch(patch, path) {
     if (k === 'points') {
       out.points = pointList(v, `${path}.points`);
     } else if (k === 'label') {
-      const label = optStr(v, `${path}.label`, LIMITS.MAX_LABEL);
-      if (label !== undefined) out.label = label;
+      out.label = optStr(v, `${path}.label`, LIMITS.MAX_LABEL);
     } else if (k === 'text') {
       out.text = optStr(v, `${path}.text`, LIMITS.MAX_TEXT);
     } else if (k === 'src') {
       out.src = optStr(v, `${path}.src`, LIMITS.MAX_IMAGE_CHARS);
-    } else if (k === 'fontSize' || k === 'rotation' || k === 'strokeWidth' || k === 'opacity') {
+    } else if (k === 'x' || k === 'y') {
+      out[k] = coord(v, `${path}.${k}`);
+    } else if (k === 'fontSize' || k === 'rotation' || k === 'strokeWidth' || k === 'opacity' || k === 'updatedAt') {
       out[k] = reqNum(v, `${path}.${k}`);
+    } else if (k === 'naturalWidth' || k === 'naturalHeight') {
+      out[k] = optNonNeg(v, `${path}.${k}`, MAX_COORD);
     } else if (k === 'stroke' || k === 'fill') {
-      const c = optColor(v, `${path}.${k}`);
-      if (c !== undefined) out[k] = c;
+      out[k] = optColor(v, `${path}.${k}`);
     } else if (k === 'strokeStyle') {
       if (!STROKE_STYLES.includes(v)) fail('bad strokeStyle', `${path}.strokeStyle`);
       out.strokeStyle = v;
@@ -405,22 +523,24 @@ function sanitisePatch(patch, path) {
     } else if (k === 'startArrowhead' || k === 'endArrowhead') {
       out[k] = reqEnum(v, ARROWHEADS, `${path}.${k}`);
     } else if (k === 'seed') {
-      if (v === null || v === undefined) fail('seed must be an integer', `${path}.seed`);
       out.seed = optSeed(v, `${path}.seed`);
     } else if (k === 'roughness') {
-      if (v === null || v === undefined) fail('expected a finite number', `${path}.roughness`);
       out.roughness = optRoughness(v, `${path}.roughness`);
     } else if (k === 'locked') {
       if (typeof v !== 'boolean') fail('locked must be a boolean', `${path}.locked`);
       out.locked = v;
+    } else if (k === 'startFixedPoint' || k === 'endFixedPoint') {
+      out[k] = optFixedPoint(v, `${path}.${k}`);
     } else if (k === 'groupId' || k === 'startId' || k === 'endId') {
       // (null was handled above: it removes the field.)
-      const i = optId(v, `${path}.${k}`);
-      if (i !== undefined) out[k] = i;
+      out[k] = optId(v, `${path}.${k}`);
     } else if (k === 'w' || k === 'h') {
-      out[k] = Math.max(0, reqNum(v, `${path}.${k}`));
+      out[k] = extent(v, `${path}.${k}`);
     } else {
-      out[k] = v;
+      // A PATCHABLE key nobody wrote a check for. Refuse it loudly (the
+      // validate tests walk every PATCHABLE key) instead of fanning out
+      // whatever JSON the client put there.
+      fail('this field cannot be patched', `${path}.${k}`);
     }
   }
   return out;

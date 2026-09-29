@@ -65,43 +65,123 @@ export function measureText(text, fontFamily = 'hand', fontSize = FONT_SIZES.M) 
   return { width: Math.ceil(width), height: Math.ceil(lines.length * lineHeightPx(fontSize)), lines };
 }
 
+/*
+ * Line breaking for labels.
+ *
+ * The label editor is a <textarea> with `white-space: pre-wrap` and
+ * `overflow-wrap / word-break: break-word` (TextEditor.jsx), and it sizes
+ * itself from `wrapText`'s line count. So `wrapText` has to break lines where
+ * the browser does, or the text jumps when editing starts or ends, and the
+ * textarea clips the lines it did not expect. It follows the CSS rules that
+ * matter for typed text (checked against Chromium):
+ *
+ *   - a soft-wrap opportunity after every run of breakable spaces, and after a
+ *     hyphen or dash (`-`, U+2010, `–`, `—`) or `?` unless the next character
+ *     cannot start a line (another hyphen, closing punctuation…) — so
+ *     `segunda-feira` breaks as `segunda-` / `feira`, like the textarea;
+ *   - a no-break space (U+00A0, U+202F, U+2007) never breaks;
+ *   - spaces at a soft wrap HANG: they never push text onto a new line and are
+ *     not part of the line (so they do not shift centred/right-aligned text);
+ *   - an unbreakable run wider than the box is broken between graphemes, but
+ *     only after it has been moved to a line of its own (break-word breaks a
+ *     word only when the line has no other opportunity);
+ *   - explicit `\n` always breaks, and the spaces before one stay on the line.
+ */
+
+/** Spaces that end a word: U+0020, tab, the typographic spaces, ideographic space, ZWSP. */
+const BREAK_SPACE = /[ \t\u1680\u2000-\u2006\u2008-\u200a\u200b\u205f\u3000]/;
+const TRAILING_SPACES = /[ \t\u1680\u2000-\u2006\u2008-\u200a\u200b\u205f\u3000]+$/;
+/** A line may break AFTER these (UAX #14 classes HY, BA and B2, plus `?`, as Chromium does). */
+const BREAK_AFTER = new Set(['-', '\u2010', '\u2013', '\u2014', '?']);
+/** …but never before these: no line starts with them. */
+const NO_BREAK_BEFORE = new Set(['-', '\u2010', '\u2013', '\u2014', '?', '!', '.', ',', ':', ';', ')', ']', '}', '%', '"', "'", '\u00bb', '\u201d', '\u2019']);
+
+let graphemeSegmenter;
+/** User-perceived characters, so a word is never split inside "ã" or an emoji. */
+function graphemes(s) {
+  if (graphemeSegmenter === undefined) {
+    try {
+      graphemeSegmenter = typeof Intl !== 'undefined' && Intl.Segmenter ? new Intl.Segmenter(undefined, { granularity: 'grapheme' }) : null;
+    } catch {
+      graphemeSegmenter = null;
+    }
+  }
+  if (!graphemeSegmenter) return Array.from(s);
+  return Array.from(graphemeSegmenter.segment(s), (g) => g.segment);
+}
+
+/** Drop the spaces a line ends with (the ones that would hang). */
+export function trimTrailingSpaces(s) {
+  return s.replace(TRAILING_SPACES, '');
+}
+
 /**
- * Greedy word wrap to `maxWidth` px. Explicit newlines are kept; a single word
- * wider than the box is broken by characters so it never overflows.
+ * Cut a paragraph (no `\n`) at its soft-wrap opportunities. Each piece keeps
+ * the spaces that follow it, so the pieces concatenate back to `para`.
+ */
+function breakSegments(para) {
+  const chars = Array.from(para);
+  const out = [];
+  let cur = '';
+  for (let i = 0; i < chars.length; i++) {
+    const ch = chars[i];
+    const next = chars[i + 1];
+    cur += ch;
+    if (next === undefined) break;
+    const nextIsSpace = BREAK_SPACE.test(next);
+    if (BREAK_SPACE.test(ch) ? !nextIsSpace : BREAK_AFTER.has(ch) && !nextIsSpace && !NO_BREAK_BEFORE.has(next)) {
+      out.push(cur);
+      cur = '';
+    }
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+/**
+ * Wrap text to `maxWidth` px the way the label textarea does (see above).
+ * Explicit newlines are kept; a word wider than the box is broken between
+ * characters so it never overflows.
+ *
+ * Lines ended by a soft wrap come back without their hanging spaces; the last
+ * line of each paragraph keeps the spaces typed before the `\n` (they still
+ * count for alignment when they fit — `layoutText` handles that).
+ *
  * @returns {string[]}
  */
 export function wrapText(text, maxWidth, fontFamily = 'hand', fontSize = FONT_SIZES.M) {
   const out = [];
   const width = Math.max(1, maxWidth);
+  const fits = (s) => measureLine(s, fontFamily, fontSize) <= width;
   for (const para of String(text ?? '').split('\n')) {
-    if (para === '') {
-      out.push('');
-      continue;
-    }
-    const words = para.split(/(\s+)/).filter((w) => w.length > 0);
     let line = '';
-    for (const word of words) {
-      const candidate = line + word;
-      if (measureLine(candidate, fontFamily, fontSize) <= width || line === '') {
-        if (line === '' && measureLine(word, fontFamily, fontSize) > width) {
-          // Break an over-long word by characters.
-          let chunk = '';
-          for (const ch of word) {
-            if (measureLine(chunk + ch, fontFamily, fontSize) > width && chunk) {
-              out.push(chunk);
-              chunk = ch;
-            } else chunk += ch;
-          }
-          line = chunk;
-        } else {
-          line = candidate;
+    for (const seg of breakSegments(para)) {
+      if (line !== '') {
+        // Hanging spaces do not count toward the fit.
+        if (fits(trimTrailingSpaces(line + seg))) {
+          line += seg;
+          continue;
         }
-      } else {
-        out.push(line.trimEnd());
-        line = /^\s+$/.test(word) ? '' : word;
+        out.push(trimTrailingSpaces(line));
+        line = '';
       }
+      // `seg` starts a line. Its trailing spaces hang; only the rest must fit.
+      const body = trimTrailingSpaces(seg);
+      if (body === '' || fits(body)) {
+        line = seg;
+        continue;
+      }
+      // Wider than the box on a line of its own: break between graphemes.
+      let chunk = '';
+      for (const g of graphemes(body)) {
+        if (chunk !== '' && !fits(chunk + g)) {
+          out.push(chunk);
+          chunk = g;
+        } else chunk += g;
+      }
+      line = chunk + seg.slice(body.length);
     }
-    out.push(line.trimEnd());
+    out.push(line);
   }
   return out;
 }
@@ -157,7 +237,12 @@ export function labelBox(el) {
  * - text: lines split on `\n`, anchored at the element's top-left, aligned
  *   within the element's width.
  * - sticky: wrapped to the note, top-aligned, aligned per `align` (default left).
- * - rect/ellipse/diamond/cylinder label: wrapped, centred both ways.
+ * - rect/ellipse/diamond/cylinder label: wrapped, centred vertically, aligned
+ *   per `align` (default centre).
+ *
+ * Labels are wrapped with `wrapText`, so the painted lines are the textarea's
+ * lines; a line's `text` never ends in spaces (its `x` already accounts for
+ * the ones the browser counts when aligning).
  *
  * @returns {null | {lines: {text:string, x:number, y:number}[], font:string,
  *   fontSize:number, fontFamily:string, lineHeight:number,
@@ -196,7 +281,19 @@ export function layoutText(el) {
   const total = lines.length * lh;
   const top = el.type === 'sticky' ? box.y : el.y + (el.h - total) / 2;
   return {
-    lines: lines.map((t, i) => ({ text: t, x: anchorX, y: top + i * lh })),
+    lines: lines.map((t, i) => {
+      const y = top + i * lh;
+      const shown = trimTrailingSpaces(t);
+      if (shown === t || align === 'left') return { text: shown, x: anchorX, y };
+      // Spaces typed before a line break are part of the line in the
+      // textarea (pre-wrap "conditionally hangs" them): they count for
+      // centring/right-alignment up to the box width. Paint the glyphs only,
+      // shifted to where the browser puts them.
+      const inked = measureLine(shown, fontFamily, fontSize);
+      const full = Math.max(inked, Math.min(box.w, measureLine(t, fontFamily, fontSize)));
+      const shift = align === 'center' ? (full - inked) / 2 : full - inked;
+      return { text: shown, x: anchorX - shift, y };
+    }),
     font: fontString(fontFamily, fontSize),
     fontSize,
     fontFamily,

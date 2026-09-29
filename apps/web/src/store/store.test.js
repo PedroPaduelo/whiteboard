@@ -16,6 +16,7 @@ import assert from 'node:assert/strict';
 
 import { useBoardStore, initialState, applyOpsToElements, describeTransition, rebaseEntry, mergePatch } from './boardStore.js';
 import { DEFAULT_STYLE } from '../editor/constants.js';
+import { ZOOM_LIMITS } from '@whiteboard/shared';
 
 /** The store's actions, bound to a fresh reset. */
 const s = () => useBoardStore.getState();
@@ -502,7 +503,7 @@ test('panBy is never history', () => {
   const depth = s().pastDepth;
   s().panBy(100, 100);
   s().setZoom(3);
-  s().resetView();
+  s().setView({ zoom: 1, panX: 0, panY: 0 });
   assert.equal(s().pastDepth, depth, 'view changes do not pollute history');
 });
 
@@ -524,32 +525,9 @@ test('zoomAtScreen keeps the point under the cursor fixed', () => {
 
 test('setZoom clamps to the zoom limits', () => {
   s().setZoom(1000);
-  assert.ok(s().view.zoom <= 8, 'clamped to the max');
+  assert.equal(s().view.zoom, ZOOM_LIMITS.max, 'clamped to the max');
   s().setZoom(0.0001);
-  assert.ok(s().view.zoom >= 0.05, 'clamped to the min');
-});
-
-test('fitToContent accepts an explicit viewport', () => {
-  s().addElements([rect('a', 0, 0, 100, 100), rect('b', 900, 900, 100, 100)]);
-  s().fitToContent({ vw: 1000, vh: 1000 });
-  const v = s().view;
-  assert.ok(v.zoom > 0 && v.zoom <= 8);
-  // Content should be centred, so the pan should be near zero for a
-  // symmetric layout around the viewport centre.
-  assert.ok(Math.abs(v.panX) < 200, `panX should be small, got ${v.panX}`);
-});
-
-test('fitToContent on an empty board does not produce NaN', () => {
-  s().fitToContent({ vw: 800, vh: 600 });
-  for (const key of ['zoom', 'panX', 'panY']) {
-    assert.ok(Number.isFinite(s().view[key]), `${key} must be a finite number`);
-  }
-});
-
-test('resetView returns to the identity transform', () => {
-  s().setView({ zoom: 3, panX: 50, panY: 60 });
-  s().resetView();
-  assert.deepEqual(s().view, { zoom: 1, panX: 0, panY: 0 });
+  assert.equal(s().view.zoom, ZOOM_LIMITS.min, 'clamped to the min');
 });
 
 // ----------------------------------------------------------------- peers
@@ -690,18 +668,12 @@ test('tool lock toggles', () => {
   assert.equal(s().toolLocked, false);
 });
 
-test('setViewportSize stores CSS px and fitToContent uses it', () => {
+test('setViewportSize stores CSS px and ignores an unchanged size', () => {
   s().setViewportSize({ w: 1000, h: 1000 });
   assert.deepEqual(s().viewportSize, { w: 1000, h: 1000 });
   const same = s().viewportSize;
   s().setViewportSize({ w: 1000, h: 1000 });
   assert.equal(s().viewportSize, same, 'an unchanged size is not a store write');
-
-  s().addElements([rect('a', 0, 0, 100, 100), rect('b', 900, 900, 100, 100)]);
-  s().fitToContent();
-  const byStore = { ...s().view };
-  s().fitToContent({ vw: 1000, vh: 1000 });
-  assert.deepEqual(s().view, byStore, 'no argument = the reported canvas size');
 });
 
 test('setConnection accepts only the realtime states', () => {
@@ -875,6 +847,81 @@ test('describeTransition detects a real reorder but not a create or delete', () 
   assert.deepEqual(describeTransition([a, b], [b, a]).order, ['b', 'a']);
 });
 
+test('mergePatch: a fresh copy of the same points is NOT a change (identity kept)', () => {
+  const ln = { id: 'ln', type: 'line', x: 100, y: 300, w: 300, h: 0, points: [{ x: 100, y: 300 }, { x: 400, y: 300 }] };
+  assert.equal(mergePatch(ln, { points: ln.points.map((p) => ({ x: p.x, y: p.y })) }), ln);
+  assert.equal(mergePatch(ln, { points: ln.points.map((p) => ({ ...p })), x: 100, y: 300 }), ln);
+  assert.notEqual(mergePatch(ln, { points: [{ x: 100, y: 301 }, { x: 400, y: 300 }] }), ln);
+});
+
+test('undo of a polyline move stays correct while remote batches arrive during the drag', () => {
+  // The sync bridge re-applies my unacked update (a fresh copy of the points)
+  // under every remote batch. That used to be read as a REMOTE change and was
+  // written into the undo snapshot, so Ctrl+Z left the line where it was dragged.
+  for (const type of ['line', 'arrow', 'pen']) {
+    s().reset();
+    const ln = { id: 'ln', type, x: 100, y: 300, w: 300, h: 0, points: [{ x: 100, y: 300 }, { x: 400, y: 300 }], stroke: '#1e1e1e' };
+    s().addElements([ln, rect('r')]);
+    s().commit('move:g1');
+    for (let f = 1; f <= 10; f++) {
+      const cur = s().elements.find((e) => e.id === 'ln');
+      s().updateElement('ln', { points: cur.points.map((p) => ({ x: p.x, y: p.y + 20 })) });
+      const now = s().elements.find((e) => e.id === 'ln');
+      const pending = [
+        { kind: 'update', elementId: 'ln', patch: { points: now.points.map((p) => ({ x: p.x, y: p.y })), y: now.y } },
+      ];
+      if (f % 3 === 0) s().applyRemoteOps([{ kind: 'update', elementId: 'r', patch: { x: f } }], pending);
+    }
+    assert.equal(s().elements.find((e) => e.id === 'ln').y, 500, `${type}: dragged 200 down`);
+    s().undo();
+    assert.equal(s().elements.find((e) => e.id === 'ln').y, 300, `${type}: undo puts it back`);
+    assert.equal(s().elements.find((e) => e.id === 'r').x, 9, `${type}: the peer's move survives`);
+    s().redo();
+    assert.equal(s().elements.find((e) => e.id === 'ln').y, 500, `${type}: redo drags it again`);
+  }
+});
+
+test("undo after a peer restored an element in place keeps it there (remote creates keep their neighbours)", () => {
+  // A draws X, B draws Y over it, A draws Z; B deletes X and undoes, which
+  // ships create X + reorder X<Y<Z. A's Ctrl+Z must only remove Z.
+  s().commit('add:x');
+  s().addElement(rect('X'));
+  s().applyRemoteOps([{ kind: 'create', element: rect('Y') }]);
+  s().commit('add:z');
+  s().addElement(rect('Z'));
+  s().applyRemoteOps([{ kind: 'delete', elementId: 'X' }]);
+  s().applyRemoteOps([{ kind: 'create', element: rect('X') }, { kind: 'reorder', order: ['X', 'Y', 'Z'] }]);
+  assert.deepEqual(ids(), ['X', 'Y', 'Z']);
+  s().undo();
+  assert.deepEqual(ids(), ['X', 'Y'], 'X is not lifted above Y');
+});
+
+test('undo of my delete after a peer reordered restores the element in place', () => {
+  s().addElements([rect('bottom'), rect('middle'), rect('top'), rect('far')]);
+  s().commit('delete');
+  s().removeElements(['middle']);
+  s().applyRemoteOps([{ kind: 'reorder', order: ['far', 'bottom', 'top'] }]); // peer: "far" to back
+  s().undo();
+  assert.deepEqual(ids(), ['far', 'bottom', 'middle', 'top'], "middle back between its neighbours, the peer's move kept");
+});
+
+test('undo of my reorder keeps a peer create on top', () => {
+  s().addElements([rect('a'), rect('b'), rect('c')]);
+  s().commit('front');
+  s().reorder(['a', 'c', 'b']);
+  s().applyRemoteOps([{ kind: 'create', element: rect('d') }]);
+  s().undo();
+  assert.deepEqual(ids(), ['a', 'b', 'c', 'd']);
+});
+
+test('describeTransition: moved is the smallest set of survivors whose order changed', () => {
+  const [a, b, c, d] = ['a', 'b', 'c', 'd'].map((id) => rect(id));
+  assert.deepEqual([...describeTransition([a, b, c, d], [a, c, d, b]).moved], ['b'], 'bring b to front');
+  assert.deepEqual([...describeTransition([a, b, c, d], [d, a, b, c]).moved], ['d'], 'send d to back');
+  assert.equal(describeTransition([a, b], [a, b, c]).moved.size, 0);
+  assert.deepEqual(describeTransition([a, b], [a, b, c]).next, ['a', 'b', 'c']);
+});
+
 // -------------------------------------------------------------- snapshots
 
 test('setSnapshot ignores a snapshot OLDER than the board already shows', () => {
@@ -940,5 +987,70 @@ test('upsertCursor stores name and colour and keeps them on a bare move', () => 
   assert.equal(cur.name, 'Ana');
   assert.equal(cur.color, '#e03131');
   assert.equal(cur.x, 5);
-  assert.notEqual(s().remoteCursors, mapBefore, 'a new Map, so useRemoteCursors re-renders');
+  assert.notEqual(s().remoteCursors, mapBefore, 'a new Map, so a subscriber to remoteCursors re-renders');
+});
+
+// ------------------------------------------------- collaborators' selections
+
+test("setPeerSelection stores a peer's selection with its colour; empty removes it", () => {
+  s().setPeers([{ id: 'p1', name: 'Ana', color: '#e03131' }]);
+  s().setPeerSelection('p1', { ids: ['a', 'b', 'a', 7, ''] });
+  assert.ok(s().peerSelections instanceof Map, 'a Map: renderInteractive iterates its entries');
+  assert.deepEqual(s().peerSelections.get('p1'), { ids: ['a', 'b'], color: '#e03131', name: 'Ana' });
+
+  // A colour carried by the message wins over the roster's.
+  s().setPeerSelection('p1', { ids: ['c'], color: '#2f9e44' });
+  assert.equal(s().peerSelections.get('p1').color, '#2f9e44');
+
+  s().setPeerSelection('p1', { ids: [] });
+  assert.equal(s().peerSelections.size, 0, 'nothing selected, nothing drawn');
+});
+
+test('setPeerSelection with the same ids keeps the Map (no re-render per repeated message)', () => {
+  s().setPeerSelection('p1', { ids: ['a'], color: '#e03131', name: 'Ana' });
+  const before = s().peerSelections;
+  s().setPeerSelection('p1', { ids: ['a'], color: '#e03131', name: 'Ana' });
+  assert.equal(s().peerSelections, before);
+  s().setPeerSelection('p1', { ids: ['a', 'b'], color: '#e03131', name: 'Ana' });
+  assert.notEqual(s().peerSelections, before, 'a change is a new Map');
+});
+
+test('our own peer id never gets a peerSelections entry', () => {
+  s().setMyPeerId('me');
+  s().setPeerSelection('me', { ids: ['a'] });
+  s().setPeers([{ id: 'me', selection: ['a'] }]);
+  assert.equal(s().peerSelections.size, 0);
+});
+
+test('setPeers drops the selections of peers that left, and an empty roster drops them all', () => {
+  s().setPeerSelection('p1', { ids: ['a'], color: '#e03131' });
+  s().setPeerSelection('p2', { ids: ['b'], color: '#1971c2' });
+  s().setPeers([{ id: 'p1', color: '#e03131' }]);
+  assert.deepEqual([...s().peerSelections.keys()], ['p1']);
+  assert.deepEqual(s().peerSelections.get('p1').ids, ['a'], 'a roster without `selection` keeps what we know');
+  s().setPeers([]);
+  assert.equal(s().peerSelections.size, 0, 'offline: nobody is selecting anything');
+});
+
+test("a roster that carries `selection` seeds it (a late joiner sees the others' selections)", () => {
+  s().setPeers([
+    { id: 'p1', name: 'Ana', color: '#e03131', selection: ['a', 'b'] },
+    { id: 'p2', name: 'Bruno', color: '#1971c2', selection: [] },
+  ]);
+  assert.deepEqual([...s().peerSelections.keys()], ['p1']);
+  assert.deepEqual(s().peerSelections.get('p1'), { ids: ['a', 'b'], color: '#e03131', name: 'Ana' });
+  const before = s().peerSelections;
+  s().setPeers([
+    { id: 'p1', name: 'Ana', color: '#e03131', selection: ['a', 'b'] },
+    { id: 'p2', name: 'Bruno', color: '#1971c2', selection: [] },
+  ]);
+  assert.equal(s().peerSelections, before, 'an unchanged roster keeps the Map');
+  s().setPeers([{ id: 'p1', name: 'Ana', color: '#e03131', selection: [] }]);
+  assert.equal(s().peerSelections.size, 0, "the server's record says p1 selects nothing now");
+});
+
+test('reset() clears the collaborators selections', () => {
+  s().setPeerSelection('p1', { ids: ['a'] });
+  s().reset();
+  assert.equal(s().peerSelections.size, 0);
 });

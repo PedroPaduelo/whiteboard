@@ -11,7 +11,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { useBoardStore } from '../store/boardStore.js';
-import { StoreSync, withRemote, diffElements, collapseOps, clearedValue } from './sync.js';
+import { StoreSync, withRemote, diffElements, diffElement, collapseOps, clearedValue } from './sync.js';
 
 const s = () => useBoardStore.getState();
 const wait = () => new Promise((r) => setTimeout(r, 80));
@@ -436,4 +436,44 @@ test('pendingOps() exposes the debounce window without flushing it', async () =>
   assert.equal(sync.pendingOps().length, 0);
   assert.equal(client.sent.length, 1);
   sync.stop();
+});
+
+// ------------------------------------------------ op order, cleared values
+
+test('diffElements: deletes first, then creates (targets before the connectors bound to them), then updates, reorder last', () => {
+  const a = rect('a');
+  const b = rect('b');
+  const d = rect('d', { x: 200 });
+  const conn = { id: 'c', type: 'arrow', x: 0, y: 0, w: 200, h: 0, points: [{ x: 0, y: 0 }, { x: 200, y: 0 }], endId: 'd' };
+  const moved = { ...b, x: 5 };
+  const { ops } = diffElements([a, b], [moved, conn, d], makeOp);
+  assert.deepEqual(
+    ops.map((o) => `${o.kind}:${o.element?.id ?? o.elementId ?? ''}`),
+    ['delete:a', 'create:d', 'create:c', 'update:b', 'reorder:'],
+  );
+  assert.deepEqual(ops.at(-1).order, ['b', 'c', 'd'], 'the z-order the user sees is restored');
+});
+
+test('diffElements: no reorder when creates keep z-order (nothing bound to a later element)', () => {
+  const a = rect('a');
+  const conn = { id: 'c', type: 'arrow', x: 0, y: 0, w: 10, h: 0, points: [{ x: 0, y: 0 }, { x: 10, y: 0 }], endId: 'a' };
+  const { ops } = diffElements([a], [a, rect('x'), conn], makeOp);
+  assert.deepEqual(ops.map((o) => o.kind), ['create', 'create']);
+});
+
+test('clearedValue: a cleared stroke/width draws like the missing key did', () => {
+  for (const type of ['arrow', 'line', 'pen']) assert.equal(clearedValue('stroke', { type }), '#1e1e1e', type);
+  for (const type of ['rect', 'ellipse', 'text', 'sticky']) assert.equal(clearedValue('stroke', { type }), 'none', type);
+  assert.equal(clearedValue('strokeWidth', { type: 'rect' }), 2);
+  const legacy = { id: 'ar', type: 'arrow', x: 0, y: 0, w: 10, h: 0, points: [{ x: 0, y: 0 }, { x: 10, y: 0 }] };
+  assert.deepEqual(diffElement({ ...legacy, stroke: '#e03131', strokeWidth: 4 }, legacy), { stroke: '#1e1e1e', strokeWidth: 2 });
+});
+
+test('collapseOps does not merge an update across a create (a binding must not overtake its target)', () => {
+  const ops = [
+    { opId: '1', kind: 'update', elementId: 'ar', patch: { x: 1 } },
+    { opId: '2', kind: 'create', element: rect('box') },
+    { opId: '3', kind: 'update', elementId: 'ar', patch: { endId: 'box' } },
+  ];
+  assert.deepEqual(collapseOps(ops).map((o) => o.opId), ['1', '2', '3']);
 });

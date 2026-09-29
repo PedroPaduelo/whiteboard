@@ -61,14 +61,19 @@ export function useRealtime(boardId, { name, enabled = true, onError } = {}) {
 
     // Back online after a network drop: do not wait out the backoff timer.
     const onOnline = () => {
+      if (realtime.fatal) return; // the board does not exist; nothing to reconnect to
       if (realtime.status === 'offline' || realtime.status === 'disconnected') realtime.reconnect();
     };
-    // Closing the tab: hand the debounce window to the client and post
-    // everything unacknowledged (keepalive) before the page goes away. A page
-    // restored from the back/forward cache simply reconnects.
+    // The network is gone: say so now. The socket can look open for a long
+    // time after that, and the dot would keep saying "Conectado".
+    const onOffline = () => realtime.markOffline();
+    // Closing the tab: hand the debounce window to the client, which posts
+    // what it can (keepalive) and stashes everything unacknowledged for the
+    // next visit, before the page goes away. A page restored from the
+    // back/forward cache simply reconnects (and picks the stash back up).
     const onPageHide = () => {
       storeSync.flush();
-      realtime.disconnect();
+      realtime.disconnect({ unloading: true });
     };
     const onPageShow = (event) => {
       if (event.persisted) realtime.connect(boardId, { name: nameRef.current || undefined });
@@ -76,6 +81,7 @@ export function useRealtime(boardId, { name, enabled = true, onError } = {}) {
     const hasWindow = typeof window !== 'undefined';
     if (hasWindow) {
       window.addEventListener('online', onOnline);
+      window.addEventListener('offline', onOffline);
       window.addEventListener('pagehide', onPageHide);
       window.addEventListener('pageshow', onPageShow);
     }
@@ -83,6 +89,7 @@ export function useRealtime(boardId, { name, enabled = true, onError } = {}) {
     return () => {
       if (hasWindow) {
         window.removeEventListener('online', onOnline);
+        window.removeEventListener('offline', onOffline);
         window.removeEventListener('pagehide', onPageHide);
         window.removeEventListener('pageshow', onPageShow);
       }

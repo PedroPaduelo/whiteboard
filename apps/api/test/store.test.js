@@ -12,13 +12,14 @@
 
 import { test, describe, after, before } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { LIMITS, BIND_GAP, validateOps } from '@whiteboard/shared';
+import { join, dirname } from 'node:path';
+import { LIMITS, BIND_GAP, validateOps, bindingFixedPoint } from '@whiteboard/shared';
 
 import { createStore as createMemoryStore } from '../src/store/memory.js';
 import { createStore as createSqliteStore } from '../src/store/sqlite.js';
+import { applyOpBatch, rejectionCode } from '../src/store/ops.js';
 
 /* ---------------------------------------------------------------- helpers */
 
@@ -128,8 +129,8 @@ for (const driver of DRIVERS) {
     });
 
     test('listBoards search treats LIKE wildcards LITERALLY, on both drivers', async () => {
-      // escapeLike() in the sqlite driver is load-bearing: without it these
-      // searches would match the wrong rows and the two drivers would diverge.
+      // Both drivers match titles literally (a plain substring, never a SQL
+      // LIKE pattern): these searches must not turn into wildcards.
       const pct = await store.createBoard({ title: 'Budget 100% spent' });
       const us = await store.createBoard({ title: 'Under_score and more' });
       const bs = await store.createBoard({ title: 'Back\\slash' });
@@ -732,6 +733,38 @@ for (const driver of DRIVERS) {
       await store.deleteBoard(b.id);
     });
 
+    test('a pinned end (endFixedPoint) is persisted where it was dropped and follows its shape', async () => {
+      // The review repro: an arrow from A dropped on the middle of C's top edge.
+      const b = await store.createBoard({ title: 'Pinned' });
+      await store.applyOps(b.id, validateOps([
+        create(b.id, rect('A', { x: 400, y: 250, w: 160, h: 120 })),
+        create(b.id, rect('C', { x: 850, y: 550, w: 160, h: 120 })),
+        create(b.id, arrow('link', { x: 563.7, y: 344.1 }, { x: 930, y: 552 }, {
+          startId: 'A', endId: 'C', endFixedPoint: bindingFixedPoint({ x: 850, y: 550, w: 160, h: 120 }, { x: 930, y: 552 }),
+        })),
+      ]));
+      let link = (await store.listElements(b.id)).find((e) => e.id === 'link');
+      assert.deepEqual(link.endFixedPoint, { x: 0.5, y: 0 });
+      assert.deepEqual(link.points[1], { x: 930, y: 550 - BIND_GAP }, 'on the top edge, not by the top-left corner');
+
+      // Moving C carries the end along on the same spot.
+      await store.applyOps(b.id, [update(b.id, 'C', { x: 1000, y: 700 })]);
+      link = (await store.listElements(b.id)).find((e) => e.id === 'link');
+      assert.deepEqual(link.points[1], { x: 1080, y: 700 - BIND_GAP });
+
+      // Re-binding the end elsewhere replaces the pin in the same patch; null un-pins.
+      await store.applyOps(b.id, validateOps([update(b.id, 'link', { endId: 'C', endFixedPoint: { x: 0, y: 0.5 } })]));
+      link = (await store.listElements(b.id)).find((e) => e.id === 'link');
+      assert.deepEqual(link.points[1], { x: 1000 - BIND_GAP, y: 760 }, 'left edge now');
+      await store.applyOps(b.id, validateOps([update(b.id, 'link', { endFixedPoint: null })]));
+      link = (await store.listElements(b.id)).find((e) => e.id === 'link');
+      assert.equal('endFixedPoint' in link, false);
+      const before = JSON.stringify(await store.listElements(b.id));
+      await store.applyOps(b.id, [update(b.id, 'A', {})]);
+      assert.equal(JSON.stringify(await store.listElements(b.id)), before, 'idempotent');
+      await store.deleteBoard(b.id);
+    });
+
     test('a multi-point connector: moving a bound shape moves ONLY the end points', async () => {
       const b = await store.createBoard({ title: 'Elbow' });
       const pts = [{ x: 50, y: 50 }, { x: 50, y: 300 }, { x: 350, y: 300 }, { x: 350, y: 50 }];
@@ -781,6 +814,119 @@ for (const driver of DRIVERS) {
       await store.deleteBoard(b.id);
     });
 
+    /* --- review fixes: bounds, broadcast fidelity, empty batches -------- */
+
+    test('a connector the resolver would push off the board is refused, never stored', async () => {
+      const M = LIMITS.MAX_COORD;
+      const b = await store.createBoard({ title: 'Edge of the world' });
+      await store.applyOps(b.id, [create(b.id, rect('edge', { x: M - 100, y: 0, w: 100, h: 100 }))]);
+      // The start is bound to a box whose right edge IS the board's edge, and
+      // aims right: the resolved end would land BIND_GAP past it.
+      await assert.rejects(
+        () => store.applyOps(b.id, [create(b.id, arrow('off', { x: M - 50, y: 50 }, { x: M, y: 50 }, { startId: 'edge' }))]),
+        (err) => err.name === 'InvalidElement' && /connector "off"\.points\[0\]\.x: must be within/.test(err.message),
+      );
+      const snap = await store.getSnapshot(b.id);
+      assert.deepEqual(snap.elements.map((e) => e.id), ['edge'], 'nothing half-applied');
+      assert.equal(snap.rev, 1);
+      await store.deleteBoard(b.id);
+    });
+
+    test('appliedOps carry what the store KEPT, not fields it stripped', async () => {
+      const b = await store.createBoard({ title: 'Broadcast fidelity' });
+      await store.applyOps(b.id, [
+        create(b.id, rect('r')),
+        create(b.id, pen('p', [{ x: 0, y: 0 }, { x: 10, y: 20 }])),
+      ]);
+      const [clean] = validateOps([
+        { opId: opId('junk'), kind: 'update', elementId: 'r', patch: { text: 'hello', points: [{ x: 1, y: 1 }], x: 7 } },
+      ]);
+      const res = await store.applyOps(b.id, [clean]);
+      assert.equal(res.status, 'applied');
+      assert.deepEqual(res.appliedOps[0].patch, { x: 7 }, 'text and points are not a rect\'s, so they are not broadcast');
+      const stored = (await store.listElements(b.id)).find((e) => e.id === 'r');
+      assert.equal('text' in stored, false);
+
+      // A pen's box is derived from its points: the patch's x/w did not take.
+      const [move] = validateOps([{ opId: opId('pen'), kind: 'update', elementId: 'p', patch: { x: 500, w: 1000 } }]);
+      const res2 = await store.applyOps(b.id, [move]);
+      assert.deepEqual(res2.appliedOps[0].patch, { x: 0, w: 10 }, 'the broadcast says what is stored');
+      await store.deleteBoard(b.id);
+    });
+
+    test('an empty batch is refused and changes nothing (no write, no rev bump)', async () => {
+      const b = await store.createBoard({ title: 'Empty batch' });
+      await assert.rejects(() => store.applyOps(b.id, []), (err) => err.code === 'INVALID_OP');
+      await assert.rejects(() => store.applyOps(b.id, []), /at least one op/);
+      assert.equal((await store.getSnapshot(b.id)).rev, 0);
+      await store.deleteBoard(b.id);
+    });
+
+    test('a result cannot be used to reach into stored state', async () => {
+      const b = await store.createBoard({ title: 'Frozen results' });
+      const res = await store.applyOps(b.id, [create(b.id, pen('p', [{ x: 0, y: 0 }, { x: 5, y: 5 }]))]);
+      assert.throws(() => { res.elements[0].x = 999; }, TypeError);
+      assert.throws(() => { res.elements[0].points[0].x = 999; }, TypeError);
+      res.elements.push(rect('smuggled'));
+      const els = await store.listElements(b.id);
+      assert.deepEqual(els.map((e) => e.id), ['p']);
+      assert.equal(els[0].points[0].x, 0);
+      await store.deleteBoard(b.id);
+    });
+
+    test('a rejected batch leaves the board exactly as committed, and the next batch sees it', async () => {
+      const b = await store.createBoard({ title: 'Rollback then write' });
+      await store.applyOps(b.id, [create(b.id, rect('a')), create(b.id, rect('b', { x: 50 }))]);
+      await assert.rejects(() => store.applyOps(b.id, [
+        update(b.id, 'a', { x: 5 }),
+        create(b.id, rect('b')), // duplicate id: the whole batch is refused
+      ]));
+      assert.equal((await store.listElements(b.id))[0].x, 0, 'the first op of the refused batch did not stick');
+      await store.applyOps(b.id, [update(b.id, 'b', { y: 9 }), del(b.id, 'a')]);
+      const els = await store.listElements(b.id);
+      assert.deepEqual(els.map((e) => [e.id, e.x, e.y]), [['b', 50, 9]]);
+      await store.deleteBoard(b.id);
+    });
+
+    test('z-order survives creates, deletes and reorders (positions are kept, not rewritten)', async () => {
+      const b = await store.createBoard({ title: 'Order' });
+      await store.applyOps(b.id, ['a', 'b', 'c', 'd', 'e'].map((id) => create(b.id, rect(id))));
+      await store.applyOps(b.id, [del(b.id, 'b'), create(b.id, rect('f'))]);
+      await store.applyOps(b.id, [reorder(b.id, ['e', 'a'])]);
+      await store.applyOps(b.id, [reorder(b.id, ['c', 'd', 'f', 'e'])]);
+      await store.applyOps(b.id, [create(b.id, rect('g')), del(b.id, 'c'), create(b.id, rect('c'))]);
+      const ids = (await store.listElements(b.id)).map((e) => e.id);
+      assert.deepEqual(ids, ['d', 'f', 'e', 'a', 'g', 'c']);
+      await store.deleteBoard(b.id);
+    });
+
+    test('listBoards pages in order and totals every board', async () => {
+      const made = [];
+      for (let i = 0; i < 5; i++) made.push(await store.createBoard({ title: `Paged ${i}` }));
+      const all = await store.listBoards({ limit: 200, offset: 0 });
+      const order = all.boards.map((x) => x.id);
+      const page = await store.listBoards({ limit: 2, offset: 1 });
+      assert.equal(page.total, all.total);
+      assert.deepEqual(page.boards.map((x) => x.id), order.slice(1, 3));
+      const none = await store.listBoards({ limit: 0 });
+      assert.deepEqual(none.boards, []);
+      assert.equal(none.total, all.total);
+      for (const x of made) await store.deleteBoard(x.id);
+    });
+
+    test('search folds accented capitals like the memory driver (Unicode, not ASCII-only)', async () => {
+      const area = await store.createBoard({ title: 'Área de testes' });
+      const epoca = await store.createBoard({ title: 'ÉPOCA DE PROVAS' });
+      const reuniao = await store.createBoard({ title: 'Reunião' });
+      const find = async (search) => (await store.listBoards({ search })).boards.map((x) => x.id);
+      assert.deepEqual(await find('área'), [area.id]);
+      assert.deepEqual(await find('ÁREA'), [area.id]);
+      assert.deepEqual(await find('época'), [epoca.id]);
+      assert.deepEqual(await find('REUNIÃO'), [reuniao.id]);
+      assert.equal((await store.listBoards({ search: 'época', owner: 'nobody' })).total, 1, 'owner + search too');
+      for (const x of [area, epoca, reuniao]) await store.deleteBoard(x.id);
+    });
+
     /* --- close --------------------------------------------------------- */
 
     test('close() resolves, and later calls reject instead of crashing', async () => {
@@ -803,6 +949,112 @@ for (const driver of DRIVERS) {
     });
   });
 }
+
+describe('store [sqlite]: cost proportional to the change', () => {
+  const PHOTO = `data:image/png;base64,${'A'.repeat(200_000)}`;
+  const photo = (id, x) => ({ id, type: 'image', x, y: 0, w: 64, h: 64, src: PHOTO });
+
+  test('a one-field update writes one row and parses nothing, however heavy the board', async () => {
+    const store = createSqliteStore({ path: join(tmpRoot, `cost-${++fileSeq}`, 'whiteboard.db') });
+    const b = await store.createBoard({ title: 'Photos' });
+    const ops = [];
+    for (let i = 0; i < 10; i++) ops.push(create(b.id, photo(`img${i}`, i * 70)));
+    ops.push(create(b.id, rect('drag')));
+    await store.applyOps(b.id, ops);
+    const s0 = store.__stats();
+    for (let i = 1; i <= 20; i++) {
+      const res = await store.applyOps(b.id, [update(b.id, 'drag', { x: i, y: i })]);
+      assert.equal(res.status, 'applied');
+    }
+    const s1 = store.__stats();
+    assert.equal(s1.rowsWritten - s0.rowsWritten, 20, 'one row per drag frame, not the whole board');
+    assert.equal(s1.boardLoads, s0.boardLoads, 'the hot board is not re-parsed per batch');
+    // And what is stored is right, read back cold by a second connection.
+    await store.close();
+    const again = createSqliteStore({ path: join(tmpRoot, `cost-${fileSeq}`, 'whiteboard.db') });
+    const els = await again.listElements(b.id);
+    assert.equal(els.length, 11);
+    assert.deepEqual([els[10].id, els[10].x, els[10].y], ['drag', 20, 20]);
+    assert.equal(els[3].src, PHOTO);
+    const { boards } = await again.listBoards();
+    assert.equal(boards.find((x) => x.id === b.id).elementCount, 11);
+    assert.equal(again.__stats().boardLoads, 0, 'listing and counting never parse element data');
+    await again.close();
+  });
+
+  test('a board written by the one-blob schema is migrated on open, order intact', async () => {
+    const path = join(tmpRoot, `legacy-${++fileSeq}`, 'whiteboard.db');
+    mkdirSync(dirname(path), { recursive: true });
+    const { DatabaseSync } = await import('node:sqlite');
+    const old = new DatabaseSync(path);
+    old.exec(`CREATE TABLE boards (id TEXT PRIMARY KEY, title TEXT NOT NULL, theme TEXT NOT NULL DEFAULT 'light',
+      rev INTEGER NOT NULL DEFAULT 0, owner_id TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`);
+    old.exec(`CREATE TABLE elements (board_id TEXT PRIMARY KEY REFERENCES boards(id) ON DELETE CASCADE, data TEXT NOT NULL)`);
+    old.prepare("INSERT INTO boards (id, title, theme, rev, created_at, updated_at) VALUES ('old', 'Antigo', 'light', 7, 1, 1)").run();
+    old.prepare('INSERT INTO elements (board_id, data) VALUES (?, ?)').run('old', JSON.stringify([
+      rect('z1', { x: 1 }), rect('z2', { x: 2 }), rect('z3', { x: 3 }),
+    ]));
+    old.close();
+
+    const store = createSqliteStore({ path });
+    const snap = await store.getSnapshot('old');
+    assert.equal(snap.rev, 7);
+    assert.deepEqual(snap.elements.map((e) => [e.id, e.x]), [['z1', 1], ['z2', 2], ['z3', 3]]);
+    const res = await store.applyOps('old', [update('old', 'z2', { y: 5 }), create('old', rect('z4'))]);
+    assert.equal(res.rev, 8);
+    assert.deepEqual((await store.listElements('old')).map((e) => e.id), ['z1', 'z2', 'z3', 'z4']);
+    await store.close();
+    // A second open is a no-op (the old table is gone) and loses nothing.
+    const reopened = createSqliteStore({ path });
+    assert.equal((await reopened.listElements('old')).length, 4);
+    await reopened.close();
+  });
+});
+
+describe('applyOpBatch: whole-board caps', () => {
+  /** A minimal in-memory port, so the caps can be tested without 40MB of images. */
+  const port = (elements, caps) => {
+    const state = { elements, rev: 0 };
+    return {
+      state,
+      run: (ops) => applyOpBatch({
+        ops,
+        currentRev: state.rev,
+        load: () => state.elements.slice(),
+        isSeen: () => false,
+        recordSeen: () => {},
+        prune: () => {},
+        touch: () => {},
+        bumpRev: (rev) => { state.rev = rev; },
+        save: (next) => { state.elements = next; },
+        ...caps,
+      }),
+    };
+  };
+  const img = (id, n) => ({ id, type: 'image', x: 0, y: 0, w: 10, h: 10, src: `data:image/png;base64,${'A'.repeat(n)}` });
+  const op = (kind, extra) => ({ opId: opId(kind), kind, ...extra });
+
+  test('a batch that grows the board past a cap is refused as BOARD_TOO_LARGE', () => {
+    const p = port([], { maxImageChars: 1000, maxPoints: 5 });
+    p.run([op('create', { element: img('a', 400) })]);
+    assert.throws(() => p.run([op('create', { element: img('b', 700) })]), (err) => err.code === 'BOARD_TOO_LARGE');
+    assert.throws(
+      () => p.run([op('create', { element: pen('p', Array.from({ length: 6 }, (_, i) => ({ x: i, y: i }))) })]),
+      (err) => err.code === 'BOARD_TOO_LARGE' && /points/.test(err.message),
+    );
+    assert.equal(rejectionCode({ code: 'BOARD_TOO_LARGE' }), 'BOARD_TOO_LARGE');
+    assert.deepEqual(p.state.elements.map((e) => e.id), ['a']);
+  });
+
+  test('a board already over a cap can still shrink (and be edited without growing)', () => {
+    const big = [validateOps([op('create', { element: img('a', 900) })])[0].element,
+      validateOps([op('create', { element: img('b', 900) })])[0].element];
+    const p = port(big, { maxImageChars: 1000 });
+    const moved = p.run([op('update', { elementId: 'a', patch: { x: 5 } })]);
+    assert.equal(moved.status, 'applied', 'an edit that does not add weight is fine');
+    assert.equal(p.run([op('delete', { elementId: 'b' })]).status, 'applied');
+  });
+});
 
 after(() => {
   rmSync(tmpRoot, { recursive: true, force: true });

@@ -33,24 +33,30 @@ export const isContainer = (el) => !!el && ['rect', 'ellipse', 'diamond', 'cylin
 /** Rotation is not offered for connectors: shared resolveConnectors ignores it. */
 export const isRotatable = (el) => !!el && !isLinear(el);
 
+/** Style keys that only affect a label or text: font and alignment. */
+const TEXT_STYLE_KEYS = ['fontFamily', 'fontSize', 'align'];
+
 /**
  * The style keys an element type actually uses. The properties panel shows
  * exactly these for the selection, and `applyStyle` patches only these, so a
  * font change never writes `fontFamily` onto a pen stroke.
+ *
+ * Shapes that can hold a label (rect, diamond, ellipse, cylinder) carry the
+ * label's font, size and alignment (`align`, default centre when absent).
  */
 export function styleKeysFor(type) {
   switch (type) {
     case 'rect':
     case 'diamond':
-      return ['stroke', 'fill', 'fillStyle', 'strokeWidth', 'strokeStyle', 'roughness', 'roundness', 'opacity', 'fontFamily', 'fontSize'];
+      return ['stroke', 'fill', 'fillStyle', 'strokeWidth', 'strokeStyle', 'roughness', 'roundness', 'opacity', ...TEXT_STYLE_KEYS];
     case 'ellipse':
     case 'cylinder':
       // No `roundness`: an ellipse has no corners, and a cylinder is always drawn with curved caps.
-      return ['stroke', 'fill', 'fillStyle', 'strokeWidth', 'strokeStyle', 'roughness', 'opacity', 'fontFamily', 'fontSize'];
+      return ['stroke', 'fill', 'fillStyle', 'strokeWidth', 'strokeStyle', 'roughness', 'opacity', ...TEXT_STYLE_KEYS];
     case 'sticky':
-      return ['fill', 'opacity', 'fontFamily', 'fontSize', 'align'];
+      return ['fill', 'opacity', ...TEXT_STYLE_KEYS];
     case 'text':
-      return ['stroke', 'opacity', 'fontFamily', 'fontSize', 'align'];
+      return ['stroke', 'opacity', ...TEXT_STYLE_KEYS];
     case 'arrow':
     case 'line':
       return ['stroke', 'strokeWidth', 'strokeStyle', 'roughness', 'roundness', 'opacity', 'startArrowhead', 'endArrowhead'];
@@ -63,10 +69,45 @@ export function styleKeysFor(type) {
   }
 }
 
-/** Which style keys the panel should show while a drawing TOOL is active. */
+/**
+ * Which style keys the panel should show while a drawing TOOL is active:
+ * the ones the element that tool creates takes from the default style, so
+ * every control shown there changes what gets drawn (Excalidraw shows the
+ * same sections).
+ *
+ * - `line`: no arrowheads — a new line never has any (`createElement`).
+ *   A selected line still offers them, through `styleKeysFor('line')`.
+ * - rect/diamond/ellipse/cylinder: no font, size or alignment — a new shape
+ *   has no label yet, and its label is centred whatever `style.align` says.
+ *   The font and size a label will get follow the default style (set with
+ *   the text tool, or from any selected text); a labelled shape shows all
+ *   three once selected.
+ */
 export function styleKeysForTool(tool) {
   if (tool === 'image' || tool === 'select' || tool === 'hand' || tool === 'eraser') return [];
-  return styleKeysFor(tool);
+  const keys = styleKeysFor(tool);
+  if (tool === 'line') return keys.filter((k) => k !== 'startArrowhead' && k !== 'endArrowhead');
+  if (isContainer({ type: tool }) && tool !== 'sticky') return keys.filter((k) => !TEXT_STYLE_KEYS.includes(k));
+  return keys;
+}
+
+/**
+ * The style keys worth showing for ONE selected element. Like
+ * `styleKeysFor(el.type)`, except that a shape without a label (and not being
+ * labelled right now) leaves out font, size and alignment: they would change
+ * nothing visible, and Excalidraw only shows them for containers with text.
+ * `applyStyle` still filters by `styleKeysFor`, so a mixed selection that
+ * shows "Fonte" because of a text also sets the font the shapes' future
+ * labels will use.
+ *
+ * @param {object} el
+ * @param {{editing?: boolean}} [opts] `editing`: its label editor is open
+ */
+export function styleKeysForElement(el, { editing = false } = {}) {
+  const keys = styleKeysFor(el?.type);
+  if (!isContainer(el) || el.type === 'sticky' || editing) return keys;
+  if (typeof el.label === 'string' && el.label !== '') return keys;
+  return keys.filter((k) => !TEXT_STYLE_KEYS.includes(k));
 }
 
 /**
@@ -125,7 +166,8 @@ export function createElement(type, geom, style = DEFAULT_STYLE, extra = {}) {
         fill: s.stickyFill,
         fontFamily: s.fontFamily,
         fontSize: s.fontSize,
-        align: 'left',
+        // The alignment the panel shows while the sticky tool is active.
+        align: s.align,
       };
       break;
     case 'text': {
@@ -156,6 +198,8 @@ export function createElement(type, geom, style = DEFAULT_STYLE, extra = {}) {
         strokeStyle: s.strokeStyle,
         roughness: s.roughness,
         roundness: s.roundness,
+        // Lines start without heads (Excalidraw); the line tool's panel does
+        // not offer them (`styleKeysForTool`), a selected line does.
         startArrowhead: type === 'arrow' ? s.startArrowhead : 'none',
         endArrowhead: type === 'arrow' ? s.endArrowhead : 'none',
       };

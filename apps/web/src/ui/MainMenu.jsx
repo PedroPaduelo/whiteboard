@@ -14,7 +14,7 @@ import { useUi } from './uiStore.js';
 import { copyShareLink } from './share.js';
 import { openBoardFile, confirmClearCanvas } from './commands.js';
 import { shortcutHint } from './shortcuts.js';
-import { IconButton, Island, menuKeyNav, useOutsideClose } from './common.jsx';
+import { IconButton, Island, menuKeyNav, useMenuFocus, useOutsideClose } from './common.jsx';
 import {
   IconBoards,
   IconCheck,
@@ -61,6 +61,9 @@ export function MainMenu() {
   const grid = useSnapEnabled();
   const nickname = useNickname();
   const ref = useRef(null);
+  // Keyboard focus moves into the menu when it opens: arrow keys then walk
+  // the items instead of nudging the selection on the board underneath.
+  const panelRef = useMenuFocus(open);
 
   const ui = useUi.getState;
   const close = () => ui().close('menuOpen');
@@ -86,7 +89,7 @@ export function MainMenu() {
         </IconButton>
       </Island>
       {open ? (
-        <Island className="menu-panel" role="menu" aria-label={t.menu.button} onKeyDown={menuKeyNav}>
+        <Island ref={panelRef} className="menu-panel" role="menu" aria-label={t.menu.button} data-testid="main-menu" onKeyDown={menuKeyNav}>
           <Item icon={IconFolder} label={t.menu.open} hint={shortcutHint('board.open')} onSelect={run(() => void openBoardFile())} />
           <Item icon={IconSave} label={t.menu.save} hint={shortcutHint('board.save')} onSelect={run(() => actions.saveToFile())} />
           <Item

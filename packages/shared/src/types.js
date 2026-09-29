@@ -30,7 +30,7 @@ export const ELEMENT_TYPES = Object.freeze([
   'image',
 ]);
 
-/** Line-ending styles, mirroring the reference whiteboard. */
+/** Stroke dash styles (`strokeStyle`). Line endings are ARROWHEADS, below. */
 export const STROKE_STYLES = Object.freeze(['solid', 'dashed', 'dotted']);
 
 /*
@@ -104,16 +104,18 @@ export const DEFAULT_PALETTE = Object.freeze({
 /**
  * Fields every element carries.
  *
- * `x/y/w/h` are the axis-aligned bounding box of the element, always present
- * and always tight, EVEN FOR ROTATED ELEMENTS. Rotation happens at paint time
- * around the box centre, so geometry, hit-testing, snapping and export all have
- * a single rectangular source of truth. `rotation` is in radians.
+ * `x/y/w/h` are the element's UNROTATED box, always present. `rotation`
+ * (radians, clockwise) turns that box about its centre at paint time, so a
+ * rotated element covers the box's rotated corners and its painted
+ * axis-aligned bounds are LARGER than `x/y/w/h` (the web's
+ * handles.elementBounds computes them). Pen strokes and connectors are the
+ * exception: their box is derived from their points, and is tight.
  *
  * @typedef {Object} ElementBase
  * @property {string} id        Client-generated, opaque, stable forever.
  * @property {ElementType} type
- * @property {number} x         Left edge of the tight bounding box, board units.
- * @property {number} y         Top edge of the tight bounding box.
+ * @property {number} x         Left edge of the unrotated box, board units.
+ * @property {number} y         Top edge of the unrotated box.
  * @property {number} w         Width; always >= 0.
  * @property {number} h         Height; always >= 0.
  * @property {number} [rotation] Radians, clockwise, about the box centre.
@@ -165,11 +167,21 @@ export const DEFAULT_PALETTE = Object.freeze({
  * outline as it moves (see `resolveConnectors`); interior points never move
  * by binding. In an update patch `startId: null` / `endId: null` unbinds.
  *
+ * `startFixedPoint`/`endFixedPoint` pin a bound end to the spot of its
+ * anchor's outline where it was dropped, as `{x, y}` fractions (0..1) of the
+ * anchor's unrotated box (see `bindingFixedPoint`); without one the end aims
+ * at the other end or its neighbouring point. A pin is inert while its end is
+ * unbound. `null` in a patch removes it; a client that changes `startId`/
+ * `endId` to another element sets the matching pin (or nulls it) in the SAME
+ * patch, because a pin is only meaningful on the element it was taken on.
+ *
  * @typedef {ElementBase & {
  *   type:'arrow'|'line',
  *   points: Point[],
  *   startId?: string,
  *   endId?: string,
+ *   startFixedPoint?: {x: number, y: number},
+ *   endFixedPoint?: {x: number, y: number},
  *   startArrowhead?: 'none'|'arrow'|'triangle'|'bar'|'dot',
  *   endArrowhead?: 'none'|'arrow'|'triangle'|'bar'|'dot',
  * }} ConnectorElement
@@ -281,7 +293,8 @@ export const OP_RESULT = Object.freeze({
  *   the batch. The WS ack omits it (it would cost O(board) per drag frame).
  * @property {string} [message]     Human-readable reason, for conflict/missing/error.
  * @property {string} [code]        Machine-readable reason, for 'error'
- *   ('VALIDATION_FAILED', 'DUPLICATE_ELEMENT', 'TOO_MANY_ELEMENTS', 'INVALID_OP', 'INTERNAL').
+ *   ('VALIDATION_FAILED', 'DUPLICATE_ELEMENT', 'TOO_MANY_ELEMENTS', 'BOARD_TOO_LARGE',
+ *   'INVALID_OP', 'INTERNAL').
  */
 
 /** Real-time protocol. Envelope shared by server and client. */
@@ -349,8 +362,19 @@ export const IDENTITY_VIEW = Object.freeze({ zoom: 1, panX: 0, panY: 0 });
 /** Default and minimum grid spacing, in board units. */
 export const GRID = Object.freeze({ defaultSize: 20, min: 4, max: 200 });
 
-/** Zoom clamps. */
-export const ZOOM_LIMITS = Object.freeze({ min: 0.05, max: 8 });
+/**
+ * Zoom range: 10% to 3000%, Excalidraw's MIN_ZOOM / MAX_ZOOM. The web store
+ * clamps every view change into it (setView, setZoom, and zoomAt, whose
+ * default limits are these).
+ */
+export const ZOOM_LIMITS = Object.freeze({ min: 0.1, max: 30 });
+
+/**
+ * One press of zoom in / zoom out (the footer buttons, Ctrl+= / Ctrl+-): 10
+ * percentage points, ADDED rather than multiplied, as in Excalidraw — 100% ->
+ * 110% -> 120%. See `stepZoom`. Wheel and pinch zoom stay multiplicative.
+ */
+export const ZOOM_STEP = 0.1;
 
 /** Request/response bodies that cross the wire as JSON. */
 export const API = Object.freeze({

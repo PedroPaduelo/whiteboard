@@ -50,6 +50,7 @@ import {
   hitLinearPoint,
   hitLinearSegment,
   pointInFrame,
+  pointInShape,
 } from './hitTest.js';
 import {
   expandSelectionToGroups,
@@ -63,10 +64,18 @@ import {
   transformFrame,
   handlePoint,
   applyPatches,
+  rebindMovedConnectors,
 } from './scene.js';
 
 /** Modes during which a pointer button is held and owns the gesture. */
 const HELD_MODES = new Set(['panning', 'marquee', 'moving', 'resizing', 'rotating', 'creating', 'freedraw', 'editingPoint', 'erasing']);
+
+/**
+ * The second press of a double-click lands within this time (ms) and
+ * distance (CSS px) of the first — the usual OS defaults, a bit generous.
+ */
+const DOUBLE_CLICK_MS = 500;
+const DOUBLE_CLICK_SLOP = 16;
 
 /** Maximum number of recent points kept for the fading eraser trail. */
 const ERASER_TRAIL_MAX = 24;
@@ -92,7 +101,10 @@ export function initialInteraction() {
     hoveredId: null,
     editingGroupId: null, // group entered by double-click (clicks then select members)
     swallowDblClick: false, // the click pair that finished a creation must not also dblclick
+    swallowAt: null, // {x, y, at}: screen point and time of that finishing click
+    clearedByClick: null, // {ids, groupId, x, y, at}: the selection a click in its empty frame just cleared
     lastPointer: null, // last pointer event, to re-evaluate a gesture when Shift/Alt change
+    toolSeen: null, // the tool as of the last event (a change ends the old tool's gesture)
   };
 }
 
@@ -127,16 +139,34 @@ function sameIdSet(a, b) {
 const snapOn = (ctx) => Boolean(ctx.snapEnabled) && ctx.gridSize > 0;
 const snapP = (p, ctx) => snapToGrid(p, ctx.gridSize, snapOn(ctx));
 
-/** Handle options for a selection — must match what the renderer draws. */
-function handleOpts(selected) {
-  return { rotatable: selected.length > 1 || (selected.length === 1 && isRotatable(selected[0])) };
+/**
+ * Does a LONE selected connector show the transform box (frame, resize and
+ * rotation handles) on top of its point handles? Only with more than two
+ * points, and not while its points are being edited — Excalidraw's
+ * shouldShowBoundingBox. A 2-point connector's box handles would only
+ * duplicate its two point handles.
+ */
+export function linearShowsBox(el, linearEdit = null) {
+  if (!isLinear(el) || !Array.isArray(el.points) || el.points.length <= 2) return false;
+  return !(linearEdit && linearEdit.id === el.id && linearEdit.editing);
 }
 
-/** Does this selection show box transform handles? (Not for a lone connector, not with locked members.) */
-function hasBoxHandles(selected) {
+/** Handle options for a selection — must match what the renderer draws. */
+function handleOpts(selected) {
+  // A lone connector only has box handles when linearShowsBox, and then it
+  // turns like a multi-selection: the turn is baked into its points.
+  return { rotatable: selected.length !== 1 || isRotatable(selected[0]) || isLinear(selected[0]) };
+}
+
+/**
+ * Does this selection show box transform handles? Not with locked members,
+ * and for a lone connector only when linearShowsBox (`s` is the reducer
+ * state, for its point-editing flag).
+ */
+function hasBoxHandles(selected, s) {
   if (selected.length === 0) return false;
   if (selected.some((el) => el.locked)) return false;
-  if (selected.length === 1 && isLinear(selected[0])) return false;
+  if (selected.length === 1 && isLinear(selected[0])) return linearShowsBox(selected[0], s?.linearEdit);
   return true;
 }
 
@@ -157,6 +187,54 @@ function groupKeyOf(el, elements) {
 function nextGestureLabel(s, kind, ctx) {
   s.seq += 1;
   return `${kind}:${ctx.now ?? 0}:${s.seq}`;
+}
+
+/**
+ * How close (board units) to the centre of a transparent container a text
+ * gesture over its empty middle must land to write the container's label:
+ * Excalidraw's TEXT_TO_CENTER_SNAP_THRESHOLD (labelContainerAt widens it to a
+ * quarter of the shape's smaller side, so a big shape is a big target).
+ */
+const LABEL_SNAP_DISTANCE = 30;
+
+/**
+ * The container a text gesture at `p` writes into when nothing was hit
+ * directly — the pointer is over the empty middle of a transparent shape,
+ * which is not ink (hitTest misses it) but is still where the user expects
+ * the shape's label to go (Excalidraw's getTextBindableContainerAtPosition):
+ *  1. the single selected container, anywhere inside its selection frame
+ *     (the hint line promises "double-click to edit the text");
+ *  2. otherwise the topmost container whose inside holds `p`, near enough to
+ *     its centre (LABEL_SNAP_DISTANCE, or a quarter of its smaller side) —
+ *     farther out, a big transparent frame keeps taking free text.
+ * Locked and invisible shapes are never written into.
+ */
+function labelContainerAt(ctx, p) {
+  const zoom = zoomOf(ctx);
+  const selected = selectedElements(ctx);
+  if (selected.length === 1) {
+    const el = selected[0];
+    if (isContainer(el) && !el.locked && el.opacity !== 0 && pointInFrame(selectionFrame(selected, zoom), p)) return el;
+  }
+  for (let i = ctx.elements.length - 1; i >= 0; i--) {
+    const el = ctx.elements[i];
+    if (!isContainer(el) || el.locked || el.opacity === 0) continue;
+    if (!pointInShape(el, p)) continue;
+    const reach = Math.max(LABEL_SNAP_DISTANCE, Math.min(el.w, el.h) / 4);
+    if (Math.hypot(p.x - (el.x + el.w / 2), p.y - (el.y + el.h / 2)) <= reach) return el;
+  }
+  return null;
+}
+
+/**
+ * Is `e` from a pointer other than the one holding the active gesture (a
+ * palm or finger touching down while a pen or mouse drags)? Such a pointer
+ * must neither feed the gesture its moves nor end it with its pointerup or
+ * pointercancel. Events without a pointerId (synthetic ones) are the owner's.
+ */
+function isStrayPointer(s, e) {
+  const g = s.g;
+  return Boolean(g && g.held && e.pointerId !== undefined && g.pointerId !== undefined && e.pointerId !== g.pointerId);
 }
 
 function newTextAt(p, ctx) {
@@ -198,14 +276,14 @@ function idleCursor(s, p, ctx) {
   const lin = soleLinear(ctx);
   if (lin && hitLinearPoint(lin, p, zoom) >= 0) return 'pointer';
   const selected = selectedElements(ctx);
-  if (hasBoxHandles(selected)) {
+  if (hasBoxHandles(selected, s)) {
     const frame = selectionFrame(selected, zoom);
     const key = hitHandle(frame, p, zoom, handleOpts(selected));
     if (key) return cursorForHandle(key, frame.rotation);
   }
   const hit = hitTest(ctx.elements, p, zoom, { skipLocked: true });
   if (hit) return 'move';
-  if (selected.length && !selected.every((el) => el.locked) && pointInFrame(selectionFrame(selected, zoom), p)) return 'move';
+  if (grabsSelection(selected, p, zoom, s)) return 'move';
   return 'default';
 }
 
@@ -232,9 +310,24 @@ export function reduce(state, event, ctx) {
   // Keep the connector point-editing state in step with the selection.
   syncLinearEdit(s, c);
 
-  // The tool changed under a gesture that belongs to a tool (a shortcut while
-  // drawing): finish or drop it before anything else.
-  if (s.g && s.g.tool && s.g.tool !== c.tool) abortGesture(s, c, fx, { finalize: true });
+  // The tool changed since the last event this reducer saw (toolbar,
+  // shortcut, a text edit that committed and returned to select): finish or
+  // drop the old tool's gesture before anything else. Keyed on the tool the
+  // reducer last SAW rather than on the Canvas' deferred 'toolchange'
+  // notification: when a click on the board commits a text edit (tool text ->
+  // select) and then starts a drag, the pointerdown already sees 'select' and
+  // the late notification must not cancel the drag it just started.
+  const toolChanged = s.toolSeen !== null && s.toolSeen !== undefined && s.toolSeen !== c.tool;
+  s.toolSeen = c.tool;
+  if (toolChanged) {
+    if (s.g) abortGesture(s, c, fx, { finalize: true });
+    s.bindTarget = null;
+    s.editingGroupId = null;
+    if (!s.g) s.cursor = idleCursor(s, s.lastPointer ? toBoard(s.lastPointer, c) : null, c);
+  } else if (s.g && s.g.tool && s.g.tool !== c.tool) {
+    // A gesture that belongs to another tool (state from before toolSeen).
+    abortGesture(s, c, fx, { finalize: true });
+  }
 
   switch (event.type) {
     case 'pointerdown':
@@ -247,6 +340,7 @@ export function reduce(state, event, ctx) {
       onPointerUp(s, event, c, fx);
       break;
     case 'pointercancel':
+      if (isStrayPointer(s, event)) break;
       if (s.g && (s.g.held || HELD_MODES.has(s.mode))) abortGesture(s, c, fx, { finalize: false });
       break;
     case 'blur':
@@ -254,10 +348,8 @@ export function reduce(state, event, ctx) {
       s.cursor = idleCursor(s, null, { ...c, spaceDown: false });
       break;
     case 'toolchange':
-      if (s.g) abortGesture(s, c, fx, { finalize: true });
-      s.bindTarget = null;
-      s.editingGroupId = null;
-      s.cursor = idleCursor(s, s.lastPointer ? toBoard(s.lastPointer, c) : null, c);
+      // Only a wake-up so the change is seen without waiting for the next
+      // pointer event: the change itself was handled above (toolSeen).
       break;
     case 'dblclick':
       onDoubleClick(s, event, c, fx);
@@ -321,6 +413,13 @@ function syncLinearEdit(s, ctx) {
 function abortGesture(s, ctx, fx, { finalize }) {
   const g = s.g;
   if (!g) return;
+  if (g.kind === 'pan' && g.resume) {
+    // A pan in the middle of a multi-point connector: the pan ends and the
+    // connector is back — then finished (finalize) or left to go on.
+    resumeAfterPan(s, g);
+    if (finalize) abortGesture(s, ctx, fx, { finalize });
+    return;
+  }
   if (g.kind === 'linear' && finalize && g.phase === 'clicking') {
     finishLinear(s, ctx, fx, g.points.slice(0, -1), { switchTool: false });
     return;
@@ -330,16 +429,68 @@ function abortGesture(s, ctx, fx, { finalize }) {
   endGesture(s);
 }
 
+/** A pan started over a multi-point connector ended: the connector goes on. */
+function resumeAfterPan(s, g) {
+  s.g = g.resume;
+  s.mode = 'linear';
+  s.cursor = 'crosshair';
+}
+
+/** Start a pan (hand tool, Space+drag, middle button). `resume`: the gesture to go back to after it. */
+function startPan(s, e, resume = null) {
+  s.g = { kind: 'pan', held: true, sx: e.x, sy: e.y, lx: e.x, ly: e.y, pointerId: e.pointerId, resume };
+  s.mode = 'panning';
+  s.cursor = 'grabbing';
+}
+
+/**
+ * Is this press the second one of a double-click whose first click finished
+ * a creation (s.swallowAt)? Then the dblclick that follows it is swallowed.
+ */
+function pairsWithSwallowedClick(s, e, ctx) {
+  const a = s.swallowAt;
+  if (!a || typeof e.x !== 'number') return false;
+  const dt = (ctx.now ?? 0) - a.at;
+  return dt >= 0 && dt <= DOUBLE_CLICK_MS && Math.hypot(e.x - a.x, e.y - a.y) <= DOUBLE_CLICK_SLOP;
+}
+
+/**
+ * The selection the first click of this double-click cleared (a click in the
+ * empty part of the selection frame deselects, see selectDown step 4), or
+ * null. Consumed: only the double-click of that very click pair sees it.
+ */
+function takeClearedSelection(s, e, ctx) {
+  const c = s.clearedByClick;
+  s.clearedByClick = null;
+  if (!c || typeof e.x !== 'number') return null;
+  const dt = (ctx.now ?? 0) - c.at;
+  if (dt < 0 || dt > DOUBLE_CLICK_MS || Math.hypot(e.x - c.x, e.y - c.y) > DOUBLE_CLICK_SLOP) return null;
+  const alive = new Set(ctx.elements.map((el) => el.id));
+  const ids = c.ids.filter((id) => alive.has(id));
+  return ids.length ? { ids, groupId: c.groupId } : null;
+}
+
+/** A creation just finished: the dblclick its click pair may produce must not act. */
+function armDblClickSwallow(s, ctx) {
+  s.swallowDblClick = true;
+  const lp = s.lastPointer;
+  s.swallowAt = lp && typeof lp.x === 'number' ? { x: lp.x, y: lp.y, at: ctx.now ?? 0 } : null;
+}
+
 /* ------------------------------------------------------------------ *
  * pointerdown
  * ------------------------------------------------------------------ */
 
 function onPointerDown(s, e, ctx, fx) {
+  // Another pointer pressing while a gesture is held (a palm or finger during
+  // a pen or mouse drag) is ignored, including by a multi-point connector.
+  if (isStrayPointer(s, e)) return;
   s.lastPointer = e;
   const p = toBoard(e, ctx);
 
   // A multi-point connector in progress owns every click until it finishes;
-  // a right click finishes it.
+  // a right click finishes it. Space+drag and the middle button pan the view
+  // WITHOUT ending it (like the wheel): the connector resumes on release.
   if (s.g && s.g.kind === 'linear' && s.g.phase === 'clicking') {
     if (e.button === 2) {
       finishLinear(s, ctx, fx, s.g.points.slice(0, -1));
@@ -347,6 +498,11 @@ function onPointerDown(s, e, ctx, fx) {
     }
     if (e.button === 0 && !ctx.spaceDown) {
       linearClick(s, e, p, ctx, fx);
+      return;
+    }
+    if (!s.g.held && (e.button === 1 || (e.button === 0 && ctx.spaceDown))) {
+      s.swallowDblClick = false;
+      startPan(s, e, s.g);
       return;
     }
   }
@@ -359,15 +515,21 @@ function onPointerDown(s, e, ctx, fx) {
     if (s.g && s.g.held) return;
   }
   if (s.g) abortGesture(s, ctx, fx, { finalize: true });
-  s.swallowDblClick = false;
+  // The second press of the double-click whose first click finished a
+  // creation keeps the swallow armed (its dblclick is part of that click
+  // pair); any other press disarms it.
+  if (s.swallowDblClick && pairsWithSwallowedClick(s, e, ctx)) s.swallowAt = null;
+  else {
+    s.swallowDblClick = false;
+    s.swallowAt = null;
+  }
 
   // The right button starts nothing: the menu opens on the `contextmenu`
-  // event (which also covers Ctrl+click on macOS and touch long-press).
+  // event (right click, Ctrl+click on macOS) or on the Canvas' touch
+  // long-press timer.
   if (e.button === 2) return;
   if (e.button === 1 || ctx.tool === 'hand' || (ctx.spaceDown && e.button === 0)) {
-    s.g = { kind: 'pan', held: true, sx: e.x, sy: e.y, lx: e.x, ly: e.y, pointerId: e.pointerId };
-    s.mode = 'panning';
-    s.cursor = 'grabbing';
+    startPan(s, e);
     return;
   }
   if (e.button !== 0 && e.button !== undefined) return;
@@ -378,7 +540,7 @@ function onPointerDown(s, e, ctx, fx) {
   else if (LINEAR_TOOLS.includes(tool)) linearDown(s, e, p, ctx);
   else if (tool === 'pen') penDown(s, e, p, ctx);
   else if (tool === 'text') {
-    s.g = { kind: 'text', tool, held: true, sx: e.x, sy: e.y, start: p, pointerId: e.pointerId };
+    s.g = { kind: 'text', tool, held: true, sx: e.x, sy: e.y, start: p, alt: Boolean(e.altKey), pointerId: e.pointerId };
     s.mode = 'creating';
   } else if (tool === 'eraser') eraserDown(s, e, p, ctx);
   else if (tool === 'image') {
@@ -388,13 +550,24 @@ function onPointerDown(s, e, ctx, fx) {
 }
 
 function contextMenu(s, e, p, ctx, fx) {
-  const hit = hitTest(ctx.elements, p, zoomOf(ctx), { skipLocked: true }) ?? hitTest(ctx.elements, p, zoomOf(ctx));
-  if (hit) {
+  const zoom = zoomOf(ctx);
+  const hit = hitTest(ctx.elements, p, zoom, { skipLocked: true }) ?? hitTest(ctx.elements, p, zoom);
+  // Inside the current selection frame (the empty middle of a selected
+  // transparent shape, the gap of a marquee or Ctrl+A selection) the menu is
+  // about the SELECTION, exactly as a left press there grabs it — Excalidraw
+  // counts the common bounding box of the selection the same way.
+  const selected = selectedElements(ctx);
+  const inSelection = selected.length > 0 && pointInFrame(selectionFrame(selected, zoom), p);
+  let targetId = null;
+  if (hit && (ctx.selection.has(hit.id) || !inSelection)) {
     if (!ctx.selection.has(hit.id)) fx.push({ type: 'select', ids: expandSelectionToGroups(ctx.elements, [hit.id]) });
+    targetId = hit.id;
+  } else if (inSelection) {
+    targetId = selected[selected.length - 1].id;
   } else if (ctx.selection.size) {
     fx.push({ type: 'select', ids: [] });
   }
-  fx.push({ type: 'contextMenu', x: e.x, y: e.y, targetId: hit ? hit.id : null });
+  fx.push({ type: 'contextMenu', x: e.x, y: e.y, targetId });
 }
 
 /* --- select tool ---------------------------------------------------- */
@@ -432,7 +605,7 @@ function selectDown(s, e, p, ctx, fx) {
   }
 
   // 2. Transform handles of the selection.
-  if (hasBoxHandles(selected)) {
+  if (hasBoxHandles(selected, s)) {
     const frame = selectionFrame(selected, zoom);
     const key = hitHandle(frame, p, zoom, handleOpts(selected));
     if (key) {
@@ -475,6 +648,14 @@ function selectDown(s, e, p, ctx, fx) {
     } else if (wasSelected) {
       next = new Set(ctx.selection);
       if (!sameIdSet(next, groupIds)) deferOnly = groupIds; // click (no drag) narrows to this one
+    } else if (grabsSelection(selected, p, zoom, s)) {
+      // An unselected element INSIDE the selection frame (a shape inside a
+      // selected container, one in the gap of a multi-selection): the press
+      // grabs the selection, so a drag moves the selection, not the element
+      // under the pointer; a click without a drag selects that element on
+      // release (Excalidraw's hasHitCommonBoundingBoxOfSelectedElements).
+      next = new Set(ctx.selection);
+      deferOnly = groupIds;
     } else {
       next = new Set(groupIds);
     }
@@ -483,26 +664,30 @@ function selectDown(s, e, p, ctx, fx) {
     return;
   }
 
-  // 4. Inside the current selection frame: grab the selection (so a selected
-  //    transparent shape can be dragged by its empty middle).
-  if (!e.shiftKey && selected.length && selected.some((el) => !el.locked)) {
-    if (pointInFrame(selectionFrame(selected, zoom), p)) {
-      startMove(s, base, selected, {});
-      return;
-    }
+  // 4. Inside the current selection frame, over no element: grab the
+  //    selection, so a drag moves it (a selected transparent shape can be
+  //    dragged by its empty middle) — and a click without a drag clears it
+  //    on release (Excalidraw's handleCanvasPointerUp: no drag, the common
+  //    bounding box hit but no element).
+  if (!e.shiftKey && grabsSelection(selected, p, zoom, s)) {
+    startMove(s, base, selected, { deferClear: true });
+    return;
   }
 
-  // 5. A locked element, only when nothing else is under the pointer: select it, never move it.
+  // 5. A locked element, only when nothing else is under the pointer: select
+  //    it — with its whole group, like any click, so unlocking it unlocks the
+  //    group and the group never ends up half locked — and never move it.
   const lockedHit = hitTest(els, p, zoom);
   if (lockedHit && lockedHit.locked) {
     s.editingGroupId = null;
+    const ids = expandSelectionToGroups(els, [lockedHit.id]);
     if (e.shiftKey) {
       const next = new Set(ctx.selection);
-      if (next.has(lockedHit.id)) next.delete(lockedHit.id);
-      else next.add(lockedHit.id);
+      if (ids.every((id) => next.has(id))) for (const id of ids) next.delete(id);
+      else for (const id of ids) next.add(id);
       fx.push({ type: 'select', ids: [...next] });
-    } else if (!sameIdSet([lockedHit.id], ctx.selection)) {
-      fx.push({ type: 'select', ids: [lockedHit.id] });
+    } else if (!sameIdSet(ids, ctx.selection)) {
+      fx.push({ type: 'select', ids });
     }
     s.g = { ...base, kind: 'noop' };
     s.mode = 'idle';
@@ -516,7 +701,26 @@ function selectDown(s, e, p, ctx, fx) {
   s.mode = 'marquee';
 }
 
-function startMove(s, base, targets, { deferToggle = null, deferOnly = null }) {
+/**
+ * Does a press at `p` grab the current selection (rather than what is under
+ * it, or the empty canvas)? Yes when `p` is inside the selection frame of a
+ * selection that can move — but not for a lone connector that shows no
+ * transform box (linearShowsBox): its frame is not drawn, it is just the box
+ * around its line (Excalidraw hit-tests such a linear element by its stroke).
+ */
+function grabsSelection(selected, p, zoom, s) {
+  if (selected.length === 0 || !selected.some((el) => !el.locked)) return false;
+  if (selected.length === 1 && isLinear(selected[0]) && !linearShowsBox(selected[0], s?.linearEdit)) return false;
+  return pointInFrame(selectionFrame(selected, zoom), p);
+}
+
+/**
+ * Start a move of `targets`. What a click (no drag) does on release instead:
+ * `deferToggle` drops those ids from the selection (Shift-click on a selected
+ * element), `deferOnly` narrows the selection to those ids, `deferClear`
+ * clears it (a click in the empty part of the selection frame).
+ */
+function startMove(s, base, targets, { deferToggle = null, deferOnly = null, deferClear = false }) {
   const originals = targets.filter((el) => !el.locked);
   s.g = {
     ...base,
@@ -525,6 +729,7 @@ function startMove(s, base, targets, { deferToggle = null, deferOnly = null }) {
     bounds: originals.length ? commonBounds(originals) : null,
     deferToggle,
     deferOnly,
+    deferClear,
   };
   s.mode = 'moving';
   s.cursor = 'move';
@@ -599,6 +804,8 @@ function eraserDown(s, e, p, ctx) {
  * ------------------------------------------------------------------ */
 
 function onPointerMove(s, e, ctx, fx) {
+  // A second pointer (palm, finger) never steers someone else's drag.
+  if (isStrayPointer(s, e)) return;
   s.lastPointer = e;
   const p = toBoard(e, ctx);
   const g = s.g;
@@ -896,12 +1103,16 @@ function eraseAlong(s, a, b, restore, ctx) {
  * ------------------------------------------------------------------ */
 
 function onPointerUp(s, e, ctx, fx) {
+  if (isStrayPointer(s, e)) return;
   s.lastPointer = e;
   const p = toBoard(e, ctx);
   const g = s.g;
   if (!g) return;
   switch (g.kind) {
     case 'pan':
+      if (g.resume) resumeAfterPan(s, g);
+      else endGesture(s);
+      break;
     case 'noop':
       endGesture(s);
       break;
@@ -915,7 +1126,20 @@ function onPointerUp(s, e, ctx, fx) {
           fx.push({ type: 'select', ids: [...ctx.selection].filter((id) => !drop.has(id)) });
         } else if (g.deferOnly) {
           fx.push({ type: 'select', ids: g.deferOnly });
+        } else if (g.deferClear) {
+          // Remembered for a double-click this click may start: it is about
+          // the selection this click just cleared (see onDoubleClick).
+          s.clearedByClick = { ids: [...ctx.selection], groupId: s.editingGroupId, x: e.x, y: e.y, at: ctx.now ?? 0 };
+          s.editingGroupId = null;
+          if (ctx.selection.size) fx.push({ type: 'select', ids: [] });
         }
+      } else {
+        // A connector dragged by its shaft came unbound while moving (so its
+        // ends could follow the pointer). An end still close to the shape it
+        // was bound to keeps that binding (Excalidraw), snapped back onto the
+        // outline — part of the same undo step, no new commit.
+        const rebind = rebindMovedConnectors(g.originals, ctx.elements, zoomOf(ctx));
+        if (rebind.length) fx.push({ type: 'updateElements', patches: rebind });
       }
       endGesture(s);
       break;
@@ -1004,7 +1228,12 @@ function boxUp(s, e, p, ctx, fx) {
     box = { x: c.x - def.w / 2, y: c.y - def.h / 2, w: def.w, h: def.h };
   } else {
     box = dragBox(g.start, snapP(p, ctx), { square: e.shiftKey, fromCenter: e.altKey });
-    if (box.w < MIN_SHAPE_SIZE || box.h < MIN_SHAPE_SIZE) {
+    // Only a drag that ended (nearly) where it began — tiny in BOTH
+    // directions, on screen — is really a click: it gets the default size.
+    // A thin one (a 400×3 divider) is kept exactly as its draft showed it
+    // (Excalidraw drops only a shape that is 0 in both directions).
+    const min = MIN_SHAPE_SIZE / zoomOf(ctx);
+    if (box.w < min && box.h < min) {
       const c = { x: box.x + box.w / 2, y: box.y + box.h / 2 };
       box = { x: c.x - def.w / 2, y: c.y - def.h / 2, w: def.w, h: def.h };
     }
@@ -1018,7 +1247,7 @@ function boxUp(s, e, p, ctx, fx) {
   }
   if (g.tool === 'sticky') fx.push({ type: 'startTextEdit', id: el.id });
   endGesture(s);
-  s.swallowDblClick = true;
+  armDblClickSwallow(s, ctx);
 }
 
 /** Click in click-click-click mode: add a point, or finish on the last one. */
@@ -1035,6 +1264,7 @@ function linearClick(s, e, p, ctx, fx) {
   g.held = true;
   g.sx = e.x;
   g.sy = e.y;
+  g.pointerId = e.pointerId; // each tap of a touch is a new pointer
   if (g.points.length >= LIMITS.MAX_POINTS) {
     finishLinear(s, ctx, fx, g.points.slice(0, -1));
     return;
@@ -1055,7 +1285,7 @@ function finishLinear(s, ctx, fx, rawPoints, { switchTool = true, endPointer = n
   const zoom = zoomOf(ctx);
   if (points.length < 2 || (b.w < 1e-6 && b.h < 1e-6)) {
     endGesture(s);
-    s.swallowDblClick = true;
+    armDblClickSwallow(s, ctx);
     return;
   }
   const startTarget = g.startTarget;
@@ -1078,7 +1308,7 @@ function finishLinear(s, ctx, fx, rawPoints, { switchTool = true, endPointer = n
     fx.push({ type: 'setTool', tool: 'select' });
   }
   endGesture(s);
-  s.swallowDblClick = true;
+  armDblClickSwallow(s, ctx);
 }
 
 function penUp(s, p, ctx, fx) {
@@ -1092,11 +1322,18 @@ function penUp(s, p, ctx, fx) {
   endGesture(s);
 }
 
+/**
+ * Text tool click: edit the text under the pointer, or the label of the
+ * container under it — also through the empty middle of a transparent shape
+ * (labelContainerAt) — or start a new free text there. Alt+click always
+ * starts a free text over a container (Excalidraw).
+ */
 function textUp(s, g, ctx, fx) {
   const hit = hitTest(ctx.elements, g.start, zoomOf(ctx), { skipLocked: true });
   endGesture(s);
-  if (hit && (isText(hit) || isContainer(hit))) {
-    fx.push({ type: 'startTextEdit', id: hit.id });
+  const target = hit ?? (g.alt ? null : labelContainerAt(ctx, g.start));
+  if (target && (isText(target) || (isContainer(target) && !g.alt))) {
+    fx.push({ type: 'startTextEdit', id: target.id });
     return;
   }
   const el = newTextAt(g.start, ctx);
@@ -1108,8 +1345,10 @@ function textUp(s, g, ctx, fx) {
  * ------------------------------------------------------------------ */
 
 function onDoubleClick(s, e, ctx, fx) {
+  const cleared = takeClearedSelection(s, e, ctx);
   if (s.swallowDblClick) {
     s.swallowDblClick = false;
+    s.swallowAt = null;
     return;
   }
   const g = s.g;
@@ -1122,29 +1361,45 @@ function onDoubleClick(s, e, ctx, fx) {
   const p = toBoard(e, ctx);
   const zoom = zoomOf(ctx);
   const hit = hitTest(ctx.elements, p, zoom, { skipLocked: true });
+  // The first click of this double-click landed in the empty middle of the
+  // selection frame and cleared the selection: the double-click is still
+  // about that selection (a selected container's label is edited from
+  // anywhere inside its frame, inside the group that was entered).
+  let about = ctx;
+  if (!hit && cleared) {
+    about = { ...ctx, selection: new Set(cleared.ids) };
+    s.editingGroupId = cleared.groupId ?? null;
+  }
+  // What the double-click is about: the element under the pointer or, over
+  // the empty middle of a transparent shape, that container (its label).
+  // Alt+double-click writes a free text even over a container (Excalidraw).
+  const target = hit ?? (e.altKey ? null : labelContainerAt(about, p));
 
-  if (!hit) {
+  if (!target) {
     s.editingGroupId = null;
     const el = newTextAt(p, ctx);
     fx.push({ type: 'startTextEdit', id: el.id, element: el });
     return;
   }
-  if (isText(hit) || isContainer(hit)) {
-    if (!sameIdSet([hit.id], ctx.selection)) fx.push({ type: 'select', ids: [hit.id] });
-    fx.push({ type: 'startTextEdit', id: hit.id });
-    return;
-  }
-  if (isLinear(hit)) {
-    linearDoubleClick(s, hit, p, ctx, fx);
-    return;
-  }
-  // pen / image: step into a group first; otherwise write a new text here.
-  const key = groupKeyOf(hit, ctx.elements);
+  // A member of a group that is not entered yet: the double-click steps into
+  // the group (only this member selected) and does nothing else; the next
+  // double-click edits the member (Excalidraw's handleCanvasDoubleClick).
+  const key = groupKeyOf(target, ctx.elements);
   if (key && s.editingGroupId !== key) {
     s.editingGroupId = key;
-    fx.push({ type: 'select', ids: [hit.id] });
+    if (!sameIdSet([target.id], ctx.selection)) fx.push({ type: 'select', ids: [target.id] });
     return;
   }
+  if (isText(target) || (isContainer(target) && !e.altKey)) {
+    if (!sameIdSet([target.id], ctx.selection)) fx.push({ type: 'select', ids: [target.id] });
+    fx.push({ type: 'startTextEdit', id: target.id });
+    return;
+  }
+  if (isLinear(target)) {
+    linearDoubleClick(s, target, p, ctx, fx);
+    return;
+  }
+  // pen / image (or Alt over a container): write a new text here.
   const el = newTextAt(p, ctx);
   fx.push({ type: 'startTextEdit', id: el.id, element: el });
 }
@@ -1189,9 +1444,47 @@ function linearDoubleClick(s, el, p, ctx, fx) {
 
 const ARROW_KEYS = new Set(['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight']);
 
+/**
+ * Delete/Backspace while a connector is in point editing (Excalidraw's line
+ * editor): the active point goes — one undo step, bindings re-resolved, an
+ * end that goes loses its binding — as long as 2 points remain. With no
+ * active point the key does nothing: deleting the whole connector there is
+ * almost always a miss for "delete this point" (Excalidraw does the same).
+ * Returns false when not point editing, so the global Delete runs.
+ */
+function deleteActivePoint(s, ctx, fx) {
+  const le = s.linearEdit;
+  if (!le || !le.editing) return false;
+  const el = soleLinear(ctx);
+  if (!el || el.id !== le.id) return false;
+  const n = el.points.length;
+  const idx = le.activeIndex ?? -1;
+  if (idx < 0 || idx >= n || n <= 2) return true;
+  const patch = { points: el.points.filter((_, i) => i !== idx).map((q) => ({ x: q.x, y: q.y })) };
+  if (idx === 0 && el.startId) patch.startId = null;
+  if (idx === n - 1 && el.endId) patch.endId = null;
+  fx.push({ type: 'commit', label: nextGestureLabel(s, 'point', ctx) });
+  fx.push({ type: 'updateElements', patches: withBindings(ctx, [{ id: el.id, patch }], [el.id]) });
+  s.linearEdit = { ...le, hoverIndex: -1, activeIndex: -1 };
+  return true;
+}
+
+/** Undo/redo chords (Mod+Z, Mod+Shift+Z, Mod+Y). */
+const isUndoRedoKey = (e) => Boolean(e.mod) && /^[zy]$/i.test(e.key ?? '');
+
 function onKey(s, e, ctx, fx) {
   const g = s.g;
   const down = e.type === 'keydown';
+  // Undo/redo while a button holds a gesture (a move, a resize, a pen
+  // stroke…) would rewind the store under it: the gesture keeps writing from
+  // its originals without a new commit, merges into the previous undo step
+  // and leaves a stale redo entry. Swallowed until the button is released.
+  if (isUndoRedoKey(e)) return down && Boolean(g && g.held);
+  if (down && (e.key === 'Delete' || e.key === 'Backspace')) {
+    if (g && g.held) return true; // mid-drag: never delete what is being dragged
+    if (g) return false;
+    return deleteActivePoint(s, ctx, fx);
+  }
   if (down && (e.key === 'Escape' || e.key === 'Enter')) {
     if (g && g.kind === 'linear') {
       finishLinear(s, ctx, fx, g.phase === 'clicking' ? g.points.slice(0, -1) : g.points);

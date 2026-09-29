@@ -1,0 +1,23 @@
+# Build-context filter for apps/api/Dockerfile ONLY (BuildKit reads
+# <Dockerfile>.dockerignore next to the Dockerfile; the context is the repo
+# root). Keeps host artefacts out of the image: the host's node_modules
+# (the image installs its own), a developer's .env, and any local sqlite file.
+# The image needs only package.json, packages/shared and apps/api.
+
+**/node_modules
+**/.git
+**/.env
+**/.env.*
+!**/.env.example
+**/data
+**/*.db
+**/*.db-journal
+**/*.db-wal
+**/*.db-shm
+**/*.log
+**/coverage
+**/dist
+apps/web
+apps/api/test
+docs
+scripts

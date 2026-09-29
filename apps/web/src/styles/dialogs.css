@@ -58,6 +58,20 @@
   overflow: auto;
 }
 
+/* The body takes focus on open (so scroll keys work) without a ring; one
+   that scrolls is a Tab stop, and shows the ring when reached by keyboard
+   (inset: the rounded box around it does not clip it). */
+.dialog__body:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  border-radius: var(--radius);
+}
+
+.dialog__body[tabindex='-1']:focus-visible,
+.dialog__body[data-autofocus]:focus-visible {
+  outline: none;
+}
+
 .dialog__foot {
   display: flex;
   justify-content: flex-end;

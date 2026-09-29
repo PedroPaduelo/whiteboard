@@ -46,14 +46,17 @@ export const t = Object.freeze({
     shape: 'Clique e arraste, solte quando terminar. Shift mantém a proporção.',
     sticky: 'Clique para colocar uma nota adesiva e comece a digitar.',
     linear: 'Clique para marcar vários pontos, arraste para uma linha simples.',
-    linearMulti: 'Enter, Esc ou clique duplo para terminar.',
+    linearMulti: 'Clique para adicionar pontos. Enter, Esc ou clique duplo para terminar.',
     pen: 'Clique e arraste, solte quando terminar.',
     text: 'Dica: com a seleção, um clique duplo em qualquer lugar também cria texto.',
     eraser: 'Arraste sobre os elementos para apagar. Segure Alt para restaurar.',
     hand: 'Arraste para mover a tela. Ctrl + roda do mouse aproxima.',
     image: 'Escolha uma imagem para inserir no quadro.',
     editPoints: 'Clique duplo na linha para editar os pontos.',
+    pointEditing: 'Arraste os pontos. Clique duplo num segmento adiciona um ponto; num ponto, remove (ou Delete). Esc para sair.',
     editText: 'Clique duplo ou Enter para editar o texto.',
+    lockedElement: (keys) => `Elemento travado: ${keys} para destravar.`,
+    lockedElements: (keys) => `Elementos travados: ${keys} para destravar.`,
     selection: 'Shift + clique soma à seleção. Alt + arrastar duplica.',
     locked: 'Ferramenta travada: ela continua ativa depois de cada desenho.',
   },
@@ -154,7 +157,13 @@ export const t = Object.freeze({
     copied: (n) => (n === 1 ? '1 elemento copiado' : `${n} elementos copiados`),
     cut: (n) => (n === 1 ? '1 elemento recortado' : `${n} elementos recortados`),
     nothingToPaste: 'Nada para colar',
-    pasteFailed: 'Não foi possível ler a área de transferência',
+    // Menu "Colar" where the browser will not let the page read the
+    // clipboard (http origin, permission denied): the keyboard still works.
+    pasteBlocked: (keys) =>
+      keys
+        ? `O navegador não deixou ler a área de transferência — use ${keys} para colar`
+        : 'O navegador não deixou ler a área de transferência',
+    pasteTruncated: (max) => `Texto colado cortado em ${Number(max).toLocaleString('pt-BR')} caracteres`,
     linkCopied: 'Link copiado — envie para quem vai desenhar com você',
     linkCopyFailed: 'Não foi possível copiar o link',
     saved: 'Arquivo salvo',
@@ -196,6 +205,7 @@ export const t = Object.freeze({
     zoom: 'Zoom',
     zoomReset: (pct) => `${pct}% — clique para voltar a 100%`,
     history: 'Histórico',
+    scrollBack: 'Voltar ao conteúdo',
   },
 
   /* --- welcome screen ------------------------------------------------------ */
@@ -315,6 +325,16 @@ export const t = Object.freeze({
     subtitleEmpty: 'Um quadro branco compartilhado. Abra um para desenhar ou crie um novo.',
     subtitle: (mine, unclaimed) =>
       `${mine === 1 ? '1 seu' : `${mine} seus`}${unclaimed ? ` · ${unclaimed === 1 ? '1 sem dono' : `${unclaimed} sem dono`}` : ''}.`,
+    subtitlePartial: (loaded, total) => `Mostrando ${loaded} de ${total} quadros (seus e sem dono).`,
+    searchCount: (total, q) => (total === 1 ? `1 quadro com “${q}”.` : `${total} quadros com “${q}”.`),
+    searching: 'Buscando…',
+    searchLabel: 'Buscar quadros pelo nome',
+    searchPlaceholder: 'Buscar quadros…',
+    searchEmpty: (q) => `Nenhum quadro com “${q}”`,
+    searchEmptyText: 'A busca procura no nome dos quadros que você vê nesta lista.',
+    searchClear: 'Limpar busca',
+    loadMore: (n) => (n > 0 ? `Carregar mais (${n} restantes)` : 'Carregar mais'),
+    loadingMore: 'Carregando…',
     newBoard: 'Novo quadro',
     creating: 'Criando…',
     defaultTitle: 'Quadro sem título',
@@ -331,6 +351,8 @@ export const t = Object.freeze({
     firstBoard: 'Criar meu primeiro quadro',
     updated: (when) => `Atualizado ${when}`,
     rev: (n) => `rev. ${n}`,
+    previewEmpty: 'Vazio',
+    previewCount: (n) => `${Number(n).toLocaleString('pt-BR')} elementos`,
     unclaimed: 'Sem dono',
     unclaimedTitle: 'Ninguém é dono deste quadro ainda',
     claim: 'Assumir',
@@ -369,6 +391,17 @@ export const t = Object.freeze({
     },
   },
 
+  /* --- a board URL with no board behind it ---------------------------------------- */
+  notFound: {
+    title: 'Este quadro não existe',
+    text: 'O link pode estar incompleto ou errado, ou o quadro foi excluído. Abra um dos seus quadros ou crie um novo.',
+    deletedTitle: 'Este quadro não existe mais',
+    deletedText: 'Ele foi excluído enquanto estava aberto (ou o servidor perdeu os quadros ao reiniciar). Nada do que for desenhado aqui pode ser salvo no servidor.',
+    id: (id) => `Endereço procurado: ${id}`,
+    save: (n) => (n === 1 ? 'Salvar o elemento na tela em arquivo' : `Salvar os ${n} elementos na tela em arquivo`),
+    boards: 'Ir para Meus quadros',
+  },
+
   /* --- errors ------------------------------------------------------------------ */
   errors: {
     title: 'Algo deu errado',
@@ -379,6 +412,14 @@ export const t = Object.freeze({
     retry: 'Tentar de novo',
     stack: 'Pilha de componentes',
     dismiss: 'Dispensar',
+    /** Why a request failed, appended to a "Não foi possível …" (ui/errors.js). */
+    reasons: {
+      network: 'sem conexão com o servidor',
+      boardGone: 'o quadro não existe mais',
+      tooLarge: 'o conteúdo é grande demais',
+      rateLimited: 'muitas tentativas seguidas; espere um pouco',
+      server: 'erro no servidor',
+    },
   },
 });
 

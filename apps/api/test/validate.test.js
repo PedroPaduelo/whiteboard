@@ -498,8 +498,8 @@ describe('validateOps', () => {
     assert.deepEqual(op.patch, patch);
   });
 
-  test('startId, endId, groupId and label accept null (null = remove the field)', () => {
-    assert.deepEqual([...NULLABLE_PATCH_KEYS].sort(), ['endId', 'groupId', 'label', 'startId']);
+  test('startId, endId, groupId, label and the fixed points accept null (null = remove the field)', () => {
+    assert.deepEqual([...NULLABLE_PATCH_KEYS].sort(), ['endFixedPoint', 'endId', 'groupId', 'label', 'startFixedPoint', 'startId']);
     const [op] = validateOps([{
       ...base, kind: 'update', elementId: 'a1',
       patch: { startId: null, endId: null, groupId: null, label: null },
@@ -550,7 +550,10 @@ describe('validateOps', () => {
       ['cylinder', { label: 'C', fillStyle: 'hachure' }],
       ['sticky', { fontFamily: 'code', fontSize: 30, align: 'center', label: 'S2' }],
       ['text', { fontFamily: 'normal', fontSize: 48, align: 'right', text: 'T2' }],
-      ['arrow', { startArrowhead: 'bar', endArrowhead: 'triangle', roundness: 'round', points: [{ x: 0, y: 0 }, { x: 5, y: 5 }, { x: 9, y: 0 }] }],
+      ['arrow', {
+        startArrowhead: 'bar', endArrowhead: 'triangle', roundness: 'round', points: [{ x: 0, y: 0 }, { x: 5, y: 5 }, { x: 9, y: 0 }],
+        startFixedPoint: { x: 1, y: 0.25 }, endFixedPoint: { x: 0.5, y: 0 },
+      }],
       ['line', { startArrowhead: 'dot', endArrowhead: 'dot', roughness: 2 }],
       ['pen', { seed: 77, roughness: 1.5 }],
       ['image', { seed: 8, roundness: 'round' }],
@@ -584,6 +587,32 @@ describe('validateOps', () => {
     assert.throws(() => validateElement({ ...sticky, ...op3.patch }), /label/);
   });
 
+  test('connector fixed points: {x, y} fractions 0..1, typed on create and patch, removable with null', () => {
+    const out = validateElement({ ...SAMPLES.arrow, endId: 'box', endFixedPoint: { x: 0.5, y: 0, z: 9 } });
+    assert.deepEqual(out.endFixedPoint, { x: 0.5, y: 0 }, 'unknown keys stripped');
+    assert.equal('startFixedPoint' in out, false);
+    // Kept while unbound too: inert without the id, and the clients keep it.
+    assert.deepEqual(validateElement({ ...SAMPLES.line, startFixedPoint: { x: 0, y: 1 } }).startFixedPoint, { x: 0, y: 1 });
+    // Only connectors store one.
+    assert.equal('endFixedPoint' in validateElement({ ...SAMPLES.pen, endFixedPoint: { x: 0.5, y: 0 } }), false);
+    assert.equal('endFixedPoint' in validateElement({ ...SAMPLES.rect, endFixedPoint: { x: 0.5, y: 0 } }), false);
+    for (const bad of [{ x: 1.5, y: 0 }, { x: 0, y: -0.1 }, { x: '0.5', y: 0 }, { x: 0.5 }, [0.5, 0], 'top', 3]) {
+      assert.throws(() => validateElement({ ...SAMPLES.arrow, endFixedPoint: bad }), /endFixedPoint/, JSON.stringify(bad));
+      assert.throws(
+        () => validateOps([{ ...base, kind: 'update', elementId: 'a1', patch: { startFixedPoint: bad } }]),
+        /patch\.startFixedPoint/,
+        JSON.stringify(bad),
+      );
+    }
+    const [op] = validateOps([{ ...base, kind: 'update', elementId: 'a1', patch: { endId: 'b2', endFixedPoint: { x: 0, y: 0.5 } } }]);
+    assert.deepEqual(op.patch, { endId: 'b2', endFixedPoint: { x: 0, y: 0.5 } });
+    const stored = validateElement({ ...SAMPLES.arrow, startId: 'b1', startFixedPoint: { x: 1, y: 0.5 } });
+    const [un] = validateOps([{ ...base, kind: 'update', elementId: stored.id, patch: { startId: null, startFixedPoint: null } }]);
+    const merged = validateElement({ ...stored, ...un.patch });
+    assert.equal('startId' in merged, false);
+    assert.equal('startFixedPoint' in merged, false, 'null un-pins');
+  });
+
   test('a multi-point points patch is accepted; the merged connector needs >= 2', () => {
     const stored = validateElement(SAMPLES.arrow);
     const pts = [{ x: 0, y: 0 }, { x: 10, y: 10 }, { x: 20, y: 0 }, { x: 30, y: 10 }];
@@ -598,5 +627,115 @@ describe('validateOps', () => {
   test('tryValidateOps reports invalid without throwing', () => {
     assert.equal(tryValidateOps([{ ...base, kind: 'clear' }]).valid, true);
     assert.equal(tryValidateOps([{ boardId: 'b', kind: 'clear' }]).valid, false);
+  });
+});
+
+describe('coordinate bounds (LIMITS.MAX_COORD)', () => {
+  const M = LIMITS.MAX_COORD;
+
+  test('the bound is the WS cursor clamp, and the edges of the board are accepted', () => {
+    assert.equal(M, 1e7);
+    assert.ok(tryValidateElement({ ...SAMPLES.image, x: -M, y: -M, w: 2 * M, h: 2 * M }).valid);
+    assert.ok(tryValidateElement({ ...SAMPLES.rect, x: M - 10, y: -M, w: 10, h: 10 }).valid);
+    assert.ok(tryValidateElement({ ...SAMPLES.pen, points: [{ x: -M, y: M }, { x: M, y: -M }] }).valid);
+  });
+
+  test('a roughjs-filled shape is at most MAX_SHAPE_SIZE a side (its fill cost grows with it)', () => {
+    const S = LIMITS.MAX_SHAPE_SIZE;
+    assert.equal(S, 200000);
+    for (const type of ['rect', 'ellipse', 'diamond', 'cylinder']) {
+      assert.ok(tryValidateElement({ ...SAMPLES[type], w: S, h: S, fillStyle: 'cross-hatch' }).valid, type);
+      assert.throws(() => validateElement({ ...SAMPLES[type], w: S + 1 }), /element\.w: must be at most/, type);
+      assert.throws(() => validateElement({ ...SAMPLES[type], h: S + 1 }), /element\.h: must be at most/, type);
+    }
+    // Text, stickies and images are not rough-filled: only the world bound applies.
+    assert.ok(tryValidateElement({ ...SAMPLES.image, w: S * 10 }).valid);
+  });
+
+  test('a finite but absurd box is rejected, naming the field', () => {
+    // 1.7e308 passes isFinite; `x + w/2` then overflows to Infinity and the
+    // connector maths turned it into a stored NaN.
+    assert.throws(() => validateElement({ ...SAMPLES.rect, x: 1.7e308 }), /element\.x: must be within/);
+    assert.throws(() => validateElement({ ...SAMPLES.rect, y: -1.7e308 }), /element\.y/);
+    assert.throws(() => validateElement({ ...SAMPLES.rect, w: 1.7e308 }), /element\.w/);
+    // A 1e8 hachure rect hung every visitor's tab.
+    assert.throws(
+      () => validateElement({ ...SAMPLES.rect, x: -5e7, y: -5e7, w: 1e8, h: 1e8, fillStyle: 'hachure' }),
+      /element\.(x|w)/,
+    );
+    // Each coordinate may be in range while the far edge is not.
+    assert.throws(() => validateElement({ ...SAMPLES.rect, x: M - 10, w: 20 }), /x \+ w/);
+    assert.throws(() => validateElement({ ...SAMPLES.image, y: M, h: 1 }), /y \+ h/);
+  });
+
+  test('every point is bounded, so a pen box can never become Infinity', () => {
+    assert.throws(
+      () => validateElement({ ...SAMPLES.pen, points: [{ x: -1.7e308, y: 0 }, { x: 1.7e308, y: 0 }] }),
+      /points\[0\]\.x: must be within/,
+    );
+    assert.throws(
+      () => validateElement({ ...SAMPLES.arrow, points: [{ x: 0, y: 0 }, { x: 0, y: M + 1 }] }),
+      /points\[1\]\.y/,
+    );
+  });
+
+  test("a pen or connector's stale x/y/w/h is ignored, not what gets it rejected", () => {
+    const el = validateElement({ ...SAMPLES.pen, x: 5e9, w: 5e9 });
+    assert.deepEqual([el.x, el.y, el.w, el.h], [0, 0, 9, 9], 'the box comes from the points');
+  });
+
+  test('an image natural size is a non-negative bounded number', () => {
+    assert.throws(() => validateElement({ ...SAMPLES.image, naturalWidth: -1 }), /naturalWidth/);
+    assert.throws(() => validateElement({ ...SAMPLES.image, naturalHeight: 1e308 }), /naturalHeight/);
+  });
+
+  test('patches are bounded the same way', () => {
+    const base = { opId: 'o1' };
+    for (const patch of [{ x: 1.7e308 }, { y: -M - 1 }, { w: 1e308 }, { points: [{ x: 0, y: 1e9 }] }]) {
+      assert.throws(
+        () => validateOps([{ ...base, kind: 'update', elementId: 'r1', patch }]),
+        /patch\.(x|y|w|points)/,
+        JSON.stringify(patch),
+      );
+    }
+  });
+});
+
+describe('sanitisePatch: every key typed, null only where it means "remove"', () => {
+  const base = { opId: 'o1' };
+  const patchOf = (patch) => validateOps([{ ...base, kind: 'update', elementId: 'r1', patch }])[0].patch;
+
+  test('null is REJECTED for every key that is not nullable (it used to vanish or pass through)', () => {
+    const keys = ['stroke', 'fill', 'text', 'src', 'naturalWidth', 'naturalHeight', 'updatedAt', 'x', 'y', 'w', 'h',
+      'rotation', 'strokeWidth', 'opacity', 'fontSize', 'points', 'locked', 'strokeStyle', 'align'];
+    for (const k of keys) {
+      assert.throws(() => patchOf({ [k]: null }), new RegExp(`patch\\.${k}: null is only allowed`), `${k}: null`);
+    }
+    // The four nullable keys still remove.
+    assert.deepEqual(patchOf({ label: null, groupId: null }), { label: null, groupId: null });
+  });
+
+  test('the keys that used to pass through unchecked are type-checked', () => {
+    for (const patch of [
+      { naturalWidth: { evil: 1 } },
+      { naturalHeight: 'big' },
+      { updatedAt: 'yesterday' },
+      { x: '10' },
+      { y: [1] },
+    ]) {
+      assert.throws(() => patchOf(patch), /patch\./, JSON.stringify(patch));
+    }
+    assert.deepEqual(
+      patchOf({ x: 5, y: -5, naturalWidth: 640, naturalHeight: 480, updatedAt: 123 }),
+      { x: 5, y: -5, naturalWidth: 640, naturalHeight: 480, updatedAt: 123 },
+    );
+  });
+
+  test('a valid colour, text and src still pass untouched; undefined means absent', () => {
+    assert.deepEqual(patchOf({ stroke: '#1e1e1e', fill: 'none', text: '', src: 'https://x.test/a.png' }), {
+      stroke: '#1e1e1e', fill: 'none', text: '', src: 'https://x.test/a.png',
+    });
+    assert.deepEqual(patchOf({ stroke: undefined }), {});
+    assert.throws(() => patchOf({ stroke: 'url(javascript:1)' }), /patch\.stroke/);
   });
 });

@@ -15,11 +15,9 @@
     "dev:api": "npm run dev -w @whiteboard/api",
     "dev": "node scripts/dev.mjs",
     "build": "npm run build -w @whiteboard/web",
-    "build:web": "npm run build -w @whiteboard/web",
     "start:api": "npm run start -w @whiteboard/api",
     "test": "node --test --experimental-sqlite \"apps/api/test/**/*.test.js\"",
-    "lint": "node --check apps/api/src/server.js",
-    "test:web": "node --test apps/web/test/*.test.js apps/web/src/**/*.test.js",
+    "test:web": "node --test \"apps/web/test/*.test.js\" \"apps/web/src/**/*.test.js\"",
     "test:all": "npm test && npm run test:web"
   },
   "devDependencies": {

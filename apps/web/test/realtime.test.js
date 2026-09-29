@@ -13,7 +13,8 @@
  * counted); an error ack is dropped, not retried; concurrent edits by two
  * people converge on the server and on both screens; a reconnect or resync
  * restores the server's state while keeping unacknowledged local edits;
- * cursors carry the peer's name and colour; presence shows the tool.
+ * cursors carry the peer's name and colour; presence shows the tool;
+ * each person's selection reaches the others (`peerSelections`).
  */
 
 import test from 'node:test';
@@ -22,7 +23,14 @@ import assert from 'node:assert/strict';
 import { createStore as createServerStore } from '../../api/src/store/memory.js';
 import { validateOps, colorForPeer } from '@whiteboard/shared';
 
-import { RealtimeClient } from '../src/realtime/realtime.js';
+import {
+  RealtimeClient,
+  MAX_BATCH_BYTES,
+  KEEPALIVE_BYTES,
+  MAX_SELECTION_IDS,
+  normalizeSelectionIds,
+  utf8Length,
+} from '../src/realtime/realtime.js';
 import { resolveWsUrl } from '../src/api/client.js';
 import { updateBoardMutation, boardPatchOf } from '../src/api/queries.js';
 import { StoreSync, withRemote } from '../src/realtime/sync.js';
@@ -31,6 +39,8 @@ import { useBoardStore as storeA } from '../src/store/boardStore.js';
 
 // A second, independent store instance: a second browser tab.
 const { useBoardStore: storeB } = await import('../src/store/boardStore.js?peer=b');
+// And a third, for someone who joins later.
+const { useBoardStore: storeC } = await import('../src/store/boardStore.js?peer=c');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -39,9 +49,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
    ======================================================================== */
 
 class FakeServer {
-  constructor({ latency = 2 } = {}) {
+  constructor({ latency = 2, maxPayload = 8 * 1024 * 1024 } = {}) {
     this.store = createServerStore();
     this.latency = latency;
+    /** ws maxPayload: a bigger frame closes the socket with 1009 and no ack, like `ws` does. */
+    this.maxPayload = maxPayload;
+    /** Optional async hook run after a snapshot is read and before it is returned. */
+    this.onSnapshot = null;
     this.sockets = new Set();
     /** Every frame a client sent: {sock, msg}. */
     this.frames = [];
@@ -73,8 +87,14 @@ class FakeServer {
       }
       send(raw) {
         if (this.readyState !== 1) throw new Error('socket not open');
+        const size = Buffer.byteLength(raw);
+        if (size > server.maxPayload) {
+          server.frames.push({ sock: this, msg: { type: 'oversized' }, size });
+          this.drop(1009, 'Max payload size exceeded');
+          return;
+        }
         const msg = JSON.parse(raw);
-        server.frames.push({ sock: this, msg });
+        server.frames.push({ sock: this, msg, size });
         server.busy += 1;
         setTimeout(() => {
           server.receive(this, msg).finally(() => (server.busy -= 1));
@@ -95,12 +115,12 @@ class FakeServer {
           if (this.readyState === 1) this.onmessage?.({ data });
         }, server.latency);
       }
-      /** The network dies under this socket. */
-      drop() {
+      /** The network dies under this socket (or the server closes it with `code`). */
+      drop(code = 1006, reason = 'network') {
         if (this.readyState === 3) return;
         this.readyState = 3;
         server.leave(this);
-        setTimeout(() => this.onclose?.({ code: 1006, reason: 'network' }), 0);
+        setTimeout(() => this.onclose?.({ code, reason }), 0);
       }
     };
   }
@@ -110,7 +130,13 @@ class FakeServer {
   }
 
   peersOf(boardId) {
-    return this.room(boardId).map((s) => ({ id: s.peer.id, name: s.peer.name, color: s.peer.color, tool: s.peer.tool }));
+    return this.room(boardId).map((s) => ({
+      id: s.peer.id,
+      name: s.peer.name,
+      color: s.peer.color,
+      tool: s.peer.tool,
+      selection: s.peer.selection,
+    }));
   }
 
   broadcast(boardId, msg, except = null) {
@@ -133,7 +159,7 @@ class FakeServer {
           return;
         }
         const id = `peer-${++this.seq}`;
-        sock.peer = { id, boardId: msg.boardId, name: msg.peer?.name ?? 'Anônimo', color: colorForPeer(id), tool: 'select' };
+        sock.peer = { id, boardId: msg.boardId, name: msg.peer?.name ?? 'Anônimo', color: colorForPeer(id), tool: 'select', selection: [] };
         sock.deliver({ type: 'ready', peerId: id, board: snap.board, elements: snap.elements, rev: snap.rev, peers: this.peersOf(msg.boardId) });
         this.broadcast(msg.boardId, { type: 'presence', boardId: msg.boardId, peers: this.peersOf(msg.boardId) }, sock);
         return;
@@ -156,6 +182,21 @@ class FakeServer {
         this.broadcast(
           sock.peer.boardId,
           { type: 'peer-cursor', boardId: sock.peer.boardId, peerId: sock.peer.id, cursor: msg.cursor, name: sock.peer.name, color: sock.peer.color },
+          sock,
+        );
+        return;
+      }
+      case 'selection': {
+        // The relay this client expects: the peer's selection is recorded
+        // (so the roster carries it to late joiners) and, when it changed,
+        // fanned out to the others as `peer-selection`. Never persisted.
+        if (!sock.peer || !Array.isArray(msg.ids)) return;
+        const ids = [...new Set(msg.ids.filter((id) => typeof id === 'string' && id))];
+        if (ids.join('\n') === sock.peer.selection.join('\n')) return;
+        sock.peer.selection = ids;
+        this.broadcast(
+          sock.peer.boardId,
+          { type: 'peer-selection', boardId: sock.peer.boardId, peerId: sock.peer.id, ids, name: sock.peer.name, color: sock.peer.color },
           sock,
         );
         return;
@@ -217,6 +258,7 @@ class FakeServer {
       err.status = 404;
       throw err;
     }
+    if (this.onSnapshot) await this.onSnapshot(boardId, snap);
     return snap;
   }
 
@@ -242,12 +284,13 @@ class FakeServer {
    Client harness: RealtimeClient + StoreSync + bridge over one store
    ======================================================================== */
 
-function makeClient(server, store, { boardId, name }) {
+function makeClient(server, store, { boardId, name, stash = null, postOps = null }) {
   const errors = [];
   const client = new RealtimeClient({
     WebSocket: server.socketClass(),
     url: 'ws://test.local/api/ws',
-    postOps: (b, ops) => server.postOps(b, ops),
+    postOps: postOps ?? ((b, ops) => server.postOps(b, ops)),
+    stash,
     ackTimeoutMs: 3000,
     heartbeatMs: 60_000,
     backoffBaseMs: 5,
@@ -336,6 +379,7 @@ async function freshBoard(server, id, elements = []) {
 function resetStores() {
   storeA.getState().reset();
   storeB.getState().reset();
+  storeC.getState().reset();
 }
 
 test.beforeEach(() => resetStores());
@@ -609,6 +653,80 @@ test('cursors carry the peer name and colour; presence shows the nickname and th
   b.close();
 });
 
+test("collaborators' selections: sent throttled, drawn in the peer's colour, seen by late joiners, gone with the peer", async () => {
+  const server = new FakeServer();
+  await freshBoard(server, 'b1', [rect('r1'), rect('r2', 200), rect('r3', 400)]);
+  const a = track(makeClient(server, storeA, { boardId: 'b1', name: 'Ana' }));
+  const b = track(makeClient(server, storeB, { boardId: 'b1', name: 'Bruno' }));
+  await settle(server, [a, b]);
+  const selectionFrames = () => server.frames.filter((f) => f.msg.type === 'selection' && f.sock.__client === a.client);
+  assert.equal(selectionFrames().length, 0, 'nothing selected, nothing announced');
+
+  // A selects a shape: B holds it under A's peer id, in A's colour.
+  a.S().select(['r1']);
+  const seen = () => b.S().peerSelections.get(a.client.peerId);
+  await until(() => seen()?.ids.join() === 'r1', { what: "A's selection on B" });
+  assert.equal(seen().color, colorForPeer(a.client.peerId));
+  assert.equal(seen().name, 'Ana');
+  assert.equal(a.S().peerSelections.size, 0, 'our own selection is never stored as a peer one');
+
+  // A marquee drag: a burst of changes is a few frames, and the LAST one lands.
+  const before = selectionFrames().length;
+  for (let i = 0; i < 20; i++) a.S().select(i % 2 ? ['r1', 'r2'] : ['r1']);
+  a.S().select(['r1', 'r2', 'r3']);
+  await until(() => seen()?.ids.join() === 'r1,r2,r3', { what: 'the trailing selection' });
+  assert.ok(selectionFrames().length - before <= 3, `throttled, got ${selectionFrames().length - before}`);
+
+  // The same selection again is not sent again.
+  const settled = selectionFrames().length;
+  a.S().select(['r1', 'r2', 'r3']);
+  await sleep(80);
+  assert.equal(selectionFrames().length, settled);
+
+  // Editing a text counts as working on it.
+  a.S().clearSelection();
+  a.S().setEditing('r2');
+  await until(() => seen()?.ids.join() === 'r2', { what: 'the edited element' });
+  a.S().setEditing(null);
+  a.S().select(['r3']);
+  await until(() => seen()?.ids.join() === 'r3', { what: 'back to a selection' });
+
+  // Someone joining later sees it at once (the roster in `ready` carries it).
+  const c = track(makeClient(server, storeC, { boardId: 'b1', name: 'Carla' }));
+  await until(() => c.client.status === 'connected' && c.S().peerSelections.get(a.client.peerId)?.ids.join() === 'r3', {
+    what: "A's selection on the late joiner",
+  });
+
+  // A reconnects (a new peer to the server): the selection is announced again,
+  // and the old peer id's outline goes with the old roster entry.
+  const oldId = a.client.peerId;
+  a.client.reconnect();
+  await until(() => a.client.status === 'connected' && a.client.peerId !== oldId, { what: 'the reconnect' });
+  await until(() => seen()?.ids.join() === 'r3' && !b.S().peerSelections.has(oldId), { what: 're-announced after the re-join' });
+
+  // Nothing selected any more: the outline goes away.
+  a.S().clearSelection();
+  await until(() => !b.S().peerSelections.has(a.client.peerId), { what: 'the cleared selection' });
+
+  // A peer that leaves takes its selection with it.
+  a.S().select(['r1']);
+  await until(() => seen()?.ids.join() === 'r1', { what: 'selected again' });
+  a.close();
+  await until(() => b.S().peerSelections.size === 0 && c.S().peerSelections.size === 0, { what: 'selection dropped with the peer' });
+  b.close();
+  c.close();
+});
+
+test('normalizeSelectionIds: unique non-empty string ids, capped; anything else is []', () => {
+  assert.deepEqual(normalizeSelectionIds(new Set(['a', 'b'])), ['a', 'b']);
+  assert.deepEqual(normalizeSelectionIds(['a', 'a', '', 3, null, 'x'.repeat(41), 'b']), ['a', 'b']);
+  assert.deepEqual(normalizeSelectionIds('abc'), [], 'a string is not a list of ids');
+  assert.deepEqual(normalizeSelectionIds(null), []);
+  assert.deepEqual(normalizeSelectionIds({ ids: ['a'] }), []);
+  const many = Array.from({ length: MAX_SELECTION_IDS + 10 }, (_, i) => `e${i}`);
+  assert.equal(normalizeSelectionIds(many).length, MAX_SELECTION_IDS);
+});
+
 test('a {type:"board"} message updates the store board (rename by someone else)', async () => {
   const server = new FakeServer();
   await freshBoard(server, 'b1');
@@ -777,4 +895,326 @@ test('useUpdateBoard(id).mutate({title}) PATCHes /boards/<id> with {title} and u
   } finally {
     globalThis.fetch = realFetch;
   }
+});
+
+/* ========================================================================
+   Batches by bytes, bindings across batches, stale resyncs, tab close,
+   offline, missing boards
+   ======================================================================== */
+
+/** A valid image element whose data URL is `chars` long. */
+const bigImage = (id, chars, x = 0) => ({
+  id,
+  type: 'image',
+  x,
+  y: 0,
+  w: 160,
+  h: 120,
+  src: `data:image/png;base64,${'A'.repeat(chars - 'data:image/png;base64,'.length)}`,
+});
+
+/** A stash in memory, shaped like stash.js. */
+function memoryStash() {
+  const boards = new Map();
+  return {
+    boards,
+    save(boardId, ops) {
+      const prior = boards.get(boardId) ?? [];
+      const seen = new Set(prior.map((op) => op.opId));
+      boards.set(boardId, [...prior, ...ops.filter((op) => !seen.has(op.opId))]);
+      return true;
+    },
+    take(boardId) {
+      const ops = boards.get(boardId) ?? [];
+      boards.delete(boardId);
+      return ops;
+    },
+    drop(boardId) {
+      boards.delete(boardId);
+    },
+  };
+}
+
+test('a drop of several big images goes out in frames under the byte budget, and everything lands', async () => {
+  const server = new FakeServer();
+  await freshBoard(server, 'b1');
+  const a = track(makeClient(server, storeA, { boardId: 'b1', name: 'Ana' }));
+  await until(() => a.client.status === 'connected');
+
+  // Six ~1.8M-char images in ONE commit: ~10.8 MB, over the 8 MiB frame cap.
+  edit(a, 'drop-images', (s) => s.addElements([1, 2, 3, 4, 5, 6].map((i) => bigImage(`img${i}`, 1_800_000, i * 200))));
+  await settle(server, [a], 60);
+  edit(a, 'add', (s) => s.addElement(rect('after', 0, 400)));
+  await settle(server, [a], 60);
+
+  const frames = server.frames.filter((f) => f.msg.type === 'ops' || f.msg.type === 'oversized');
+  assert.ok(frames.every((f) => f.msg.type === 'ops'), 'no frame was over the server cap');
+  assert.ok(frames.length >= 3, `split into several frames (got ${frames.length})`);
+  for (const f of frames) assert.ok(f.size <= MAX_BATCH_BYTES + 2_000_000, `frame of ${f.size} bytes is within budget`);
+  const ids = (await server.elements('b1')).map((e) => e.id);
+  assert.deepEqual(ids, ['img1', 'img2', 'img3', 'img4', 'img5', 'img6', 'after'], 'every image and the later edit persisted');
+  a.close();
+});
+
+test('a batch the server keeps closing (1009) is split; a lone op that can never fit is dropped, not retried forever', async () => {
+  // A server configured tighter than the client's budget: 1.7 MB frames.
+  const server = new FakeServer({ maxPayload: 1_700_000 });
+  await freshBoard(server, 'b1');
+  const a = track(makeClient(server, storeA, { boardId: 'b1', name: 'Ana' }));
+  await until(() => a.client.status === 'connected');
+
+  // Two 1M images: one 2 MB frame, closed with 1009 -> split -> both land.
+  edit(a, 'drop', (s) => s.addElements([bigImage('i1', 1_000_000), bigImage('i2', 1_000_000, 300)]));
+  await settle(server, [a], 60);
+  assert.deepEqual((await server.elements('b1')).map((e) => e.id), ['i1', 'i2']);
+
+  // One op bigger than the server takes at all: dropped after the 1009, reported,
+  // rolled back locally; later edits are not stuck behind it.
+  const opens = () => server.frames.filter((f) => f.msg.type === 'join').length;
+  edit(a, 'drop', (s) => s.addElement(bigImage('huge', 1_900_000)));
+  edit(a, 'add', (s) => s.addElement(rect('later', 0, 400)));
+  await until(() => (a.S().elements.some((e) => e.id === 'later') && !a.S().elements.some((e) => e.id === 'huge')), {
+    what: 'the oversized image rolled back',
+  });
+  await settle(server, [a], 80);
+  const joinsBefore = opens();
+  await sleep(150);
+  assert.equal(opens(), joinsBefore, 'no reconnect loop');
+  assert.deepEqual((await server.elements('b1')).map((e) => e.id), ['i1', 'i2', 'later']);
+  assert.ok(a.errors.some((e) => e.code === 'PAYLOAD_TOO_LARGE'), 'the drop is reported');
+  assert.deepEqual(essence(a.S().elements), essence(await server.elements('b1')));
+  a.close();
+});
+
+test('a change over 200 ops keeps connector bindings: targets are created before the arrows bound to them', async () => {
+  const server = new FakeServer();
+  const rects = Array.from({ length: 250 }, (_, i) => rect(`r${i}`, (i % 25) * 120, Math.floor(i / 25) * 80));
+  const arrow = {
+    id: 'ar',
+    type: 'arrow',
+    x: 0,
+    y: 0,
+    w: 100,
+    h: 100,
+    points: [{ x: 0, y: 0 }, { x: 100, y: 100 }],
+    stroke: '#1e1e1e',
+    endId: 'r249',
+  };
+  await freshBoard(server, 'b1', [arrow, ...rects]); // the arrow sits BELOW its target
+  const a = track(makeClient(server, storeA, { boardId: 'b1', name: 'Ana' }));
+  const b = track(makeClient(server, storeB, { boardId: 'b1', name: 'Bruno' }));
+  await until(() => a.client.status === 'connected' && b.client.status === 'connected');
+
+  // Ctrl+A, Ctrl+D: copies in z-order, the arrow copy bound to the copy of r249.
+  edit(a, 'duplicate', (s) =>
+    s.addElements(s.elements.map((el) => ({ ...el, id: `c-${el.id}`, ...(el.endId ? { endId: `c-${el.endId}` } : {}) }))),
+  );
+  await settle(server, [a, b], 80);
+
+  const truth = await server.elements('b1');
+  assert.equal(truth.length, 502);
+  assert.equal(truth.find((e) => e.id === 'c-ar').endId, 'c-r249', 'the server kept the binding');
+  assert.equal(b.S().elements.find((e) => e.id === 'c-ar').endId, 'c-r249', 'and so did the live peer');
+  assert.deepEqual(truth.map((e) => e.id), a.S().elements.map((e) => e.id), 'same z-order everywhere');
+  assert.deepEqual(b.S().elements.map((e) => e.id), a.S().elements.map((e) => e.id));
+  a.close();
+  b.close();
+});
+
+test('replacing a nearly full board (an import) deletes first, so MAX_ELS is never passed halfway', async () => {
+  const server = new FakeServer({ latency: 1 });
+  const old = Array.from({ length: 2501 }, (_, i) => rect(`old${i}`, (i % 50) * 110, Math.floor(i / 50) * 70));
+  await freshBoard(server, 'b1', old);
+  const a = track(makeClient(server, storeA, { boardId: 'b1', name: 'Ana' }));
+  await until(() => a.client.status === 'connected' && a.S().elements.length === 2501);
+
+  const incoming = Array.from({ length: 2500 }, (_, i) => ({ ...rect(`new${i}`, (i % 50) * 110, Math.floor(i / 50) * 70), type: 'ellipse' }));
+  edit(a, 'import', (s) => s.replaceAll(incoming)); // 2501 + 2500 > 5000 if creates went first
+  await settle(server, [a], 80);
+
+  const truth = await server.elements('b1');
+  assert.equal(truth.length, 2500, 'the whole file landed');
+  assert.ok(truth.every((e) => e.type === 'ellipse'));
+  assert.equal(a.errors.filter((e) => e.kind === 'ops').length, 0, 'no batch was refused');
+  assert.equal(a.S().elements.length, 2500);
+  a.close();
+});
+
+test('a resync snapshot older than broadcasts already applied is brought up to date, not rolled back', async () => {
+  const server = new FakeServer();
+  await freshBoard(server, 'b1', [rect('r1'), rect('victim', 0, 200)]);
+  const a = track(makeClient(server, storeA, { boardId: 'b1', name: 'Ana' }));
+  const b = track(makeClient(server, storeB, { boardId: 'b1', name: 'Bruno' }));
+  await until(() => a.client.status === 'connected' && b.client.status === 'connected');
+
+  // While each of A's snapshot GETs is "on the wire", B keeps editing (a
+  // create each time, and a delete the first time) and A applies the
+  // broadcasts — so EVERY snapshot is older than what A shows. It used to
+  // refetch 3 times and then apply the 4th stale one, losing B's last edit.
+  let fetches = 0;
+  server.onSnapshot = async () => {
+    fetches += 1;
+    if (fetches > 5) return;
+    const id = `fromB${fetches}`;
+    edit(b, 'add', (s) => s.addElement(rect(id, 300, fetches * 70)));
+    await until(() => a.S().elements.some((e) => e.id === id), { what: `A sees ${id}` });
+    if (fetches > 1) return;
+    edit(b, 'delete', (s) => s.removeElements(['victim']));
+    await until(() => !a.S().elements.some((e) => e.id === 'victim'), { what: 'A sees the delete' });
+  };
+  // Count snapshot GETs in flight, so the test waits for the whole resync.
+  const realSnapshot = server.snapshot.bind(server);
+  let active = 0;
+  server.snapshot = async (id) => {
+    active += 1;
+    try {
+      return await realSnapshot(id);
+    } finally {
+      active -= 1;
+    }
+  };
+  const sock = [...server.sockets].find((s) => s.__client === a.client);
+  sock.deliver({ type: 'resync', boardId: 'b1', rev: a.client.rev });
+  await until(() => fetches >= 1 && active === 0 && server.busy === 0, { what: 'the resync', timeout: 5000 });
+  await sleep(100);
+  await until(() => active === 0, { what: 'no refetch in flight', timeout: 5000 });
+  await settle(server, [a, b], 120);
+  server.onSnapshot = null;
+
+  const truth = await server.elements('b1');
+  assert.deepEqual(truth.map((e) => e.id), ['r1', ...Array.from({ length: fetches }, (_, i) => `fromB${i + 1}`)]);
+  assert.deepEqual(essence(a.S().elements), essence(truth), "A kept B's creates and did not resurrect the deleted element");
+  assert.equal(fetches, 1, 'no refetch was needed: the batches in between were known');
+  a.close();
+  b.close();
+});
+
+test('closing the tab: one keepalive request with what fits, everything stashed and replayed on the next visit', async () => {
+  const server = new FakeServer();
+  await freshBoard(server, 'b1');
+  const stash = memoryStash();
+  const posts = [];
+  const postOps = async (boardId, ops, opts) => {
+    posts.push({ boardId, ops, opts, bytes: utf8Length(JSON.stringify({ ops, actorId: 'x'.repeat(10) })) });
+    return server.postOps(boardId, ops);
+  };
+  const a = track(makeClient(server, storeA, { boardId: 'b1', name: 'Ana', stash, postOps }));
+  await until(() => a.client.status === 'connected');
+
+  server.held = []; // the socket never acks: everything stays pending
+  edit(a, 'paste', (s) => s.addElements(Array.from({ length: 300 }, (_, i) => rect(`p${i}`, i * 3, 0))));
+  a.sync.flush();
+  a.client.disconnect({ unloading: true }); // pagehide
+  server.held = null;
+
+  assert.equal(posts.length, 1, 'exactly one request while the page goes away (no chain, no burst)');
+  assert.equal(posts[0].opts?.keepalive, true);
+  assert.ok(posts[0].bytes <= KEEPALIVE_BYTES + 100, `the keepalive body fits the browser quota (${posts[0].bytes} bytes)`);
+  assert.ok(posts[0].ops.length < 300, 'it cannot carry all 300 rects');
+  assert.equal(stash.boards.get('b1').length, 300, 'but all 300 are stashed');
+  await sleep(40);
+
+  // Next visit, same browser (a fresh store): the stash is queued first and delivered.
+  storeB.getState().reset();
+  const next = track(makeClient(server, storeB, { boardId: 'b1', name: 'Ana', stash, postOps }));
+  await until(() => next.client.status === 'connected');
+  await settle(server, [next], 80);
+  const truth = await server.elements('b1');
+  assert.equal(truth.length, 300, 'every pasted rect reached the server exactly once');
+  assert.deepEqual(truth.map((e) => e.id), Array.from({ length: 300 }, (_, i) => `p${i}`), 'in order');
+  assert.equal(stash.boards.has('b1'), false, 'the stash is consumed');
+  assert.deepEqual(essence(next.S().elements), essence(truth));
+  next.close();
+});
+
+test('leaving a board: the HTTP salvage is split by bytes, sent in order, and what fails is stashed', async () => {
+  const server = new FakeServer();
+  await freshBoard(server, 'b1');
+  await freshBoard(server, 'b2');
+  const stash = memoryStash();
+  const posts = [];
+  let failFrom = Infinity;
+  const postOps = async (boardId, ops) => {
+    posts.push(ops.length);
+    if (posts.length >= failFrom) throw Object.assign(new Error('network down'), { status: 0 });
+    return server.postOps(boardId, ops);
+  };
+  const a = track(makeClient(server, storeA, { boardId: 'b1', name: 'Ana', stash, postOps }));
+  await until(() => a.client.status === 'connected');
+
+  server.held = [];
+  edit(a, 'drop', (s) => s.addElements([1, 2, 3].map((i) => bigImage(`img${i}`, 1_800_000, i * 200))));
+  edit(a, 'add', (s) => s.addElement(rect('tail', 0, 400)));
+  a.sync.flush();
+  failFrom = 2; // the second request fails
+  a.client.connect('b2');
+  server.held = null;
+  await until(() => a.client.status === 'connected');
+  await sleep(40);
+
+  assert.deepEqual(posts, [2, 2], 'two images per request (byte budget), the second request failed');
+  assert.deepEqual((await server.elements('b1')).map((e) => e.id), ['img1', 'img2']);
+  assert.deepEqual(stash.boards.get('b1').map((op) => op.element?.id), ['img3', 'tail'], 'the rest waits for the next visit');
+  assert.ok(a.errors.some((e) => e.kind === 'salvage'), 'reported, but not as a rejected edit');
+  assert.ok(!a.errors.some((e) => e.kind === 'ops'));
+  a.close();
+});
+
+test('the browser going offline says offline at once; back online it reconnects and the edits land', async () => {
+  const server = new FakeServer();
+  await freshBoard(server, 'b1');
+  const a = track(makeClient(server, storeA, { boardId: 'b1', name: 'Ana' }));
+  await until(() => a.client.status === 'connected');
+
+  a.client.markOffline(); // the window's 'offline' event
+  assert.equal(a.S().connection, 'offline', 'no waiting for an ack timeout');
+  assert.equal(a.client.ws, null, 'the socket is dropped');
+  edit(a, 'add', (s) => s.addElement(rect('offline-edit')));
+  a.sync.flush();
+  assert.equal(a.client.outbox.length, 1, 'the edit waits in the queue');
+
+  a.client.reconnect(); // the window's 'online' event
+  await settle(server, [a], 60);
+  assert.deepEqual((await server.elements('b1')).map((e) => e.id), ['offline-edit']);
+  a.close();
+});
+
+test('a board deleted while open is final: the missing ack stops the client and says BOARD_NOT_FOUND', async () => {
+  const server = new FakeServer();
+  await freshBoard(server, 'b1');
+  const a = track(makeClient(server, storeA, { boardId: 'b1', name: 'Ana' }));
+  await until(() => a.client.status === 'connected');
+  const joins = () => server.frames.filter((f) => f.msg.type === 'join').length;
+  const joined = joins();
+
+  await server.store.deleteBoard('b1');
+  edit(a, 'add', (s) => s.addElement(rect('into-the-void')));
+  await until(() => a.client.status === 'disconnected', { what: 'disconnected' });
+  await sleep(60);
+  assert.equal(joins(), joined, 'no reconnect: the board is gone');
+  assert.equal(a.client.fatal, true);
+  assert.equal(a.client.outbox.length + (a.client.inflight ? 1 : 0), 0, 'nothing left to send');
+  assert.equal(a.S().connection, 'disconnected');
+  assert.ok(a.S().error, 'the store says so');
+  assert.equal(a.S().status, 'missing');
+  assert.ok(a.errors.some((e) => e.code === 'BOARD_NOT_FOUND'));
+  a.close();
+});
+
+test("the server evicting a deleted board's room (BOARD_NOT_FOUND error) is final too, even with no edit", async () => {
+  const server = new FakeServer();
+  await freshBoard(server, 'b1');
+  const a = track(makeClient(server, storeA, { boardId: 'b1', name: 'Ana' }));
+  await until(() => a.client.status === 'connected');
+  const joins = () => server.frames.filter((f) => f.msg.type === 'join').length;
+  const joined = joins();
+
+  const sock = [...server.sockets].find((s) => s.__client === a.client);
+  sock.deliver({ type: 'error', text: 'board deleted', code: 'BOARD_NOT_FOUND', boardId: 'b1' });
+  await until(() => a.client.status === 'disconnected', { what: 'disconnected' });
+  await sleep(60);
+  assert.equal(joins(), joined, 'no reconnect');
+  assert.equal(a.S().status, 'missing');
+  assert.ok(a.errors.some((e) => e.code === 'BOARD_NOT_FOUND'));
+  a.close();
 });

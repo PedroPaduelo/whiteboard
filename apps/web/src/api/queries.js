@@ -229,13 +229,18 @@ export function useBoard(id, { enabled = true } = {}) {
  * `realtime/bridge.js` (not a bare `setSnapshot`): it skips a snapshot older
  * than what the board already shows and keeps unacknowledged local edits.
  * The live resync path fetches its own snapshot and does not use this cache.
+ *
+ * A 404 (or a 400 for an id the server cannot even look up) is final, not
+ * retried: the board does not exist, and the app shows that at once instead
+ * of an editor whose edits could never be saved.
  */
 export function useBoardSnapshot(id, { enabled = true } = {}) {
   return useQuery({
     queryKey: keys.snapshot(id),
-    queryFn: () => api.get(`/boards/${id}/snapshot`),
+    queryFn: () => api.get(`/boards/${encodeURIComponent(id)}/snapshot`),
     enabled: Boolean(id) && enabled,
     staleTime: 5000,
+    retry: (failures, err) => err?.status !== 404 && err?.status !== 400 && failures < 1,
   });
 }
 

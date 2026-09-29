@@ -17,6 +17,8 @@ import {
   connectorMidpoint,
   detachMissingConnectors,
   BIND_GAP,
+  bindGap,
+  cornerRadius,
   pointInPolygon,
   fitView,
   diamondPolygon,
@@ -25,6 +27,14 @@ import {
   unionRect,
   screenToBoard,
   boardToScreen,
+  bindingFixedPoint,
+  FIXED_POINT_MIN_RATIO,
+  ZOOM_LIMITS,
+  ZOOM_STEP,
+  zoomAt,
+  clampZoom,
+  stepZoom,
+  validateElement,
 } from '@whiteboard/shared';
 
 const box = (over = {}) => ({ id: 'b', type: 'rect', x: 0, y: 0, w: 100, h: 100, ...over });
@@ -547,5 +557,302 @@ describe('supporting helpers', () => {
     const back = boardToScreen(screenToBoard(screen, view), view);
     assert.ok(Math.abs(back.x - screen.x) < 1e-9);
     assert.ok(Math.abs(back.y - screen.y) < 1e-9);
+  });
+});
+
+describe('binding gap follows stroke width and rounded outlines', () => {
+  const S = Math.SQRT1_2;
+
+  test('bindGap: BIND_GAP at the default stroke, half a unit more per extra unit on each side', () => {
+    assert.equal(bindGap({ type: 'rect' }, { type: 'arrow' }), BIND_GAP, 'no strokeWidth = the default 2');
+    assert.equal(bindGap({ type: 'rect', strokeWidth: 2 }, { type: 'arrow', strokeWidth: 2 }), BIND_GAP);
+    assert.equal(bindGap({ type: 'rect', strokeWidth: 4 }, { type: 'arrow', strokeWidth: 4 }), BIND_GAP + 2);
+    assert.equal(bindGap({ type: 'ellipse', strokeWidth: 1 }, { type: 'arrow', strokeWidth: 1 }), BIND_GAP - 1);
+    // Text, images and stickies draw no outline: their strokeWidth adds nothing.
+    for (const type of ['text', 'image', 'sticky']) {
+      assert.equal(bindGap({ type, strokeWidth: 4 }, { type: 'arrow' }), BIND_GAP, type);
+    }
+    // The VISIBLE gap (minus half of each stroke) is the same at every width.
+    for (const w of [1, 2, 4, 8]) {
+      assert.equal(bindGap({ type: 'rect', strokeWidth: w }, { strokeWidth: w }) - w / 2 - w / 2, BIND_GAP - 2);
+    }
+  });
+
+  test('extra-bold rect and arrow: the end stops clear of both strokes', () => {
+    const r = { id: 'r', type: 'rect', x: 400, y: 170, w: 200, h: 100, strokeWidth: 4, roughness: 0 };
+    const a = { id: 'a', type: 'arrow', x: 0, y: 0, w: 0, h: 0, strokeWidth: 4, points: [{ x: 500, y: 400 }, { x: 500, y: 280 }], endId: 'r' };
+    const [, out] = resolveConnectors([r, a]);
+    assert.deepEqual(out.points[1], { x: 500, y: 276 }, '6 units below the bottom edge, not 4');
+  });
+
+  test('a round rect: an end aimed at a corner stops at the DRAWN curve, not the cut-off corner', () => {
+    const box = { id: 'b', type: 'rect', roundness: 'round', x: 1000, y: 450, w: 160, h: 160 };
+    // r = min(160 * 0.25, 32) = 32; the quadratic corner's midpoint on the
+    // diagonal is r/4 inside the sharp corner: (1008, 458).
+    const p = connectorEndpoint(box, { x: 900, y: 350 }, BIND_GAP);
+    near(p, { x: 1008 - BIND_GAP * S, y: 458 - BIND_GAP * S }, 'corner', 1e-9);
+    // On a straight stretch of edge it is exactly the box.
+    near(connectorEndpoint(box, { x: 1080, y: 0 }, BIND_GAP), { x: 1080, y: 450 - BIND_GAP }, 'top edge', 1e-9);
+    near(
+      connectorEndpoint({ ...box, roundness: 'sharp' }, { x: 900, y: 350 }, BIND_GAP),
+      { x: 1000 - BIND_GAP * S, y: 450 - BIND_GAP * S },
+      'a sharp rect keeps its corner',
+      1e-9,
+    );
+  });
+
+  test('a round diamond: an end aimed at a vertex stops at the rounded tip', () => {
+    // vr = cornerRadius(100) = 25, and the cubic's midpoint is vr/4 in from the vertex.
+    const d = { id: 'd', type: 'diamond', roundness: 'round', x: 0, y: 0, w: 200, h: 200 };
+    near(connectorEndpoint(d, { x: 500, y: 100 }), { x: 200 - 25 / 4, y: 100 }, 'right vertex');
+    near(connectorEndpoint(d, { x: 100, y: -500 }), { x: 100, y: 25 / 4 }, 'top vertex');
+    // Mid-edge the rounded diamond is the rhombus.
+    near(connectorEndpoint(d, { x: 300, y: 300 }), { x: 150, y: 150 }, 'edge midpoint', 1e-9);
+    assert.equal(cornerRadius(100), 25);
+    assert.equal(cornerRadius(1000), 32, 'capped like the renderer');
+  });
+
+  test('still idempotent with round outlines and any stroke widths (randomised)', () => {
+    const rnd = prng(424242);
+    const types = ['rect', 'diamond', 'ellipse', 'text'];
+    for (let round = 0; round < 200; round++) {
+      const shapes = [0, 1].map((i) => ({
+        id: `s${i}`,
+        type: types[Math.floor(rnd() * types.length)],
+        roundness: rnd() < 0.6 ? 'round' : 'sharp',
+        strokeWidth: [1, 2, 4][Math.floor(rnd() * 3)],
+        x: rnd() * 600 - 300,
+        y: rnd() * 600 - 300,
+        w: 1 + rnd() * 300,
+        h: 1 + rnd() * 300,
+        rotation: rnd() < 0.5 ? 0 : rnd() * Math.PI * 2,
+      }));
+      const n = 2 + Math.floor(rnd() * 3);
+      const points = Array.from({ length: n }, () => ({ x: rnd() * 1000 - 500, y: rnd() * 1000 - 500 }));
+      const link = { id: 'l', type: 'arrow', strokeWidth: [1, 2, 4][Math.floor(rnd() * 3)], ...boundsOfPoints(points), points, startId: 's0', endId: 's1' };
+      const once = resolveConnectors([...shapes, link]);
+      const twice = resolveConnectors(once);
+      assert.equal(twice[2], once[2], `round ${round}: a second pass is a no-op`);
+      for (const p of once[2].points) assert.ok(Number.isFinite(p.x) && Number.isFinite(p.y), `round ${round}`);
+    }
+  });
+});
+
+describe('fixed points: a bound end stays where it was dropped', () => {
+  // The review repro: rect A (400,250)-(560,370), rect C (850,550)-(1010,670),
+  // an arrow bound to A whose end is dropped on the middle of C's top edge.
+  const A = { id: 'A', type: 'rect', x: 400, y: 250, w: 160, h: 120 };
+  const C = { id: 'C', type: 'rect', x: 850, y: 550, w: 160, h: 120 };
+  const link = (over = {}) => ({
+    id: 'l', type: 'arrow', x: 0, y: 0, w: 0, h: 0,
+    points: [{ x: 563.7, y: 344.1 }, { x: 930, y: 552 }], startId: 'A', endId: 'C', ...over,
+  });
+
+  test('bindingFixedPoint: the drop projected onto the outline, as fractions of the box', () => {
+    assert.deepEqual(bindingFixedPoint(C, { x: 930, y: 552 }), { x: 0.5, y: 0 }, 'middle of the top edge');
+    assert.deepEqual(bindingFixedPoint(C, { x: 930, y: 540 }), { x: 0.5, y: 0 }, 'a drop in the halo above it too');
+    assert.deepEqual(bindingFixedPoint(C, { x: 1012, y: 640 }), { x: 1, y: 0.75 }, 'right edge');
+    assert.deepEqual(bindingFixedPoint(C, { x: 850, y: 550 }), { x: 0, y: 0 }, 'a corner is a corner');
+    const e = { id: 'E', type: 'ellipse', x: 0, y: 0, w: 200, h: 100 };
+    const onEllipse = bindingFixedPoint(e, { x: 190, y: 90 });
+    assert.ok(Math.abs(((onEllipse.x - 0.5) * 2) ** 2 + ((onEllipse.y - 0.5) * 2) ** 2 - 1) < 1e-3, 'the pin is ON the ellipse');
+    // The NEAREST outline point, not the one on the ray from the centre: a
+    // drop just inside the top edge of a wide box, near its right end, stays
+    // on the top edge (the ray would have reached the right edge first).
+    const wide = { id: 'W', type: 'rect', x: 0, y: 0, w: 400, h: 60 };
+    assert.deepEqual(bindingFixedPoint(wide, { x: 350, y: 10 }), { x: 0.875, y: 0 });
+    // Rotated: the drop is taken in the element's own frame.
+    const turned = { ...C, rotation: Math.PI / 2 }; // its top edge now faces right
+    assert.deepEqual(bindingFixedPoint(turned, { x: 992, y: 610 }), { x: 0.5, y: 0 });
+  });
+
+  test('bindingFixedPoint: a drop near the centre (or on a shapeless element) pins nothing', () => {
+    assert.equal(bindingFixedPoint(C, { x: 930, y: 610 }), null, 'the centre');
+    assert.equal(bindingFixedPoint(C, { x: 960, y: 620 }), null, 'well inside');
+    // Exactly FIXED_POINT_MIN_RATIO of the way out still pins; the option moves the line.
+    assert.equal(FIXED_POINT_MIN_RATIO, 0.5);
+    assert.deepEqual(bindingFixedPoint(C, { x: 930, y: 580 }), { x: 0.5, y: 0 });
+    assert.equal(bindingFixedPoint(C, { x: 930, y: 580 }, { minRatio: 0.9 }), null);
+    assert.equal(bindingFixedPoint({ ...C, w: 0 }, { x: 850, y: 500 }), null, 'no area');
+    assert.equal(bindingFixedPoint(C, null), null);
+    assert.equal(bindingFixedPoint(C, { x: NaN, y: 1 }), null);
+  });
+
+  test('a pinned end lands on its spot, and the unpinned end aims at it (not at the centre)', () => {
+    const endFixedPoint = bindingFixedPoint(C, { x: 930, y: 552 });
+    const [, , out] = resolveConnectors([A, C, link({ endFixedPoint })]);
+    assert.deepEqual(out.points[1], { x: 930, y: 550 - BIND_GAP }, 'on the top edge where it was dropped');
+    // Without the pin the end jumped next to C's top-left corner (846.7, 554.4).
+    const [, , legacy] = resolveConnectors([A, C, link()]);
+    near(legacy.points[1], { x: 850 - (BIND_GAP * 450) / Math.hypot(450, 300), y: 556.6666666666666 - (BIND_GAP * 300) / Math.hypot(450, 300) }, 'legacy aim', 1e-6);
+    // The start (unpinned) aims at the pinned end: it leaves A's right edge.
+    assert.ok(Math.abs(out.points[0].x - (560 + BIND_GAP)) < 1, `start on A's right side, got ${JSON.stringify(out.points[0])}`);
+  });
+
+  test('both ends pinned: each keeps its own spot, whatever the other does', () => {
+    const startFixedPoint = bindingFixedPoint(A, { x: 561, y: 280 }); // right edge, upper quarter
+    const endFixedPoint = { x: 0.5, y: 0 };
+    const [, , out] = resolveConnectors([A, C, link({ startFixedPoint, endFixedPoint })]);
+    assert.deepEqual(startFixedPoint, { x: 1, y: 0.25 });
+    assert.deepEqual(out.points[0], { x: 560 + BIND_GAP, y: 280 }, 'start: the gap is along the edge normal');
+    assert.deepEqual(out.points[1], { x: 930, y: 546 });
+  });
+
+  test('the pin rides along when the anchor moves, resizes or rotates', () => {
+    const l = link({ endFixedPoint: { x: 0.5, y: 0 } });
+    let [, , out] = resolveConnectors([A, { ...C, x: 950, y: 600 }, l]);
+    assert.deepEqual(out.points[1], { x: 1030, y: 600 - BIND_GAP }, 'moved');
+    [, , out] = resolveConnectors([A, { ...C, w: 320, h: 60 }, l]);
+    assert.deepEqual(out.points[1], { x: 1010, y: 550 - BIND_GAP }, 'resized: still the middle of the top edge');
+    // Rotated a quarter turn clockwise, the box's top edge faces right.
+    [, , out] = resolveConnectors([A, { ...C, rotation: Math.PI / 2 }, l]);
+    near(out.points[1], { x: 930 + 60 + BIND_GAP, y: 610 }, 'rotated', 1e-9);
+  });
+
+  test('a pin beats the neighbouring point of a multi-point connector', () => {
+    const pts = [{ x: 480, y: 310 }, { x: 700, y: 900 }, { x: 930, y: 900 }, { x: 930, y: 552 }];
+    const [, , out] = resolveConnectors([A, C, link({ points: pts, endFixedPoint: { x: 0.5, y: 0 } })]);
+    assert.deepEqual(out.points[3], { x: 930, y: 546 }, 'end on the top edge, though it came from below');
+    assert.deepEqual(out.points.slice(1, 3), pts.slice(1, 3));
+    assert.deepEqual(out.points[0].y > 370, true, 'the unpinned start still aims at its neighbour (below A)');
+  });
+
+  test('a half-bound connector keeps its pinned end put as the free end moves', () => {
+    const l = { id: 'l', type: 'arrow', x: 0, y: 0, w: 0, h: 0, points: [{ x: 0, y: 0 }, { x: 930, y: 552 }], endId: 'C', endFixedPoint: { x: 0.5, y: 0 } };
+    for (const free of [{ x: 0, y: 0 }, { x: 2000, y: 2000 }, { x: 930, y: 1000 }]) {
+      const [, out] = resolveConnectors([C, { ...l, points: [free, l.points[1]] }]);
+      assert.deepEqual(out.points[1], { x: 930, y: 546 });
+      assert.deepEqual(out.points[0], free);
+    }
+  });
+
+  test('a pin without its id is inert; a pin on the centre falls back to aiming', () => {
+    const unbound = link({ endId: undefined, endFixedPoint: { x: 0.5, y: 0 } });
+    delete unbound.endId;
+    const [, , out] = resolveConnectors([A, C, unbound]);
+    assert.deepEqual(out.points[1], { x: 930, y: 552 }, 'the free end is not pulled onto C');
+    const [, , centred] = resolveConnectors([A, C, link({ endFixedPoint: { x: 0.5, y: 0.5 } })]);
+    const [, , legacy] = resolveConnectors([A, C, link()]);
+    assert.deepEqual(centred.points, legacy.points);
+  });
+
+  test('the gap is kept along the outline normal on every kind of outline', () => {
+    const wide = { id: 'W', type: 'rect', x: 0, y: 0, w: 400, h: 60 };
+    const l = (anchor, fp) => ({ id: 'l', type: 'arrow', x: 0, y: 0, w: 0, h: 0, points: [{ x: -900, y: -900 }, { x: 0, y: 0 }], endId: anchor.id, endFixedPoint: fp });
+    // Near the corner of a wide box the ray from the centre is almost along
+    // the edge; the end still stands BIND_GAP straight off it.
+    let [, out] = resolveConnectors([wide, l(wide, { x: 0.875, y: 0 })]);
+    assert.deepEqual(out.points[1], { x: 350, y: -BIND_GAP });
+    [, out] = resolveConnectors([wide, l(wide, { x: 0, y: 0 })]);
+    near(out.points[1], { x: -BIND_GAP / Math.SQRT2, y: -BIND_GAP / Math.SQRT2 }, 'a corner: the diagonal', 1e-12);
+    for (const type of ['ellipse', 'diamond']) {
+      for (const roundness of ['sharp', 'round']) {
+        const shape = { id: 'S', type, roundness, x: 0, y: 0, w: 300, h: 100 };
+        for (const drop of [{ x: 290, y: 30 }, { x: 150, y: -3 }, { x: 40, y: 80 }]) {
+          const fp = bindingFixedPoint(shape, drop);
+          const [, res] = resolveConnectors([shape, l(shape, fp)]);
+          const end = res.points[1];
+          // Distance from the end to the outline polygon is the gap.
+          const poly = [];
+          for (let i = 0; i < 2000; i++) {
+            const a = (i / 2000) * Math.PI * 2;
+            poly.push(connectorEndpoint(shape, { x: 150 + Math.cos(a), y: 50 + Math.sin(a) }));
+          }
+          const d = Math.min(...poly.map((q) => Math.hypot(q.x - end.x, q.y - end.y)));
+          assert.ok(Math.abs(d - BIND_GAP) < 0.05, `${roundness} ${type} at ${JSON.stringify(drop)}: ${d} off the outline`);
+        }
+      }
+    }
+  });
+
+  test('a 2-point self-loop resolves its pinned ends only', () => {
+    const loop = { id: 's', type: 'arrow', x: 0, y: 0, w: 0, h: 0, points: [{ x: 10, y: 10 }, { x: 20, y: 20 }], startId: 'C', endId: 'C' };
+    const [, same] = resolveConnectors([C, loop]);
+    assert.equal(same, loop, 'no pins: as stored');
+    const [, one] = resolveConnectors([C, { ...loop, startFixedPoint: { x: 0, y: 0.5 } }]);
+    assert.deepEqual(one.points, [{ x: 850 - BIND_GAP, y: 610 }, { x: 20, y: 20 }]);
+    const [, both] = resolveConnectors([C, { ...loop, startFixedPoint: { x: 0, y: 0.5 }, endFixedPoint: { x: 0.5, y: 1 } }]);
+    assert.deepEqual(both.points, [{ x: 850 - BIND_GAP, y: 610 }, { x: 930, y: 670 + BIND_GAP }]);
+  });
+
+  test('pins survive validation, and resolving stays idempotent with them (randomised)', () => {
+    const rnd = prng(98765);
+    const types = ['rect', 'ellipse', 'diamond', 'cylinder', 'sticky', 'text', 'image'];
+    for (let round = 0; round < 300; round++) {
+      const shapes = [0, 1].map((i) => ({
+        id: `s${i}`,
+        type: types[Math.floor(rnd() * types.length)],
+        roundness: rnd() < 0.5 ? 'round' : 'sharp',
+        x: rnd() * 800 - 400,
+        y: rnd() * 800 - 400,
+        w: 1 + rnd() * 300,
+        h: 1 + rnd() * 300,
+        rotation: rnd() < 0.5 ? 0 : rnd() * Math.PI * 4 - Math.PI * 2,
+      }));
+      const n = 2 + Math.floor(rnd() * 3);
+      const points = Array.from({ length: n }, () => ({ x: rnd() * 1000 - 500, y: rnd() * 1000 - 500 }));
+      const link = { id: 'l', type: 'arrow', ...boundsOfPoints(points), points };
+      const s = rnd() < 0.8 ? shapes[Math.floor(rnd() * 2)] : null;
+      const e = rnd() < 0.8 ? shapes[Math.floor(rnd() * 2)] : null;
+      if (s) link.startId = s.id;
+      if (e) link.endId = e.id;
+      const drop = (el) => ({ x: el.x + rnd() * el.w * 1.2 - el.w * 0.1, y: el.y + rnd() * el.h * 1.2 - el.h * 0.1 });
+      if (s && rnd() < 0.7) {
+        const fp = bindingFixedPoint(s, drop(s));
+        if (fp) link.startFixedPoint = fp;
+      }
+      if (e && rnd() < 0.7) {
+        const fp = bindingFixedPoint(e, drop(e));
+        if (fp) link.endFixedPoint = fp;
+      }
+      const stored = validateElement(link);
+      assert.deepEqual(stored.startFixedPoint, link.startFixedPoint, `round ${round}: start pin validates`);
+      assert.deepEqual(stored.endFixedPoint, link.endFixedPoint, `round ${round}: end pin validates`);
+      const once = resolveConnectors([...shapes, stored]);
+      const twice = resolveConnectors(once);
+      assert.equal(twice[2], once[2], `round ${round}: a second pass is a no-op`);
+      for (const p of once[2].points) assert.ok(Number.isFinite(p.x) && Number.isFinite(p.y), `round ${round}`);
+    }
+  });
+});
+
+describe('zoom range and steps (Excalidraw: 10%..3000%, +-10 points per press)', () => {
+  const view = { zoom: 1, panX: 0, panY: 0 };
+
+  test('the limits and the step', () => {
+    assert.deepEqual({ ...ZOOM_LIMITS }, { min: 0.1, max: 30 });
+    assert.ok(Object.isFrozen(ZOOM_LIMITS));
+    assert.equal(ZOOM_STEP, 0.1);
+  });
+
+  test('zoomAt, clampZoom and fitView default to ZOOM_LIMITS', () => {
+    let v = view;
+    for (let i = 0; i < 200; i++) v = zoomAt(v, { x: 300, y: 200 }, 1.25);
+    assert.equal(v.zoom, 30, 'zooms in past the old 800% cap, up to 3000%');
+    for (let i = 0; i < 400; i++) v = zoomAt(v, { x: 300, y: 200 }, 0.8);
+    assert.equal(v.zoom, 0.1, 'and out to 10%');
+    assert.equal(clampZoom(1000), 30);
+    assert.equal(clampZoom(0.001), 0.1);
+    assert.equal(clampZoom(2, 0.5, 1), 1, 'explicit limits still win');
+    assert.equal(fitView({ x: 0, y: 0, w: 1, h: 1 }, { width: 800, height: 600 }).zoom, 30);
+    assert.equal(fitView({ x: 0, y: 0, w: 1e6, h: 1e6 }, { width: 800, height: 600 }).zoom, 0.1);
+  });
+
+  test('stepZoom adds or removes 10 points, clamped, with no float noise', () => {
+    const ups = [];
+    let z = 1;
+    for (let i = 0; i < 5; i++) ups.push((z = stepZoom(z, +1)));
+    assert.deepEqual(ups, [1.1, 1.2, 1.3, 1.4, 1.5]);
+    let d = 1;
+    const downs = [];
+    for (let i = 0; i < 5; i++) downs.push((d = stepZoom(d, -1)));
+    assert.deepEqual(downs, [0.9, 0.8, 0.7, 0.6, 0.5]);
+    assert.equal(stepZoom(1.37, 1), 1.47, 'from a wheel-zoomed level');
+    assert.equal(stepZoom(0.15, -1), 0.1, 'clamped at the minimum');
+    assert.equal(stepZoom(0.1, -1), 0.1);
+    assert.equal(stepZoom(29.95, 1), 30, 'clamped at the maximum');
+    assert.equal(stepZoom(2, 0), 2, 'no direction, no change');
+    assert.equal(stepZoom(NaN, 1), 1.1, 'a bad level counts as 100%');
+    assert.equal(stepZoom(1, 1, { max: 1 }), 1, 'explicit limits');
   });
 });

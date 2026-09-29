@@ -27,6 +27,29 @@ const MAX_NAME = 40;
 /** The mode a peer is in until they pick a tool. */
 const DEFAULT_TOOL = TOOLS[0];
 
+/**
+ * Where a connection waits between opening and joining a board (plugin.js
+ * parks every new socket here), and where a peer lands when it names no room.
+ * These are bookkeeping, not rooms: they are NEVER broadcast to. Fanning a
+ * presence out to '_pending' handed every socket that had not joined yet the
+ * ids of every other socket connecting at the same moment, across all boards.
+ */
+export const PENDING_ROOM = '_pending';
+const UNASSIGNED_ROOM = '_unassigned';
+const PARKING_ROOMS = new Set([PENDING_ROOM, UNASSIGNED_ROOM]);
+
+/** @returns {boolean} whether `boardId` is a parking room (never broadcast to) */
+export function isParkingRoom(boardId) {
+  return PARKING_ROOMS.has(boardId);
+}
+
+/**
+ * Close code for a peer the sweeper dropped. 4000-4999 is the application
+ * range; the web client treats any close it did not ask for as retryable, so
+ * this one means "reconnect and resync", never "give up".
+ */
+export const CLOSE_IDLE = 4000;
+
 function defaultId() {
   return randomUUID();
 }
@@ -76,7 +99,7 @@ export class Hub {
    */
   add({ socket, boardId, name } = {}) {
     if (!socket) throw new TypeError('hub.add requires a socket');
-    const room = typeof boardId === 'string' && boardId ? boardId : '_unassigned';
+    const room = typeof boardId === 'string' && boardId ? boardId : UNASSIGNED_ROOM;
     const id = this.newId();
     const peer = {
       id,
@@ -117,7 +140,7 @@ export class Hub {
     if (!peer) return null;
     const current = this.peers.get(peer.id);
     if (!current) return null;
-    const room = typeof boardId === 'string' && boardId ? boardId : '_unassigned';
+    const room = typeof boardId === 'string' && boardId ? boardId : UNASSIGNED_ROOM;
     if (current.boardId !== room) {
       const from = this.rooms.get(current.boardId);
       if (from) {
@@ -214,6 +237,9 @@ export class Hub {
    * @returns {number} how many sockets actually took the message
    */
   broadcast(boardId, envelope, exceptPeerId = null) {
+    // A parking room is not a board: whoever sits there has not joined
+    // anything and must not hear about anyone else (see PARKING_ROOMS).
+    if (PARKING_ROOMS.has(boardId)) return 0;
     const ids = this.rooms.get(boardId);
     if (!ids || !envelope) return 0;
     let sent = 0;
@@ -245,11 +271,21 @@ export class Hub {
   }
 
   /**
-   * Drop every peer that has been silent past `peerTtlMs`.
+   * Drop every peer that has been silent past `peerTtlMs`, and CLOSE its
+   * socket.
    *
    * A real client ping keeps itself alive; a client that vanished without a
    * close frame (laptop lid, dead network) does not, and without this its
    * ghost cursor and its name would sit in the roster forever.
+   *
+   * Closing is not optional. A silent peer is often not dead at all: a
+   * sleeping laptop, a paused debugger, a background tab whose timers the
+   * browser throttles past the TTL. Taking it out of the room while leaving
+   * its socket open made a one-way zombie: its own ops were still acked (the
+   * ack goes straight to the socket), so it looked 'connected', but it was in
+   * no room any more and never received another op, cursor or presence. The
+   * close makes the client do what it does for any dropped connection:
+   * reconnect, re-join, and resync from the snapshot.
    *
    * @returns {boolean} true if at least one peer was dropped
    */
@@ -263,14 +299,57 @@ export class Hub {
     // One presence per affected room, sent after the bookkeeping, so the
     // roster on the wire is already the final one.
     const dirty = new Set();
+    const dropped = [];
     for (const peer of gone) {
       const detached = this._detach(peer);
-      if (detached) dirty.add(detached.boardId);
+      if (!detached) continue;
+      dropped.push(detached);
+      dirty.add(detached.boardId);
     }
     for (const boardId of dirty) {
       this.broadcast(boardId, this.presence(boardId));
     }
+    for (const peer of dropped) this._closeSocket(peer, CLOSE_IDLE, 'idle timeout');
     return true;
+  }
+
+  /**
+   * Empty a room for good: every peer in it is detached, sent `envelope`
+   * (when given) as its last message, and its socket closed with `code`.
+   * Used when the board itself is gone (DELETE /boards/:id): the peers must
+   * learn it now, not at their next edit, and must not be left 'connected'
+   * to a board that no longer exists. No presence is sent: nobody is left.
+   *
+   * @param {string} boardId
+   * @param {{envelope?: Object, code?: number, reason?: string}} [how]
+   * @returns {number} how many peers were evicted
+   */
+  closeRoom(boardId, { envelope = null, code = 1008, reason = '' } = {}) {
+    if (PARKING_ROOMS.has(boardId)) return 0;
+    const ids = this.rooms.get(boardId);
+    if (!ids) return 0;
+    const evicted = [];
+    for (const id of [...ids]) {
+      const detached = this._detach(id);
+      if (detached) evicted.push(detached);
+    }
+    for (const peer of evicted) {
+      if (envelope) this.send(peer, envelope);
+      this._closeSocket(peer, code, reason);
+    }
+    return evicted.length;
+  }
+
+  /** Close one peer's socket. Never throws: it may already be closing or gone. */
+  _closeSocket(peer, code, reason) {
+    const socket = peer && peer.socket;
+    if (!socket || typeof socket.close !== 'function') return false;
+    try {
+      socket.close(code, reason);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /**

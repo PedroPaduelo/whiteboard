@@ -14,6 +14,7 @@ import {
   hitLinearPoint,
   hitLinearSegment,
   pointInFrame,
+  pointInShape,
 } from '../src/editor/hitTest.js';
 import { selectionFrame } from '../src/editor/handles.js';
 
@@ -121,4 +122,57 @@ test('pointInFrame honours the rotation of a single-element selection frame', ()
   const f = selectionFrame([r], 1);
   assert.equal(pointInFrame(f, { x: 100, y: 80 }), true);
   assert.equal(pointInFrame(f, { x: 180, y: 10 }), false);
+});
+
+test('a round multi-point connector is hit along its drawn curve, not the straight chords', () => {
+  const pts = [{ x: 300, y: 300 }, { x: 600, y: 600 }, { x: 900, y: 300 }];
+  const ar = { id: 'a', type: 'arrow', x: 300, y: 300, w: 600, h: 300, points: pts, stroke: '#1e1e1e', strokeWidth: 2, roundness: 'round' };
+  // Segment 1 of the curve at t = 0.5 (controls (350,350) and (500,600)).
+  assert.equal(hitElement(ar, { x: 431.25, y: 468.75 }, 1), true, 'on the curve');
+  assert.equal(hitElement(ar, { x: 768.75, y: 468.75 }, 1), true, 'on the curve, second segment');
+  assert.equal(hitElement(ar, { x: 450, y: 450 }, 1), false, 'on the chord, off the curve');
+  assert.equal(hitElement(ar, { x: 600, y: 600 }, 1), true, 'a vertex');
+  assert.equal(hitTestAll([ar], { x: 431, y: 469 }, 1).length, 1, 'the eraser uses the same test');
+  assert.equal(hitLinearSegment(ar, { x: 431.25, y: 468.75 }, 1), 0);
+  assert.equal(hitLinearSegment(ar, { x: 450, y: 450 }, 1), -1);
+  // Sharp (or 2-point) connectors are still straight.
+  const sharp = { ...ar, roundness: 'sharp' };
+  assert.equal(hitElement(sharp, { x: 450, y: 450 }, 1), true);
+  assert.equal(hitElement(sharp, { x: 431.25, y: 468.75 }, 1), false);
+});
+
+test('pointInShape: inside a closed shape however it is filled, rotation-aware', () => {
+  const r = rect('r', 0, 0, 200, 100);
+  assert.equal(pointInShape(r, { x: 100, y: 50 }), true, 'empty middle of an unfilled rect');
+  assert.equal(pointInShape(r, { x: 250, y: 50 }), false);
+  const d = { ...rect('d', 0, 0, 200, 100), type: 'diamond' };
+  assert.equal(pointInShape(d, { x: 100, y: 50 }), true);
+  assert.equal(pointInShape(d, { x: 10, y: 10 }), false, 'a diamond corner of its box is outside');
+  const rot = rect('q', 0, 0, 200, 20, { rotation: Math.PI / 2 });
+  assert.equal(pointInShape(rot, { x: 100, y: 90 }), true);
+  assert.equal(pointInShape(rot, { x: 10, y: 10 }), false);
+});
+
+test('a cylinder is hit as painted: its top rim is ink, the box corners outside its caps are not', () => {
+  // 200×200 at (300,250): caps of half-height min(30, 50, 30) = 30 (render/shape.js cylinderCap).
+  const cyl = { ...rect('c', 300, 250, 200, 200), type: 'cylinder' };
+  assert.equal(hitElement(cyl, { x: 400, y: 310 }, 1), true, 'the front of the top rim (y + 2·ry)');
+  assert.equal(hitElement(cyl, { x: 400, y: 251 }, 1), true, 'the back of the top cap');
+  assert.equal(hitElement(cyl, { x: 301, y: 350 }, 1), true, 'the left side');
+  assert.equal(hitElement(cyl, { x: 400, y: 449 }, 1), true, 'the front of the bottom cap');
+  assert.equal(hitElement(cyl, { x: 302, y: 252 }, 1), false, 'the blank top-left corner of the box');
+  assert.equal(hitElement(cyl, { x: 498, y: 448 }, 1), false, 'the blank bottom-right corner of the box');
+  assert.equal(hitElement(cyl, { x: 400, y: 380 }, 1), false, 'the empty body of an unfilled cylinder');
+  // Filled: the whole drum, still not the box corners.
+  const full = { ...cyl, fill: '#a5d8ff' };
+  assert.equal(hitElement(full, { x: 400, y: 380 }, 1), true);
+  assert.equal(hitElement(full, { x: 302, y: 252 }, 1), false);
+  assert.equal(hitElement(full, { x: 498, y: 448 }, 1), false);
+  // A rotated drum turns its rim with it.
+  const rot = { ...cyl, rotation: Math.PI };
+  assert.equal(hitElement(rot, { x: 400, y: 390 }, 1), true, 'the rim, upside down');
+  assert.equal(hitElement(rot, { x: 400, y: 310 }, 1), false);
+  // pointInShape (labels, the text tool) follows the silhouette too.
+  assert.equal(pointInShape(cyl, { x: 400, y: 350 }), true);
+  assert.equal(pointInShape(cyl, { x: 302, y: 252 }), false);
 });

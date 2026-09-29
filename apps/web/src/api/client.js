@@ -238,14 +238,3 @@ export function getActorId(boardId) {
   }
   return id;
 }
-
-/** Drop a cached actor id (board switcher, tests). Never throws. */
-export function forgetActorId(boardId) {
-  const key = `whiteboard:peer:${boardId}`;
-  memoryIds.delete(key);
-  try {
-    window.localStorage.removeItem(key);
-  } catch {
-    /* nothing to do */
-  }
-}

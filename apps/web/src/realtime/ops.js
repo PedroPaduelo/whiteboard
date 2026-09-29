@@ -17,6 +17,11 @@
  * redo inside one window) would apply the newer patch to the older element.
  * Merged ops keep their FIRST opId.
  *
+ * Nothing merges across a `create` either (of any element): a later patch may
+ * bind a connector to the element just created, and folding it into an
+ * update queued BEFORE that create would move the binding ahead of its
+ * target — split into two batches there, the server drops it.
+ *
  * Everything before the last `clear` is dead (the clear wipes it) and is
  * dropped — except ops in `frozen`, which have already been SENT once: the
  * server may hold them, so they are never merged into or dropped.
@@ -50,7 +55,7 @@ export function collapseOps(ops, { frozen } = {}) {
       out.push(entry);
       continue;
     }
-    if (op.kind === 'create' && op.element?.id) open.delete(op.element.id);
+    if (op.kind === 'create') open.clear();
     else if (op.kind === 'delete' && op.elementId) open.delete(op.elementId);
     else if (op.kind === 'clear') open.clear();
     out.push(op);

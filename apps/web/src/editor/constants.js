@@ -7,8 +7,13 @@
  * export reading from here so a colour never exists in only one of them.
  *
  * Every value here must also pass `validateElement` in @whiteboard/shared —
- * a style the server strips is a style that vanishes on reload.
+ * a style the server strips is a style that vanishes on reload. That is why
+ * the enums below are re-exported from the shared model instead of being
+ * declared again: a second copy drifts (the web copy of FILL_STYLES once
+ * lacked 'zigzag', so a zigzag element showed no fill option selected).
  */
+
+export { FILL_STYLES, STROKE_STYLES, ROUNDNESS, ARROWHEADS, TEXT_ALIGNS } from '@whiteboard/shared';
 
 /** Stroke swatches shown first in the properties panel (Excalidraw's quick row). */
 export const STROKE_COLORS = Object.freeze(['#1e1e1e', '#e03131', '#2f9e44', '#1971c2', '#f08c00']);
@@ -33,15 +38,6 @@ export const STROKE_WIDTHS = Object.freeze({ thin: 1, bold: 2, extraBold: 4 });
 /** Sloppiness: 0 architect, 1 artist, 2 cartoonist — roughjs `roughness`. */
 export const ROUGHNESS = Object.freeze({ architect: 0, artist: 1, cartoonist: 2 });
 
-export const FILL_STYLES = Object.freeze(['hachure', 'cross-hatch', 'solid']);
-
-export const STROKE_STYLES = Object.freeze(['solid', 'dashed', 'dotted']);
-
-/** Edges. `sharp` is square corners, `round` is Excalidraw's rounded corners. */
-export const ROUNDNESS = Object.freeze(['sharp', 'round']);
-
-export const ARROWHEADS = Object.freeze(['none', 'arrow', 'triangle', 'bar', 'dot']);
-
 /** Font families, keyed by the value stored on the element. */
 export const FONT_FAMILIES = Object.freeze({
   hand: '"Virgil", "Segoe Print", "Comic Sans MS", cursive',
@@ -52,8 +48,6 @@ export const FONT_FAMILIES = Object.freeze({
 export const FONT_SIZES = Object.freeze({ S: 16, M: 20, L: 28, XL: 36 });
 
 export const LINE_HEIGHT = 1.25;
-
-export const TEXT_ALIGNS = Object.freeze(['left', 'center', 'right']);
 
 /**
  * The style every new element starts from. `store.style` is initialised from

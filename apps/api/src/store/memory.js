@@ -50,7 +50,13 @@ function toBoard(row) {
   };
 }
 
-/** Copy so callers can never reach into stored state through a return value. */
+/**
+ * Copy so callers can never reach into stored state through a return value.
+ * Used by the READ paths only. The write path (applyOps) does not deep-copy:
+ * stored elements are frozen by ops.js and never modified in place, so a
+ * batch works on a shallow copy of the list and costs O(elements it touches)
+ * rather than a structuredClone of every image on the board per drag frame.
+ */
 const clone = (v) => (v === undefined || v === null ? v : structuredClone(v));
 
 /**
@@ -210,8 +216,10 @@ export function createStore(options = {}) {
         actorId,
         currentRev: row ? row.rev : 0,
         boardMissing: row === null,
-        // A clone, so a throw mid-batch leaves the stored list untouched.
-        load: () => clone(elements.get(boardId) ?? []),
+        // A fresh array of the stored (frozen) element objects: ops.js never
+        // modifies an element in place, so a throw mid-batch leaves the stored
+        // list untouched without deep-copying the board.
+        load: () => (elements.get(boardId) ?? []).slice(),
         isSeen: (opId) => seenFor(boardId).has(opId),
         recordSeen: (opIds) => {
           const m = seenFor(boardId);
@@ -219,7 +227,9 @@ export function createStore(options = {}) {
           for (const opId of opIds) m.set(opId, ts);
         },
         prune: () => pruneSeen(boardId),
-        save: (next) => elements.set(boardId, next),
+        // A copy of the array, so a caller holding `result.elements` cannot
+        // push into the stored list.
+        save: (next) => elements.set(boardId, next.slice()),
         bumpRev: (rev) => {
           if (row) row.rev = rev;
         },

@@ -186,6 +186,110 @@ test('a selected transparent rect can be dragged by its empty middle', () => {
   assert.equal(d.commits().length, 1);
 });
 
+test('a click (no drag) in the empty middle of the selection frame clears the selection', () => {
+  // Just drawn, still selected: a click in its transparent middle deselects.
+  const d = new Driver({ elements: [R('a', 300, 250, 200, 150)], selection: ['a'] });
+  d.click(400, 325);
+  assert.deepEqual(d.selection, []);
+  assert.equal(d.el('a').x, 300, 'not moved');
+  assert.equal(d.commits().length, 0);
+  // A slow click is still a click.
+  const s = new Driver({ elements: [R('a', 300, 250, 200, 150)], selection: ['a'] });
+  s.down(400, 325);
+  s.move(401, 325);
+  s.up(401, 325);
+  assert.deepEqual(s.selection, []);
+  // The gap of a multi-selection too; a drag from there still moves it all.
+  const e = new Driver({ elements: [R('a', 0, 0, 100, 100, filled), R('c', 250, 0, 100, 100, filled)], selection: ['a', 'c'] });
+  e.drag(175, 50, 175, 80);
+  assert.deepEqual(e.selection, ['a', 'c']);
+  assert.equal(e.el('c').y, 30);
+  e.click(175, 50);
+  assert.deepEqual(e.selection, []);
+  // Inside an entered group: the click leaves the group as well.
+  const g = new Driver({ elements: [R('a', 0, 0, 100, 100, { groupId: 'G' }), R('b', 200, 0, 100, 100, { groupId: 'G' })] });
+  g.click(0, 50);
+  g.click(0, 50);
+  g.dblclick(0, 50);
+  assert.equal(g.state.editingGroupId, 'G');
+  g.click(50, 50); // A's empty middle
+  assert.deepEqual(g.selection, []);
+  assert.equal(g.state.editingGroupId, null);
+  // A double-click there is still about the container that was selected:
+  // it edits its label (the first click of the pair cleared the selection).
+  const h = new Driver({ elements: [R('a', 0, 0, 400, 300)], selection: ['a'] });
+  h.click(60, 60);
+  h.click(60, 60);
+  h.dblclick(60, 60);
+  assert.equal(h.textEdits.length, 1);
+  assert.equal(h.textEdits[0].id, 'a');
+  assert.deepEqual(h.selection, ['a']);
+  // …but not a double-click long after the clearing click (a new text).
+  const k = new Driver({ elements: [R('a', 0, 0, 400, 300)], selection: ['a'] });
+  k.click(60, 60);
+  k.now += 2000;
+  k.click(60, 60);
+  k.dblclick(60, 60);
+  assert.ok(k.textEdits[0].element, 'a free text');
+});
+
+test('a lone 2-point connector has no grabbable frame: pressing beside its line is empty canvas', () => {
+  const ar = { ...createElement('arrow', { points: [{ x: 0, y: 0 }, { x: 200, y: 100 }] }, DEFAULT_STYLE), id: 'ar' };
+  const d = new Driver({ elements: [ar], selection: ['ar'] });
+  d.hover(150, 20);
+  assert.equal(d.state.cursor, 'default');
+  d.drag(150, 20, 190, 40);
+  assert.deepEqual(d.selection, [], 'a marquee, not a move');
+  assert.deepEqual(d.el('ar').points, ar.points);
+  assert.equal(d.commits().length, 0);
+});
+
+test('a lone multi-point connector shows the transform box: resize and rotate it, not only its points', () => {
+  const pts = [{ x: 100, y: 100 }, { x: 300, y: 50 }, { x: 400, y: 250 }];
+  const mk = () => ({ ...createElement('arrow', { points: pts }, DEFAULT_STYLE), id: 'ar' });
+  const d = new Driver({ elements: [mk()], selection: ['ar'] });
+  const frame = selectionFrame([d.el('ar')], 1);
+  const hs = transformHandles(frame, 1, { rotatable: true });
+  // Resize from the e handle: every point scales away from the w edge.
+  d.hover(hs.e.x, hs.e.y);
+  assert.equal(d.state.cursor, 'ew-resize');
+  d.drag(hs.e.x, hs.e.y, hs.e.x + 300, hs.e.y);
+  assert.equal(d.commits().length, 1);
+  assert.match(d.commits()[0].label, /^resize:/);
+  assert.deepEqual(d.el('ar').points.map((q) => q.x), [100, 500, 700]);
+  assert.deepEqual(d.el('ar').points.map((q) => q.y), [100, 50, 250]);
+  // Rotate by the rotation handle: a half turn about the centre of its box.
+  const r = new Driver({ elements: [mk()], selection: ['ar'] });
+  const f2 = selectionFrame([r.el('ar')], 1);
+  const rot = transformHandles(f2, 1, { rotatable: true }).rotation;
+  const c = { x: 250, y: 150 };
+  r.drag(rot.x, rot.y, c.x, c.y + 200);
+  assert.match(r.commits()[0].label, /^rotate:/);
+  const got = r.el('ar').points;
+  pts.forEach((q, i) => {
+    assert.ok(Math.abs(got[i].x - (2 * c.x - q.x)) < 1e-6 && Math.abs(got[i].y - (2 * c.y - q.y)) < 1e-6, `point ${i}: ${JSON.stringify(got[i])}`);
+  });
+  assert.equal(r.el('ar').rotation, undefined);
+  // Its point handles still win over the box: dragging a point moves that point.
+  const p = new Driver({ elements: [mk()], selection: ['ar'] });
+  p.drag(300, 50, 300, 20);
+  assert.deepEqual(p.el('ar').points[1], { x: 300, y: 20 });
+  assert.match(p.commits()[0].label, /^point:/);
+  // A click in the empty middle of its box deselects, a drag from there moves it.
+  p.drag(200, 200, 220, 200);
+  assert.equal(p.el('ar').points[0].x, 120);
+  p.click(200, 200);
+  assert.deepEqual(p.selection, []);
+  // In point editing (double-click) the box goes away: only the points.
+  const q = new Driver({ elements: [mk()], selection: ['ar'] });
+  q.dblclick(300, 50);
+  assert.equal(q.state.linearEdit.editing, true);
+  q.hover(hs.e.x, hs.e.y);
+  assert.notEqual(q.state.cursor, 'ew-resize');
+  q.drag(hs.e.x, hs.e.y, hs.e.x + 300, hs.e.y);
+  assert.deepEqual(q.el('ar').points, pts, 'no resize while point editing');
+});
+
 test('marquee selects only fully contained elements (and whole groups)', () => {
   const d = new Driver({
     elements: [R('in', 10, 10, 30, 30), R('half', 90, 10, 30, 30), R('g1', 10, 60, 20, 20, { groupId: 'G' }), R('g2', 300, 300, 20, 20, { groupId: 'G' })],
@@ -331,6 +435,29 @@ test('box tool: the draft is local while dragging and added once on release; Shi
   assert.equal(el.id, d.effects.find((e) => e.type === 'addElements').elements[0].id);
   assert.equal(d.commits().length, 1);
   assert.equal(d.state.draft, null);
+});
+
+test('box tool: a thin drag keeps its thin box (what the draft showed); only a near-point drag gets the default size', () => {
+  const d = new Driver({ tool: 'rect', toolLocked: true });
+  d.drag(400, 500, 800, 503, { steps: 10 });
+  const thin = d.store.elements[0];
+  assert.deepEqual({ x: thin.x, y: thin.y, w: thin.w, h: thin.h }, { x: 400, y: 500, w: 400, h: 3 });
+  d.drag(300, 200, 302, 600);
+  const tall = d.store.elements[1];
+  assert.deepEqual({ x: tall.x, y: tall.y, w: tall.w, h: tall.h }, { x: 300, y: 200, w: 2, h: 400 });
+  // A perfectly flat drag is a flat shape too (only 0×0 would be nothing).
+  d.drag(100, 700, 300, 700);
+  assert.deepEqual({ w: d.store.elements[2].w, h: d.store.elements[2].h }, { w: 200, h: 0 });
+  // Past the drag threshold but tiny both ways: really a click.
+  d.drag(100, 100, 103, 102);
+  const dot = d.store.elements[3];
+  assert.deepEqual({ w: dot.w, h: dot.h }, { ...DEFAULT_SHAPE_SIZE });
+  assert.equal(d.commits().length, 4);
+  // The "tiny" limit is on screen: zoomed in 8×, a 20 px drag is a real shape.
+  const z = new Driver({ tool: 'ellipse', view: { zoom: 8, panX: 0, panY: 0 } });
+  z.drag(80, 80, 100, 96);
+  const el = z.store.elements[0];
+  assert.deepEqual({ x: el.x, y: el.y, w: el.w, h: el.h }, { x: 10, y: 10, w: 2.5, h: 2 });
 });
 
 test('box tool with the tool lock stays on the tool and leaves the selection alone', () => {
@@ -733,4 +860,354 @@ test('multi-selection resize through the reducer scales every member and follows
   assert.deepEqual({ x: d.el('B').x, w: d.el('B').w, h: d.el('B').h }, { x: 400, w: 200, h: 200 });
   assert.deepEqual(resolveConnectors(d.store.elements)[3].points, d.el('ar').points, 'the arrow was re-resolved in the same batches');
   assert.ok(d.of('updateElements').at(-1).patches.some((p) => p.id === 'ar'));
+});
+
+/* ------------------------------------------------------------------ *
+ * Review fixes
+ * ------------------------------------------------------------------ */
+
+test('double-click in the empty middle of a transparent shape edits its label (selected, or near its centre)', () => {
+  for (const type of ['rect', 'ellipse', 'diamond']) {
+    const shape = { ...createElement(type, { x: 400, y: 200, w: 200, h: 120 }, DEFAULT_STYLE), id: 's' };
+    assert.equal(shape.fill, 'none', 'the default fill is transparent');
+    // Just drawn, still selected: a double-click anywhere inside it.
+    const d = new Driver({ elements: [shape], selection: ['s'] });
+    d.click(460, 240);
+    d.click(460, 240);
+    d.dblclick(460, 240);
+    assert.equal(d.textEdits.length, 1, type);
+    assert.equal(d.textEdits[0].id, 's', `${type}: the label, not a loose text`);
+    assert.equal(d.textEdits[0].element, undefined);
+    // Not selected: the centre of it still writes the label.
+    const e = new Driver({ elements: [shape] });
+    e.dblclick(500, 262);
+    assert.equal(e.textEdits[0].id, 's', type);
+  }
+});
+
+test('text tool: a click in the middle of a transparent shape edits its label; far from the centre of a big one, a free text', () => {
+  const big = R('big', 0, 0, 1000, 800);
+  const small = R('small', 400, 200, 200, 120);
+  const d = new Driver({ elements: [big, small], tool: 'text' });
+  d.click(500, 260);
+  assert.equal(d.textEdits[0].id, 'small');
+  d.click(100, 700); // inside the big frame, nowhere near its centre
+  assert.ok(d.textEdits[1].element, 'a new free text');
+  // Alt+click writes a free text even over a container (Excalidraw).
+  d.click(500, 260, { altKey: true });
+  assert.ok(d.textEdits[2].element);
+  // Locked shapes are never written into.
+  const e = new Driver({ elements: [R('l', 400, 200, 200, 120, { locked: true })], tool: 'text' });
+  e.click(500, 260);
+  assert.ok(e.textEdits[0].element);
+});
+
+test('Alt+double-click over a container writes a free text there', () => {
+  const d = new Driver({ elements: [R('a', 0, 0, 200, 200, filled)] });
+  d.send({ type: 'dblclick', x: 100, y: 100, button: 0, altKey: true });
+  assert.ok(d.textEdits[0].element);
+});
+
+test('a second pointer (palm, finger) never hijacks a pen stroke', () => {
+  const d = new Driver({ tool: 'pen' });
+  const pen = { pointerType: 'pen', pointerId: 11 };
+  const touch = { pointerType: 'touch', pointerId: 22 };
+  d.down(200, 200, pen);
+  d.move(250, 200, pen);
+  d.move(300, 200, pen);
+  d.down(700, 550, touch);
+  d.move(720, 570, touch);
+  d.move(350, 200, pen);
+  d.up(720, 570, touch);
+  d.send({ type: 'pointercancel', x: 720, y: 570, ...touch });
+  assert.equal(d.store.elements.length, 0, 'the touch neither finished nor cancelled the stroke');
+  assert.equal(d.state.mode, 'freedraw');
+  d.move(400, 200, pen);
+  d.up(400, 200, pen);
+  const [stroke] = d.store.elements;
+  assert.ok(stroke, 'the stroke is added when the PEN lifts');
+  assert.ok(stroke.points.every((q) => q.y === 200), `no palm points: ${JSON.stringify(stroke.points)}`);
+  assert.deepEqual(stroke.points.at(-1), { x: 400, y: 200 });
+  assert.equal(d.commits().length, 1);
+});
+
+test('a second pointer never steers a move; its cancel does not abort the drag', () => {
+  const d = new Driver({ elements: [R('a', 500, 300, 100, 100, filled)] });
+  const touch = { pointerType: 'touch', pointerId: 5 };
+  d.down(550, 350);
+  d.move(600, 350);
+  d.down(1000, 700, touch);
+  d.move(1010, 700, touch);
+  d.up(1010, 700, touch);
+  d.send({ type: 'pointercancel', x: 1010, y: 700, ...touch });
+  d.move(700, 350);
+  d.up(700, 350);
+  assert.deepEqual({ x: d.el('a').x, y: d.el('a').y }, { x: 650, y: 300 });
+  assert.equal(d.commits().length, 1);
+});
+
+test('pressing an unselected element inside the selection frame grabs the selection; a click narrows to it', () => {
+  const els = () => [R('big', 300, 200, 400, 300), R('small', 450, 300, 100, 80)];
+  // Drag on SMALL's top edge while BIG is selected: BIG (with SMALL, it is
+  // not selected) moves, the selection stays.
+  const d = new Driver({ elements: els(), selection: ['big'] });
+  d.drag(500, 300, 500, 340);
+  assert.deepEqual(d.selection, ['big']);
+  assert.equal(d.el('big').y, 240);
+  assert.equal(d.el('small').y, 300, 'small is not part of the selection');
+  // A click without a drag selects SMALL, on release.
+  const e = new Driver({ elements: els(), selection: ['big'] });
+  e.down(500, 300);
+  assert.deepEqual(e.selection, ['big']);
+  e.up(500, 300);
+  assert.deepEqual(e.selection, ['small']);
+  assert.equal(e.commits().length, 0);
+  // An element in the gap of a multi-selection.
+  const f = new Driver({ elements: [R('a', 0, 0, 100, 100, filled), R('mid', 150, 0, 50, 100, filled), R('c', 250, 0, 100, 100, filled)], selection: ['a', 'c'] });
+  f.drag(175, 50, 175, 150);
+  assert.deepEqual(f.selection, ['a', 'c']);
+  assert.equal(f.el('a').y, 100);
+  assert.equal(f.el('c').y, 100);
+  assert.equal(f.el('mid').y, 0);
+  // Outside the frame an unselected element is still selected on press.
+  const g = new Driver({ elements: [R('a', 0, 0, 100, 100, filled), R('b', 300, 0, 100, 100, filled)], selection: ['a'] });
+  g.drag(350, 50, 350, 80);
+  assert.deepEqual(g.selection, ['b']);
+  assert.equal(g.el('b').y, 30);
+});
+
+test('right click inside the selection frame keeps the selection and opens the element menu', () => {
+  const d = new Driver({ elements: [R('a', 400, 300, 200, 150)], selection: ['a'] });
+  d.send({ type: 'contextmenu', x: 500, y: 375, button: 2 });
+  assert.deepEqual(d.selection, ['a']);
+  assert.equal(d.menus[0].targetId, 'a');
+  // The gap of a Ctrl+A selection, and the middle of one of its members.
+  const e = new Driver({ elements: [R('a', 400, 300, 200, 150), R('b', 700, 300, 200, 150)], selection: ['a', 'b'] });
+  e.send({ type: 'contextmenu', x: 650, y: 375, button: 2 });
+  assert.deepEqual(e.selection, ['a', 'b']);
+  assert.ok(e.menus[0].targetId);
+  e.send({ type: 'contextmenu', x: 800, y: 375, button: 2 });
+  assert.deepEqual(e.selection, ['a', 'b']);
+  // Outside the frame: the canvas menu, selection cleared.
+  e.send({ type: 'contextmenu', x: 1200, y: 800, button: 2 });
+  assert.deepEqual(e.selection, []);
+  assert.equal(e.menus[2].targetId, null);
+});
+
+test('a click on a member of a locked group selects the whole group (Shift toggles the whole group)', () => {
+  const lockedGroup = () => [
+    R('a', 300, 250, 100, 100, { ...filled, groupId: 'G', locked: true }),
+    R('b', 600, 250, 100, 100, { ...filled, groupId: 'G', locked: true }),
+    R('c', 0, 0, 50, 50, filled),
+  ];
+  const d = new Driver({ elements: lockedGroup() });
+  d.click(350, 300);
+  assert.deepEqual(d.selection, ['a', 'b']);
+  d.click(25, 25);
+  d.click(350, 300, { shiftKey: true });
+  assert.deepEqual(d.selection, ['a', 'b', 'c']);
+  d.click(650, 300, { shiftKey: true });
+  assert.deepEqual(d.selection, ['c']);
+  assert.equal(d.commits().length, 0);
+});
+
+test('double-clicking a member of a selected group enters the group; the next double-click edits it', () => {
+  const d = new Driver({ elements: [R('a', 0, 0, 100, 100, { groupId: 'G' }), R('b', 200, 0, 100, 100, { groupId: 'G' })] });
+  d.click(0, 50); // on A's outline: the whole group
+  assert.deepEqual(d.selection, ['a', 'b']);
+  d.click(0, 50);
+  d.dblclick(0, 50);
+  assert.equal(d.textEdits.length, 0, 'no text editor yet');
+  assert.equal(d.state.editingGroupId, 'G');
+  assert.deepEqual(d.selection, ['a']);
+  // Inside the group, a click selects one member and a double-click edits it.
+  d.click(0, 50);
+  assert.deepEqual(d.selection, ['a']);
+  d.click(0, 50);
+  d.dblclick(0, 50);
+  assert.equal(d.textEdits.length, 1);
+  assert.equal(d.textEdits[0].id, 'a');
+  // Clicking outside the group leaves it.
+  d.click(900, 900);
+  d.click(200, 50);
+  assert.deepEqual(d.selection, ['a', 'b']);
+  assert.equal(d.state.editingGroupId, null);
+});
+
+test('dragging a bound arrow by its shaft a little keeps both bindings; far away unbinds', () => {
+  const A = R('A', 400, 250, 160, 120, filled);
+  const B = R('B', 850, 250, 160, 120, filled);
+  const ar = resolveConnectors([A, B, { ...createElement('arrow', { points: [{ x: 0, y: 0 }, { x: 1, y: 1 }] }), id: 'ar', startId: 'A', endId: 'B' }])[2];
+  const d = new Driver({ elements: [A, B, ar] });
+  d.drag(700, 310, 700, 316);
+  assert.equal(d.commits().length, 1);
+  assert.equal(d.el('ar').startId, 'A');
+  assert.equal(d.el('ar').endId, 'B');
+  assert.deepEqual(resolveConnectors(d.store.elements)[2].points, d.el('ar').points, 'ends back on the outlines');
+  // The bindings still work: moving B drags the arrow's end along.
+  d.click(1200, 900);
+  d.drag(930, 310, 930, 500);
+  const end = d.el('ar').points.at(-1);
+  assert.ok(end.y > 400, `end follows B: ${JSON.stringify(end)}`);
+  // Dragged far from both shapes: unbound for good.
+  const e = new Driver({ elements: [A, B, ar] });
+  e.drag(700, 310, 700, 600);
+  assert.equal(e.el('ar').startId, undefined);
+  assert.equal(e.el('ar').endId, undefined);
+  assert.equal(e.commits().length, 1);
+});
+
+/* ------------------------------------------------------------------ *
+ * Point editing keys, pans inside a connector, deferred tool changes,
+ * undo mid-drag, double-click with a shape tool
+ * ------------------------------------------------------------------ */
+
+test('Delete in point editing removes the active point, never the connector', () => {
+  const ln = { ...createElement('arrow', { points: [{ x: 0, y: 0 }, { x: 200, y: 0 }] }), id: 'ln' };
+  const d = new Driver({ elements: [ln], selection: ['ln'] });
+  d.dblclick(100, 0); // enter point editing
+  d.click(60, 1, { mod: true }); // insert a point: it becomes the active one
+  assert.equal(d.el('ln').points.length, 3);
+  assert.equal(d.state.linearEdit.activeIndex, 1);
+  d.reset();
+  const r = d.key('Delete');
+  assert.equal(r.handled, true, 'consumed: the global Delete must not run');
+  assert.equal(d.store.elements.length, 1);
+  assert.deepEqual(d.el('ln').points, [{ x: 0, y: 0 }, { x: 200, y: 0 }]);
+  assert.equal(d.commits().length, 1, 'one undo step');
+  assert.equal(d.state.linearEdit.activeIndex, -1);
+  // No active point: consumed, nothing happens.
+  d.reset();
+  assert.equal(d.key('Backspace').handled, true);
+  assert.equal(d.store.elements.length, 1);
+  assert.equal(d.commits().length, 0);
+  // A connector keeps at least 2 points.
+  d.click(200, 0); // activate the end point
+  assert.equal(d.state.linearEdit.activeIndex, 1);
+  assert.equal(d.key('Delete').handled, true);
+  assert.equal(d.el('ln').points.length, 2);
+  assert.equal(d.commits().length, 0);
+  // Outside point editing Delete is the global shortcut's.
+  d.key('Escape');
+  assert.equal(d.key('Delete').handled, false);
+});
+
+test('Delete of a bound end point in point editing drops that binding', () => {
+  const A = R('A', 300, -50, 100, 100, filled);
+  const raw = { ...createElement('arrow', { points: [{ x: 0, y: 0 }, { x: 150, y: 0 }, { x: 295, y: 0 }] }), id: 'ar', endId: 'A' };
+  const ar = resolveConnectors([A, raw])[1];
+  const d = new Driver({ elements: [A, ar], selection: ['ar'] });
+  d.dblclick(75, 0);
+  assert.equal(d.state.linearEdit.editing, true);
+  const end = d.el('ar').points[2];
+  d.click(end.x, end.y); // activate the bound end
+  assert.equal(d.state.linearEdit.activeIndex, 2);
+  d.reset();
+  d.key('Delete');
+  assert.equal(d.el('ar').points.length, 2);
+  assert.equal(d.el('ar').endId, undefined, 'the removed end took its binding with it');
+  assert.deepEqual(d.el('ar').points.at(-1), { x: 150, y: 0 }, 'the new end stays where it was');
+});
+
+test('Space-drag and middle-drag during a multi-point connector pan without finishing it', () => {
+  for (const how of ['space', 'middle']) {
+    const d = new Driver({ tool: 'arrow' });
+    d.click(400, 300);
+    d.click(500, 400);
+    d.hover(600, 300);
+    if (how === 'space') d.spaceDown = true;
+    d.drag(600, 300, 650, 300, how === 'middle' ? { button: 1 } : {});
+    d.spaceDown = false;
+    assert.equal(d.store.elements.length, 0, `${how}: the connector is still in progress`);
+    assert.deepEqual(d.store.view, { zoom: 1, panX: 50, panY: 0 }, `${how}: the view panned`);
+    assert.equal(d.state.mode, 'linear');
+    // The pointer is at screen 650 = board 600 now; the connector goes on.
+    d.hover(750, 300);
+    d.click(750, 300);
+    d.key('Enter');
+    assert.equal(d.store.elements.length, 1);
+    assert.deepEqual(d.store.elements[0].points, [{ x: 400, y: 300 }, { x: 500, y: 400 }, { x: 700, y: 300 }], how);
+    assert.equal(d.store.tool, 'select');
+    assert.equal(d.commits().length, 1);
+  }
+});
+
+test('a tool change during a pan inside a multi-point connector finishes the connector', () => {
+  const d = new Driver({ tool: 'line' });
+  d.click(0, 0);
+  d.click(100, 0);
+  d.hover(150, 50);
+  d.down(150, 50, { button: 1 });
+  useBoardStore.getState().setTool('rect');
+  d.send({ type: 'toolchange' });
+  assert.equal(d.store.elements.length, 1);
+  assert.equal(d.store.elements[0].points.length, 2);
+  assert.equal(d.state.g, null);
+});
+
+test('a deferred toolchange notification never cancels a gesture started under the new tool', () => {
+  // The text tool's edit commits on the next board press and returns to
+  // select; the Canvas' 'toolchange' arrives (microtask) after that press
+  // already started a move — the move must go on.
+  const d = new Driver({ tool: 'text', elements: [R('a', 700, 350, 100, 100, filled)] });
+  d.click(300, 300);
+  assert.equal(d.textEdits.length, 1);
+  useBoardStore.getState().setTool('select'); // what finishNewText does on commit
+  d.down(750, 400);
+  d.send({ type: 'toolchange' });
+  d.move(800, 420);
+  d.move(850, 450);
+  d.up(850, 450);
+  assert.equal(d.el('a').x, 800);
+  assert.equal(d.el('a').y, 400);
+  assert.equal(d.commits().length, 1);
+  // A real change mid-gesture still ends it.
+  const e = new Driver({ elements: [R('a', 0, 0, 100, 100, filled)] });
+  e.down(50, 50);
+  e.move(80, 50);
+  useBoardStore.getState().setTool('rect');
+  e.send({ type: 'toolchange' });
+  assert.equal(e.state.g, null);
+  e.move(120, 50);
+  assert.equal(e.el('a').x, 30);
+});
+
+test('undo/redo while a button holds a drag is swallowed; otherwise it is the global shortcut', () => {
+  const d = new Driver({ elements: [R('a', 0, 0, 100, 100, filled)] });
+  d.down(50, 50);
+  d.move(100, 50);
+  assert.equal(d.key('z', { mod: true }).handled, true);
+  assert.equal(d.key('Z', { mod: true, shiftKey: true }).handled, true);
+  assert.equal(d.key('y', { mod: true }).handled, true);
+  assert.equal(d.key('Delete').handled, true, 'no deleting what is being dragged');
+  d.up(100, 50);
+  assert.equal(d.el('a').x, 50);
+  assert.equal(d.key('z', { mod: true }).handled, false);
+  assert.equal(d.key('Delete').handled, false);
+});
+
+test('double-click with a shape tool makes one shape and no text editor', () => {
+  for (const tool of ['rect', 'ellipse']) {
+    for (const style of [{}, filled]) {
+      const d = new Driver({ tool });
+      useBoardStore.setState({ style: { ...DEFAULT_STYLE, ...style } });
+      // What a browser sends for a double-click: down, up, down, up, dblclick.
+      d.click(700, 450);
+      d.click(700, 450);
+      d.dblclick(700, 450);
+      assert.equal(d.store.elements.length, 1, `${tool}: one shape`);
+      assert.equal(d.textEdits.length, 0, `${tool}: no text editor`);
+      assert.equal(d.store.tool, 'select');
+    }
+  }
+  // Later, a real double-click on the shape does edit its label.
+  const d = new Driver({ tool: 'rect' });
+  useBoardStore.setState({ style: { ...DEFAULT_STYLE, ...filled } });
+  d.click(700, 450);
+  d.now += 1000;
+  d.click(700, 450);
+  d.click(700, 450);
+  d.dblclick(700, 450);
+  assert.equal(d.textEdits.length, 1);
+  assert.equal(d.textEdits[0].id, d.store.elements[0].id);
 });

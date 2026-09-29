@@ -20,6 +20,13 @@ COPY package.json ./
 COPY packages/shared/package.json packages/shared/
 COPY apps/api/package.json apps/api/
 
+# The root manifest is kept for its `workspaces` (and `type`), NOT for its
+# dependencies: those are repo tooling (dev scripts, the Playwright driver
+# used by browser checks), and `--include-workspace-root` below would
+# otherwise install them into the production image. Everything the API needs
+# at runtime is declared in apps/api/package.json and packages/shared.
+RUN node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json','utf8'));delete p.dependencies;delete p.devDependencies;delete p.optionalDependencies;fs.writeFileSync('package.json',JSON.stringify(p,null,2)+'\\n')"
+
 # No lockfile is copied: the host lockfile spans every workspace (including
 # the web app, which this image does not need) and would drag its dev
 # dependencies in. This layer is a cache hit unless a manifest changes.
@@ -44,9 +51,17 @@ WORKDIR /app
 # there is nothing native to compile and the image needs no build toolchain.
 # The tree mirrors the repo so `node_modules/@whiteboard/shared` (a workspace
 # symlink to ../../packages/shared) resolves inside the image.
+#
+# packages/shared comes from the BUILD CONTEXT, not from the deps stage: deps
+# only ever saw its package.json (so a source change keeps the npm layer
+# cached), and the symlink above points at `packages/shared/src/index.js`.
+# Copying `/build/packages` instead ships a manifest with no source, and the
+# API dies on boot with ERR_MODULE_NOT_FOUND for @whiteboard/shared.
+# What the context may contain (no host node_modules, no local .env or sqlite
+# file) is narrowed by Dockerfile.dockerignore next to this file.
 COPY --from=deps --chown=node:node /build/node_modules ./node_modules
 COPY --from=deps --chown=node:node /build/package.json ./package.json
-COPY --from=deps --chown=node:node /build/packages ./packages
+COPY --chown=node:node packages/shared ./packages/shared
 COPY --chown=node:node apps/api ./apps/api
 
 # Run from the app's own directory so the relative CMD path is correct.
@@ -56,6 +71,11 @@ WORKDIR /app/apps/api
 
 # The `node` user ships with the base image but cannot write to /app, and the
 # sqlite file lives under /app/data. Create the dir as root, then hand it over.
+# Mount a volume HERE (`-v whiteboard-data:/app/data`, as docker-compose.yml
+# does): a new named volume copies this directory's node ownership only
+# because the path already exists in the image. A mount at a path the image
+# lacks (e.g. /data) starts out root:root 0755, and the non-root API then
+# cannot create its database and exits on boot.
 RUN mkdir -p /app/data && chown -R node:node /app/data
 
 USER node

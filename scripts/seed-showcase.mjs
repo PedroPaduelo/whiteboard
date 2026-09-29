@@ -7,8 +7,13 @@
  * I handed over earlier 404'd. The script prints the id it just made, and
  * callers must use THAT.
  */
-// Override with API_URL=http://host:port/api to seed another instance.
+// Override with API_URL=http://host:port/api to seed another instance, and
+// WEB_URL=https://your.host to print a link to the web app that serves it.
+// OWNER_ID=<id> makes the board that person's (default: unowned, listed for
+// everyone).
 const BASE = (process.env.API_URL || 'http://localhost:3001/api').replace(/\/+$/, '');
+const WEB = (process.env.WEB_URL || 'http://localhost:5173').replace(/\/+$/, '');
+const OWNER_ID = process.env.OWNER_ID || null;
 const TITLE = 'Whiteboard — demonstração';
 
 /* Excalidraw palette (apps/web/src/editor/constants.js). */
@@ -52,24 +57,44 @@ const req = async (path, init) => {
   return r.json();
 };
 
+/**
+ * The board titled TITLE, if there is one. Searched by title and paged, so
+ * it is found however many boards the instance holds (one GET lists at most
+ * 200).
+ */
+async function findExisting() {
+  const PAGE = 200;
+  const q = encodeURIComponent(TITLE);
+  for (let offset = 0; ; offset += PAGE) {
+    const { boards, total } = await req(`/boards?search=${q}&limit=${PAGE}&offset=${offset}`, {});
+    const hit = boards.find((b) => b.title === TITLE);
+    if (hit) return hit;
+    if (boards.length < PAGE || offset + PAGE >= total) return null;
+  }
+}
+
 // Reuse a board with this title if it already exists, so re-running is safe.
-const { boards } = await req('/boards', {});
-const existing = boards.find((b) => b.title === TITLE);
+const existing = await findExisting();
 let id;
 if (existing && existing.elementCount > 0) {
   id = existing.id;
   console.log('reaproveitando board existente:', id);
 } else {
-  id = (existing?.id) || (await req('/boards', { method: 'POST', body: JSON.stringify({ title: TITLE, ownerId: 'ana' }) })).board.id;
+  const body = { title: TITLE, ...(OWNER_ID ? { ownerId: OWNER_ID } : {}) };
+  id = existing?.id || (await req('/boards', { method: 'POST', body: JSON.stringify(body) })).board.id;
   if (!existing) console.log('board criado:', id);
-  const res = await req(`/boards/${id}/ops`, {
+  // Fresh opIds per run: the server dedupes on them, so fixed ids would make
+  // a re-seed of a board that was emptied a silent no-op.
+  const run = Date.now().toString(36);
+  const res = await req(`/boards/${encodeURIComponent(id)}/ops`, {
     method: 'POST',
-    body: JSON.stringify({ ops: ELEMENTS.map((element, i) => ({ opId: `seed-${i + 1}`, kind: 'create', element })) }),
+    body: JSON.stringify({ ops: ELEMENTS.map((element, i) => ({ opId: `seed-${run}-${i + 1}`, kind: 'create', element })) }),
   });
   console.log('ops:', res.status, '| rev', res.rev, '| elementos', res.elements?.length);
 }
 
 // Always re-verify: an id we hand to a human must be proven to work right now.
-const snap = await req(`/boards/${id}/snapshot`);
+const snap = await req(`/boards/${encodeURIComponent(id)}/snapshot`);
 console.log('VERIFICADO: id', id, '->', snap.elements.length, 'elementos, rev', snap.rev);
-console.log('LINK: https://sb-whiteboard-app.mp.serendiped.com/?board=' + id);
+// The share-link form the app's Share button copies (ui/share.js).
+console.log(`LINK: ${WEB}/b/${encodeURIComponent(id)}`);

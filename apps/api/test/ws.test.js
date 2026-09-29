@@ -16,7 +16,7 @@ import Fastify from 'fastify';
 import WebSocket from 'ws';
 
 import { WS_MSG, OP_RESULT, colorForPeer } from '@whiteboard/shared';
-import { Hub } from '../src/ws/hub.js';
+import { Hub, PENDING_ROOM, CLOSE_IDLE } from '../src/ws/hub.js';
 import wsPlugin, { wsPath } from '../src/ws/plugin.js';
 import { createMemoryStore } from '../src/store/index.js';
 import { buildApp } from '../src/app.js';
@@ -809,4 +809,177 @@ test('protocol: the sweeper reaps a peer that stops pinging', async (t) => {
   t0 += 40_000;
   assert.equal(hub.prune(), true);
   assert.deepEqual(hub.peersOf(board.id), []);
+});
+
+/* ------------------------------------------------ review fixes (model area) */
+
+test('hub: prune CLOSES the socket of the peer it drops (no one-way zombie)', () => {
+  const { hub, advance } = testHub({ peerTtlMs: 1000 });
+  const live = hub.add({ socket: fakeSocket(), boardId: 'b1', name: 'live' });
+  const silent = hub.add({ socket: fakeSocket(), boardId: 'b1', name: 'silent' });
+  advance(1001);
+  hub.touch(live.id);
+  assert.equal(hub.prune(), true);
+  assert.deepEqual(silent.socket.closed, [{ code: CLOSE_IDLE, reason: 'idle timeout' }]);
+  assert.equal(CLOSE_IDLE, 4000, 'an application close code: the client reconnects');
+  assert.deepEqual(live.socket.closed, [], 'the live peer keeps its socket');
+});
+
+test('hub: the parking room is never broadcast to', () => {
+  const { hub, advance } = testHub({ peerTtlMs: 1000 });
+  const p1 = hub.add({ socket: fakeSocket(), boardId: PENDING_ROOM, name: null });
+  const p2 = hub.add({ socket: fakeSocket(), boardId: PENDING_ROOM, name: null });
+  const p3 = hub.add({ socket: fakeSocket(), boardId: PENDING_ROOM, name: null });
+  assert.equal(hub.broadcast(PENDING_ROOM, { type: WS_MSG.PING }), 0);
+  hub.remove(p2); // a join to an unknown board, a join timeout, a close
+  hub.touch(p1.id);
+  advance(1001);
+  hub.touch(p1.id);
+  hub.prune(); // p3 is reaped from the parking room
+  assert.deepEqual(p1.socket.sent, [], 'an unjoined socket hears about nobody');
+  assert.equal(hub.get(p3.id), undefined);
+});
+
+test('hub: closeRoom tells every peer, hangs up, and leaves other rooms alone', () => {
+  const { hub } = testHub();
+  const a = hub.add({ socket: fakeSocket(), boardId: 'gone', name: 'A' });
+  const b = hub.add({ socket: fakeSocket(), boardId: 'gone', name: 'B' });
+  const c = hub.add({ socket: fakeSocket(), boardId: 'other', name: 'C' });
+  const envelope = { type: WS_MSG.ERROR, code: 'BOARD_NOT_FOUND', boardId: 'gone', text: 'board deleted' };
+  assert.equal(hub.closeRoom('gone', { envelope, code: 1008, reason: 'board deleted' }), 2);
+  for (const peer of [a, b]) {
+    assert.deepEqual(peer.socket.json(), [envelope], 'the error is the last message, and no presence');
+    assert.deepEqual(peer.socket.closed, [{ code: 1008, reason: 'board deleted' }]);
+    assert.equal(hub.get(peer.id), undefined);
+  }
+  assert.deepEqual(c.socket.sent, []);
+  assert.deepEqual(hub.stats(), { rooms: 1, peers: 1 });
+  assert.equal(hub.closeRoom('gone'), 0, 'idempotent');
+  assert.equal(hub.closeRoom(PENDING_ROOM), 0);
+});
+
+/** Resolve with the close code the server sent this client (or 'timeout'). */
+function closeCodeOf(c, timeout = 2000) {
+  return new Promise((resolve) => {
+    if (c.ws.readyState === WebSocket.CLOSED) return resolve('already-closed');
+    const timer = setTimeout(() => resolve('timeout'), timeout);
+    c.ws.once('close', (code) => {
+      clearTimeout(timer);
+      resolve(code);
+    });
+  });
+}
+
+test('protocol: the sweeper hangs up on a silent peer, which can then re-join and resync', async (t) => {
+  let t0 = 1_000_000;
+  const { url, board, hub, store } = await serve(t, { now: () => t0 });
+  const { c: a } = await joined(t, url, board.id, 'Ada');
+  const { c: b } = await joined(t, url, board.id, 'Bob');
+
+  // Ada's tab sleeps past the TTL; Bob keeps pinging.
+  t0 += 40_000;
+  b.send({ type: WS_MSG.PING });
+  await settle(20);
+  const closed = closeCodeOf(a);
+  assert.equal(hub.prune(), true);
+  assert.equal(await closed, CLOSE_IDLE, 'the zombie is told, so it reconnects');
+  const presence = await b.waitFor(WS_MSG.PRESENCE, { from: b.log.findIndex((m) => m.type === WS_MSG.READY) + 1 });
+  assert.deepEqual(presence.peers.map((p) => p.name), ['Bob']);
+
+  // Bob draws while Ada is away; Ada's reconnect gets it in its snapshot.
+  b.send({ type: WS_MSG.OPS, ops: [rectOp('z-1', 'z1')] });
+  await b.waitFor(WS_MSG.OP_ACK);
+  const { c: again, ready } = await joined(t, url, board.id, 'Ada');
+  assert.deepEqual(ready.elements.map((e) => e.id), ['z1']);
+  b.send({ type: WS_MSG.OPS, ops: [rectOp('z-2', 'z2')] });
+  const op = await again.waitFor(WS_MSG.OP_BROADCAST);
+  assert.equal(op.ops[0].element.id, 'z2', 'and it hears the room again');
+  assert.equal((await store.getSnapshot(board.id)).elements.length, 2);
+});
+
+test('protocol: a socket the hub no longer knows is hung up on at its next message, not served', async (t) => {
+  const { url, board, hub, store } = await serve(t);
+  const { c: a, ready } = await joined(t, url, board.id, 'Ada');
+  hub._detach(ready.peerId); // what the sweeper did before it learned to close
+  const closed = closeCodeOf(a);
+  a.send({ type: WS_MSG.OPS, ops: [rectOp('q-1', 'q1')] });
+  assert.equal(await closed, CLOSE_IDLE);
+  assert.equal(a.ofType(WS_MSG.OP_ACK).length, 0, 'no ack to make a pruned tab think it is connected');
+  assert.equal((await store.getSnapshot(board.id)).elements.length, 0, 'the batch waits for the re-join');
+
+  const { c: b, ready: r2 } = await joined(t, url, board.id, 'Bob');
+  hub._detach(r2.peerId);
+  const closedB = closeCodeOf(b);
+  b.send({ type: WS_MSG.PING });
+  assert.equal(await closedB, CLOSE_IDLE, 'a ping from a forgotten peer is answered with a hang-up');
+});
+
+test('protocol: an empty op batch is refused like REST refuses it, and the rev does not move', async (t) => {
+  const { url, board, store } = await serve(t);
+  const { c: a } = await joined(t, url, board.id, 'Ada');
+  for (let i = 0; i < 3; i++) a.send({ type: WS_MSG.OPS, ops: [] });
+  await settle();
+  const acks = a.ofType(WS_MSG.OP_ACK);
+  assert.equal(acks.length, 3, 'still exactly one ack per batch');
+  for (const ack of acks) {
+    assert.equal(ack.result.status, OP_RESULT.ERROR);
+    assert.equal(ack.result.code, 'VALIDATION_FAILED');
+    assert.match(ack.result.message, /at least one op/);
+  }
+  assert.equal((await store.getSnapshot(board.id)).rev, 0);
+});
+
+test('protocol: sockets that have not joined never receive a roster', async (t) => {
+  const { url, board } = await serve(t);
+  const lurker = client(url);
+  t.after(() => lurker.close());
+  await lurker.open;
+
+  const lost = client(url);
+  t.after(() => lost.close());
+  await lost.open;
+  lost.send({ type: WS_MSG.JOIN, boardId: 'does-not-exist', peer: { name: 'Lost' } });
+  await lost.waitFor('error');
+
+  const quitter = client(url);
+  await quitter.open;
+  quitter.close();
+  await settle();
+
+  assert.deepEqual(lurker.log, [], 'nothing about other connecting sockets');
+  lurker.send({ type: WS_MSG.JOIN, boardId: board.id, peer: { name: 'Lurker' } });
+  await lurker.waitFor(WS_MSG.READY);
+  assert.equal(lurker.log[0].type, WS_MSG.READY, 'the first message a socket gets is its ready');
+});
+
+test('app: DELETE /boards/:id tells the room the board is gone and closes it (1008)', async (t) => {
+  const store = createMemoryStore();
+  const hub = new Hub();
+  const app = await buildApp({
+    store,
+    hub,
+    config: { apiPrefix: '/api', bodyLimit: 1024 * 1024, logLevel: 'silent', isProduction: false, corsOrigin: ['*'] },
+  });
+  await app.listen({ port: 0, host: '127.0.0.1' });
+  t.after(() => app.close());
+  const board = await store.createBoard({ title: 'Doomed' });
+  const other = await store.createBoard({ title: 'Survivor' });
+  const url = `ws://127.0.0.1:${app.server.address().port}/api/ws`;
+  const { c: editor } = await joined(t, url, board.id, 'Ada');
+  const { c: viewer } = await joined(t, url, board.id, 'Bob');
+  const { c: elsewhere } = await joined(t, url, other.id, 'Cy');
+  const closes = [closeCodeOf(editor), closeCodeOf(viewer)];
+
+  const res = await app.inject({ method: 'DELETE', url: `/api/boards/${board.id}` });
+  assert.equal(res.statusCode, 200);
+  for (const c of [editor, viewer]) {
+    const err = await c.waitFor('error');
+    assert.equal(err.code, 'BOARD_NOT_FOUND', 'the same fatal code as joining an unknown board');
+    assert.equal(err.boardId, board.id);
+  }
+  assert.deepEqual(await Promise.all(closes), [1008, 1008]);
+  assert.deepEqual(hub.peersOf(board.id), []);
+  await settle();
+  assert.equal(elsewhere.ofType('error').length, 0, 'other boards are untouched');
+  assert.equal(elsewhere.ws.readyState, WebSocket.OPEN);
 });

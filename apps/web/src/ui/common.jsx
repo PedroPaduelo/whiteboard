@@ -86,6 +86,40 @@ export function useOutsideClose(ref, open, onClose, ignoreSelector) {
   }, [open, ref, ignoreSelector]);
 }
 
+const MENU_ITEM_SELECTOR = '[role="menuitem"],[role="menuitemcheckbox"]';
+
+/** Enabled, rendered menu items of a menu (phone-only items are display:none on desktop). */
+function menuItems(root) {
+  if (!root) return [];
+  return [...root.querySelectorAll(MENU_ITEM_SELECTOR)].filter((el) => !el.disabled && el.getClientRects().length > 0);
+}
+
+/**
+ * Put keyboard focus on the first item of a menu that just opened, so arrow
+ * keys move through the menu instead of reaching the board (where they nudge
+ * the selection). Call it once the menu is VISIBLE: browsers refuse to focus
+ * an element under `visibility: hidden`.
+ * @returns {boolean} whether an item took focus
+ */
+export function focusFirstMenuItem(root) {
+  const first = menuItems(root)[0];
+  if (!first) return false;
+  first.focus({ preventScroll: true });
+  return document.activeElement === first;
+}
+
+/**
+ * Focus the first item whenever `open` turns true (menus opened by a click
+ * on a button that does not take focus). Returns the ref for the menu root.
+ */
+export function useMenuFocus(open) {
+  const ref = useRef(null);
+  useEffect(() => {
+    if (open) focusFirstMenuItem(ref.current);
+  }, [open]);
+  return ref;
+}
+
 /**
  * Arrow-key navigation inside a role="menu": Up/Down/Home/End move focus
  * between enabled menu items. Returns an onKeyDown handler.
@@ -94,7 +128,7 @@ export function menuKeyNav(e) {
   const keys = ['ArrowDown', 'ArrowUp', 'Home', 'End'];
   if (!keys.includes(e.key)) return;
   const root = e.currentTarget;
-  const items = [...root.querySelectorAll('[role="menuitem"],[role="menuitemcheckbox"]')].filter((el) => !el.disabled);
+  const items = menuItems(root);
   if (!items.length) return;
   e.preventDefault();
   e.stopPropagation();

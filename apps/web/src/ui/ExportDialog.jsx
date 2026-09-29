@@ -89,8 +89,9 @@ function ExportBody() {
     try {
       await fn();
     } catch (err) {
+      // The error's own text is English (canvas, clipboard, fonts): console only.
       console.error('[export] failed', err);
-      toast.error(`${t.toast.exportFailed}: ${err?.message ?? err}`);
+      toast.error(t.toast.exportFailed);
     } finally {
       setBusy(false);
     }

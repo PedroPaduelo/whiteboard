@@ -8,9 +8,12 @@
  * see, not a re-interpretation of it.
  *
  * Dark mode is the editor's CSS filter (invert 93% + hue-rotate 180°) applied
- * to the finished picture: an SVG <feColorMatrix> with the identical matrix,
- * or the same matrix over the PNG pixels. So a dark export matches the dark
- * screen, sticky text included.
+ * to the drawing: an SVG <feColorMatrix> with the identical matrix, or the
+ * same matrix over the PNG pixels. So a dark export matches the dark screen,
+ * sticky text included. Raster images are left out of it, as on screen: a
+ * photo keeps its colours instead of turning into a negative. (The matrix is
+ * affine per pixel, so darkening the runs of elements between two images
+ * separately composes to the same picture as darkening it all at once.)
  *
  * JSON: `serializeBoard` writes version 2 ({type:'whiteboard', version: 2}),
  * `parseBoardFile` reads version 2 and the legacy version 1
@@ -33,7 +36,7 @@ import {
   DARK_MATRIX,
   arrowheadBaseSize,
 } from '../render/shape.js';
-import { drawElement, STICKY_DEFAULT_FILL, STICKY_RADIUS } from '../render/renderElement.js';
+import { drawElement, textPaintBounds, STICKY_DEFAULT_FILL, STICKY_RADIUS } from '../render/renderElement.js';
 
 /* ------------------------------------------------------------------ *
  * Shared helpers
@@ -44,8 +47,29 @@ const SAFE_COLOR = /^(#[0-9a-fA-F]{3,8}|rgba?\([\d\s.,%]+\)|hsla?\([\d\s.,%]+\)|
 /** Same image-src grammar as the shared validator. */
 const SAFE_IMAGE_SRC = /^(data:image\/(png|jpe?g|gif|webp|svg\+xml);base64,[A-Za-z0-9+/=]+|https:\/\/[^\s]+)$/;
 
+/**
+ * Characters XML 1.0 does not allow anywhere, not even escaped: C0 controls
+ * other than tab/newline/CR, U+FFFE/U+FFFF, and unpaired surrogates. One of
+ * them in a text line (Word's soft line break is U+000B, PDFs carry form
+ * feeds) made the whole SVG unparseable. Form feed paints as a space on the
+ * canvas, so it becomes one; a lone surrogate becomes U+FFFD, like a UTF-8
+ * encoder would; the rest paint nothing and are dropped.
+ */
+// Surrogate PAIRS are matched first (and kept) so that only lone halves hit
+// the last alternative; no lookbehind, which older Safari cannot parse.
+const XML_FORBIDDEN = /[\uD800-\uDBFF][\uDC00-\uDFFF]|[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]|[\uD800-\uDFFF]/g;
+
+/** A string made safe for XML text and attribute values. */
+export function xmlText(s) {
+  return String(s).replace(XML_FORBIDDEN, (c) => {
+    if (c.length === 2) return c; // a valid surrogate pair
+    if (c === '\f') return ' ';
+    return c >= '\uD800' && c <= '\uDFFF' ? '\uFFFD' : '';
+  });
+}
+
 function esc(s) {
-  return String(s)
+  return xmlText(s)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
@@ -99,7 +123,9 @@ function exportMargin(el) {
 
 /**
  * Bounds of what an export must show, board units (without padding), or
- * null for an empty list.
+ * null for an empty list: each element's geometric bounds plus its paint
+ * margin, united with the text it paints — a label or a note's text that
+ * runs past its box is part of the picture too.
  */
 export function exportBounds(elements) {
   let minX = Infinity;
@@ -109,12 +135,19 @@ export function exportBounds(elements) {
   for (const el of elements || []) {
     if (!el) continue;
     const b = elementBounds(el);
-    if (!b || !Number.isFinite(b.x) || !Number.isFinite(b.y)) continue;
+    if (!b || !Number.isFinite(b.x) || !Number.isFinite(b.y) || !Number.isFinite(b.w) || !Number.isFinite(b.h)) continue;
     const m = exportMargin(el);
     minX = Math.min(minX, b.x - m);
     minY = Math.min(minY, b.y - m);
     maxX = Math.max(maxX, b.x + b.w + m);
     maxY = Math.max(maxY, b.y + b.h + m);
+    const t = textPaintBounds(el);
+    if (t) {
+      minX = Math.min(minX, t.x);
+      minY = Math.min(minY, t.y);
+      maxX = Math.max(maxX, t.x + t.w);
+      maxY = Math.max(maxY, t.y + t.h);
+    }
   }
   if (!Number.isFinite(minX)) return null;
   return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
@@ -299,7 +332,7 @@ export function exportToSvg(elements, opts = {}) {
   const f = frameOf(list, padding);
   const s = Number.isFinite(scale) && scale > 0 ? scale : 1;
   const ctx = { used: new Set(), shadow: false };
-  const body = list.map((el) => elementSvg(el, ctx)).join('');
+  const body = list.map((el) => elementSvg(el, ctx));
   const css = fontFaceCss(ctx.used, fonts);
   let defs = '';
   if (css) defs += `<style>${css}</style>`;
@@ -308,7 +341,24 @@ export function exportToSvg(elements, opts = {}) {
   const bg = background
     ? `<rect data-role="background" x="${n2(f.x)}" y="${n2(f.y)}" width="${n2(f.w)}" height="${n2(f.h)}" fill="${CANVAS_BACKGROUND}"/>`
     : '';
-  const content = dark ? `<g filter="url(#wb-dark)">${bg}${body}</g>` : `${bg}${body}`;
+  let content = `${bg}${body.join('')}`;
+  if (dark) {
+    // Every run of drawing between images goes through the dark filter; the
+    // images themselves do not (see the header).
+    content = '';
+    let run = bg;
+    const flush = () => {
+      if (run) content += `<g filter="url(#wb-dark)">${run}</g>`;
+      run = '';
+    };
+    list.forEach((el, i) => {
+      if (el.type === 'image') {
+        flush();
+        content += body[i];
+      } else run += body[i];
+    });
+    flush();
+  }
   return (
     `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" version="1.1" ` +
     `viewBox="${n2(f.x)} ${n2(f.y)} ${n2(f.w)} ${n2(f.h)}" width="${n2(f.w * s)}" height="${n2(f.h * s)}">` +
@@ -390,25 +440,76 @@ export function applyDarkToPixels(data) {
   return data;
 }
 
+const pngScaleOf = (scale) => (Number.isFinite(scale) && scale > 0 ? scale : 2);
+
+/** The requested scale, reduced until the frame fits the canvas limits. */
+function clampPngScale(f, requested) {
+  return Math.min(requested, MAX_SIDE / f.w, MAX_SIDE / f.h, Math.sqrt(MAX_AREA / (f.w * f.h)));
+}
+
+/**
+ * The pixel size a PNG export of `elements` will have, with the same frame
+ * and the same limits exportToPngBlob applies: a board too big for a canvas
+ * at the requested scale is exported smaller, and `reduced` says so (the
+ * dialog must show the real size, not the requested one).
+ * @param {object[]} elements
+ * @param {{padding?:number, scale?:number}} [opts]
+ * @returns {{width:number, height:number, scale:number, requestedScale:number, reduced:boolean}}
+ */
+export function pngExportSize(elements, { padding = 10, scale = 2 } = {}) {
+  const list = (elements || []).filter((el) => el && typeof el === 'object');
+  const f = frameOf(list, padding);
+  const requestedScale = pngScaleOf(scale);
+  const s = clampPngScale(f, requestedScale);
+  return {
+    width: Math.max(1, Math.ceil(f.w * s)),
+    height: Math.max(1, Math.ceil(f.h * s)),
+    scale: s,
+    requestedScale,
+    reduced: s < requestedScale,
+  };
+}
+
 /**
  * PNG of `elements`, drawn with the on-screen renderer on an offscreen canvas.
+ * A board too big for a browser canvas at `scale` is drawn at the largest
+ * scale that fits (pngExportSize predicts it), and at half that again if the
+ * browser still refuses; `onScale` hears the size actually produced.
  * @param {object[]} elements
- * @param {{background?:boolean, dark?:boolean, padding?:number, scale?:number}} [opts]
+ * @param {{background?:boolean, dark?:boolean, padding?:number, scale?:number,
+ *          onScale?:(info:{width:number, height:number, scale:number,
+ *                          requestedScale:number, reduced:boolean}) => void}} [opts]
  * @returns {Promise<Blob>}
  */
 export async function exportToPngBlob(elements, opts = {}) {
-  const { background = true, dark = false, padding = 10, scale = 2 } = opts;
+  const { background = true, dark = false, padding = 10, scale = 2, onScale } = opts;
   const list = (elements || []).filter((el) => el && typeof el === 'object');
   await loadFonts();
   const f = frameOf(list, padding);
   const imageCache = await preloadImages(list);
-  let s = Number.isFinite(scale) && scale > 0 ? scale : 2;
-  s = Math.min(s, MAX_SIDE / f.w, MAX_SIDE / f.h, Math.sqrt(MAX_AREA / (f.w * f.h)));
+  const requestedScale = pngScaleOf(scale);
+  let s = clampPngScale(f, requestedScale);
   let lastError = null;
   for (let attempt = 0; attempt < 3; attempt++, s /= 2) {
     try {
       const blob = await renderPng(list, f, s, { background, dark, imageCache });
-      if (blob) return blob;
+      if (blob) {
+        if (typeof onScale === 'function') {
+          const info = {
+            width: Math.max(1, Math.ceil(f.w * s)),
+            height: Math.max(1, Math.ceil(f.h * s)),
+            scale: s,
+            requestedScale,
+            reduced: s < requestedScale,
+          };
+          try {
+            onScale(info);
+          } catch (err) {
+            console.error('[export] onScale callback failed', err);
+          }
+        }
+        return blob;
+      }
     } catch (err) {
       lastError = err;
     }
@@ -422,18 +523,61 @@ async function renderPng(list, f, s, { background, dark, imageCache }) {
   const canvas = makeCanvas(W, H);
   const ctx = canvas.getContext('2d');
   if (!ctx) return null;
-  if (background) {
-    ctx.fillStyle = CANVAS_BACKGROUND;
-    ctx.fillRect(0, 0, W, H);
-  }
-  ctx.setTransform(s, 0, 0, s, -f.x * s, -f.y * s);
-  for (const el of list) drawElement(ctx, el, { zoom: s, imageCache });
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  if (dark) {
-    const img = ctx.getImageData(0, 0, W, H);
+  const board = (c) => c.setTransform(s, 0, 0, s, -f.x * s, -f.y * s);
+  const darken = (c) => {
+    c.setTransform(1, 0, 0, 1, 0, 0);
+    const img = c.getImageData(0, 0, W, H);
     applyDarkToPixels(img.data);
-    ctx.putImageData(img, 0, 0);
+    c.putImageData(img, 0, 0);
+  };
+
+  if (!dark || !list.some((el) => el.type === 'image')) {
+    if (background) {
+      ctx.fillStyle = CANVAS_BACKGROUND;
+      ctx.fillRect(0, 0, W, H);
+    }
+    board(ctx);
+    for (const el of list) drawElement(ctx, el, { zoom: s, imageCache });
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    if (dark) darken(ctx);
+    return canvasToBlob(canvas);
   }
+
+  // Dark with images: each run of drawing between two images is painted on
+  // a scratch layer, darkened there and composited; images go straight onto
+  // the picture, so they keep their colours.
+  const layer = makeCanvas(W, H);
+  const lctx = layer.getContext('2d');
+  if (!lctx) return null;
+  let pendingBackground = background;
+  let run = [];
+  const flush = () => {
+    if (!run.length && !pendingBackground) return;
+    lctx.setTransform(1, 0, 0, 1, 0, 0);
+    lctx.clearRect(0, 0, W, H);
+    if (pendingBackground) {
+      lctx.fillStyle = CANVAS_BACKGROUND;
+      lctx.fillRect(0, 0, W, H);
+      pendingBackground = false;
+    }
+    board(lctx);
+    for (const el of run) drawElement(lctx, el, { zoom: s, imageCache });
+    darken(lctx);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.drawImage(layer, 0, 0);
+    run = [];
+  };
+  for (const el of list) {
+    if (el.type !== 'image') {
+      run.push(el);
+      continue;
+    }
+    flush();
+    board(ctx);
+    drawElement(ctx, el, { zoom: s, imageCache });
+  }
+  flush();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
   return canvasToBlob(canvas);
 }
 
@@ -488,6 +632,23 @@ export function serializeBoard(elements, { board } = {}) {
 const fail = (code, error, extra = {}) => ({ ok: false, code, error, ...extra });
 
 /**
+ * A validator failure in words for the person opening the file. The shared
+ * validator speaks English to developers ("element.x: expected a finite
+ * number"); the toast must be Portuguese, so only the field it names is kept
+ * (the original goes along as `detail`, for the console).
+ */
+function describeInvalid(res, raw) {
+  const field = String(res.path || '').replace(/^element\.?/, '');
+  if (field === 'type') {
+    const type = raw && typeof raw === 'object' ? raw.type : undefined;
+    return typeof type === 'string' && type ? `tipo de elemento desconhecido (“${type.slice(0, 40)}”).` : 'falta o tipo do elemento.';
+  }
+  if (field === 'id') return 'id ausente ou inválido.';
+  if (!field) return raw && typeof raw === 'object' && !Array.isArray(raw) ? 'falta o id.' : 'não é um elemento.';
+  return `valor inválido em “${field}”.`;
+}
+
+/**
  * Read a board file. Accepts version 2 ({type:'whiteboard', version:2}),
  * the legacy version 1 ({version:1, kind:'whiteboard.elements'}) and a bare
  * element array. Every element is validated with the shared validator; ids
@@ -495,7 +656,9 @@ const fail = (code, error, extra = {}) => ({ ok: false, code, error, ...extra })
  *
  * @param {string|object} text
  * @returns {{ok:true, elements:object[], board:object|null, version:number} |
- *           {ok:false, error:string, code:string, index?:number}}
+ *           {ok:false, error:string, code:string, index?:number, detail?:string}}
+ *   `error` is Portuguese, for the person; `detail`, when present, is the
+ *   parser's or validator's own (English) message, for developers.
  */
 export function parseBoardFile(text) {
   let data = text;
@@ -503,7 +666,9 @@ export function parseBoardFile(text) {
     try {
       data = JSON.parse(text);
     } catch (e) {
-      return fail('json', `Arquivo inválido: não é um JSON (${e.message}).`);
+      // The engine's own message is English (and engine-specific): kept for
+      // the console only.
+      return fail('json', 'Arquivo inválido: não é um JSON.', { detail: e?.message });
     }
   }
   if (!data || typeof data !== 'object') return fail('format', 'Arquivo inválido: não é um quadro.');
@@ -535,7 +700,9 @@ export function parseBoardFile(text) {
   const seen = new Set();
   for (let i = 0; i < list.length; i++) {
     const res = tryValidateElement(list[i]);
-    if (!res.valid) return fail('element', `Elemento ${i} inválido: ${res.error}`, { index: i });
+    if (!res.valid) {
+      return fail('element', `Elemento ${i} inválido: ${describeInvalid(res, list[i])}`, { index: i, detail: res.error });
+    }
     if (seen.has(res.element.id)) {
       return fail('element', `Elemento ${i} inválido: id repetido (${res.element.id}).`, { index: i });
     }

@@ -17,8 +17,22 @@ import { initialTheme, persistTheme } from './theme.js';
 
 /** Overlays closed by Escape, topmost first. The library sidebar is not one:
  *  it is a docked panel with its own close button (Escape there clears the
- *  selection, as everywhere on the board). */
-const ESCAPE_ORDER = ['contextMenu', 'confirm', 'moreToolsOpen', 'menuOpen', 'nicknameOpen', 'exportOpen', 'helpOpen', 'propsOpen'];
+ *  selection, as everywhere on the board). The colour popover is: Escape
+ *  closes just the picker and keeps the selection (Excalidraw). */
+const ESCAPE_ORDER = [
+  'contextMenu',
+  'confirm',
+  'moreToolsOpen',
+  'menuOpen',
+  'nicknameOpen',
+  'exportOpen',
+  'helpOpen',
+  'colorPicker',
+  'propsOpen',
+];
+
+/** Overlay keys whose "closed" value is null rather than false. */
+const NULL_WHEN_CLOSED = new Set(['contextMenu', 'confirm', 'colorPicker']);
 
 export const useUi = create((set, get) => ({
   theme: initialTheme(),
@@ -34,8 +48,26 @@ export const useUi = create((set, get) => ({
   contextMenu: null,
   /** `{title, message, confirmLabel, danger, resolve}` — or null. */
   confirm: null,
+  /**
+   * The properties panel's open colour popover: the row that owns it
+   * ('stroke' | 'fill') or null. Kept here, not in the row, so Escape can
+   * close it like any other overlay — in the hex field too.
+   */
+  colorPicker: null,
   /** Registered by App: go to a board id, or to the list with null. */
   navigate: null,
+  /**
+   * What the canvas is in the middle of, for the hint line (ui/hints.js
+   * GESTURE_HINTS): 'linearMulti' while a connector is placed click by
+   * click, 'pointEditing' while one is in point editing, else null. Written
+   * by editor/Canvas.jsx.
+   */
+  gestureHint: null,
+
+  setGestureHint(kind) {
+    const next = kind === 'linearMulti' || kind === 'pointEditing' ? kind : null;
+    if (get().gestureHint !== next) set({ gestureHint: next });
+  },
 
   setTheme(theme, { persist = false } = {}) {
     if (theme !== 'light' && theme !== 'dark') return;
@@ -55,11 +87,21 @@ export const useUi = create((set, get) => ({
     set({ [key]: true, menuOpen: key === 'menuOpen', moreToolsOpen: key === 'moreToolsOpen', contextMenu: null });
   },
   close(key) {
-    if (get()[key]) set({ [key]: key === 'contextMenu' || key === 'confirm' ? null : false });
+    if (get()[key]) set({ [key]: NULL_WHEN_CLOSED.has(key) ? null : false });
   },
   toggle(key) {
     if (get()[key]) get().close(key);
     else get().open(key);
+  },
+
+  /** Open the colour popover of one properties row (closing another row's). */
+  openColorPicker(row) {
+    if (row && get().colorPicker !== row) set({ colorPicker: row });
+  },
+  /** Close the colour popover; with `row`, only if that row owns it. */
+  closeColorPicker(row) {
+    const cur = get().colorPicker;
+    if (cur && (!row || cur === row)) set({ colorPicker: null });
   },
 
   openContextMenu(info) {
@@ -101,6 +143,8 @@ export const useUi = create((set, get) => ({
       propsOpen: false,
       contextMenu: null,
       confirm: null,
+      colorPicker: null,
+      gestureHint: null,
     });
     if (c) c.resolve(false);
   },
