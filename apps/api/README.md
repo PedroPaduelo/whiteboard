@@ -22,7 +22,7 @@ npm run start:api        # single run
 ```
 
 The API prints its bound URL on boot in non-production. With an empty store it
-also seeds a small **Demo** board, so the first visitor sees a working canvas
+also seeds a small **Demonstração** board, so the first visitor sees a working canvas
 rather than a blank one.
 
 From inside this directory instead:
@@ -183,7 +183,7 @@ src/
   plugins/
     cors.js          * or exact-match allowlist
     errors.js        one {statusCode, code, error, message} shape
-    health.js        /health and /live
+    health.js        /health
   routes/            REST (see the contract)
   store/             sqlite + memory drivers
   ws/                hub + @fastify/websocket wiring

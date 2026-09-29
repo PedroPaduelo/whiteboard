@@ -63,6 +63,12 @@ export const useUi = create((set, get) => ({
    * by editor/Canvas.jsx.
    */
   gestureHint: null,
+  /**
+   * A NEW text is being typed. Its draft is not in the board store yet, so
+   * the board still looks empty; the welcome screen hides on this. Written by
+   * editor/Canvas.jsx.
+   */
+  textDraftOpen: false,
 
   setGestureHint(kind) {
     const next = kind === 'linearMulti' || kind === 'pointEditing' ? kind : null;
@@ -145,6 +151,7 @@ export const useUi = create((set, get) => ({
       confirm: null,
       colorPicker: null,
       gestureHint: null,
+      textDraftOpen: false,
     });
     if (c) c.resolve(false);
   },

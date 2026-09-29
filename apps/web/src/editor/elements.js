@@ -30,8 +30,13 @@ export const isBindable = (el) =>
   !!el && ['rect', 'ellipse', 'diamond', 'cylinder', 'sticky', 'text', 'image'].includes(el.type);
 /** Types that can hold a label typed into them (double-click to edit). */
 export const isContainer = (el) => !!el && ['rect', 'ellipse', 'diamond', 'cylinder', 'sticky'].includes(el.type);
-/** Rotation is not offered for connectors: shared resolveConnectors ignores it. */
-export const isRotatable = (el) => !!el && !isLinear(el);
+/**
+ * Rotation is not offered for a 2-point connector. A connector with more
+ * points can be rotated: the turn is baked into its points (no `rotation`
+ * field), because shared resolveConnectors ignores rotation.
+ */
+export const isRotatable = (el) =>
+  !!el && (!isLinear(el) || (Array.isArray(el.points) && el.points.length > 2));
 
 /** Style keys that only affect a label or text: font and alignment. */
 const TEXT_STYLE_KEYS = ['fontFamily', 'fontSize', 'align'];

@@ -21,9 +21,6 @@
     "test:all": "npm test && npm run test:web"
   },
   "devDependencies": {
-    "concurrently": "^9.1.0"
-  },
-  "dependencies": {
     "playwright-core": "^1.49.0"
   }
 }

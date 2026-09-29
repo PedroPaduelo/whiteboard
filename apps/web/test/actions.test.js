@@ -373,6 +373,16 @@ test('nudge moves boxes by x/y and polylines by points; bound arrows follow', ()
   assert.equal(byId('ar').endId, 'b');
 });
 
+test('nudging a bound arrow on its own keeps both bindings and its ends on the outlines', () => {
+  S().select(['ar']);
+  const before = byId('ar').points.map((p) => ({ ...p }));
+  actions.nudge(1, 0);
+  assert.equal(byId('ar').startId, 'a');
+  assert.equal(byId('ar').endId, 'b');
+  // The ends were re-resolved onto the (unmoved) shapes, so they did not drift.
+  assert.deepEqual(byId('ar').points, before);
+});
+
 test('repeated nudges coalesce into one undo step', () => {
   S().select(['a']);
   actions.nudge(1, 0);

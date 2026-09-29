@@ -613,9 +613,23 @@ test('renderInteractive: locked selection shows no handles; a linear selection s
     height: 600,
     interaction: { mode: 'idle', linearEdit: { id: 'lin', hoverIndex: 1, activeIndex: 2 } },
   });
-  assert.equal(named(lin, 'arc').length, 3, 'one handle per point');
-  assert.equal(named(lin, 'arcTo').length, 0, 'no box handles for a single connector');
+  // A connector with more than 2 points also gets the transform box
+  // (Excalidraw's shouldShowBoundingBox): 3 point handles + the round rotation handle.
+  assert.equal(named(lin, 'arc').length, 4, 'one handle per point, plus the rotation handle');
+  assert.ok(named(lin, 'arcTo').length > 0, 'box handles for a multi-point connector');
   assert.ok(lin.calls.some((c) => c[0] === 'set' && c[1] === 'fillStyle' && c[2] === SELECTION_COLOR), 'active point filled');
+
+  const two = fakeCtx();
+  renderInteractive(two, {
+    elements: [arrow([{ x: 0, y: 0 }, { x: 100, y: 40 }], { id: 'two' })],
+    selection: new Set(['two']),
+    view: { zoom: 1, panX: 0, panY: 0 },
+    width: 800,
+    height: 600,
+    interaction: { mode: 'idle', linearEdit: { id: 'two', hoverIndex: -1, activeIndex: -1 } },
+  });
+  assert.equal(named(two, 'arc').length, 2, 'a 2-point connector: one handle per point…');
+  assert.equal(named(two, 'arcTo').length, 0, '…and no box handles');
 });
 
 test('renderInteractive: marquee, eraser trail and remote cursors (not my own)', () => {
@@ -975,7 +989,7 @@ test('renderInteractive: point editing shows a halo and "+" midpoints; plain sel
   const halo = (ctx) => ctx.calls.some((c) => c[0] === 'set' && c[1] === 'strokeStyle' && c[2] === 'rgba(105, 101, 219, 0.2)');
   const plain = fakeCtx();
   renderInteractive(plain, { ...base, interaction: { mode: 'idle', linearEdit: { id: 'pe', hoverIndex: -1, activeIndex: -1, editing: false } } });
-  assert.equal(named(plain, 'arc').length, 4, 'only the point handles');
+  assert.equal(named(plain, 'arc').length, 5, 'the point handles plus the box rotation handle');
   assert.ok(!halo(plain));
 
   const editing = fakeCtx();

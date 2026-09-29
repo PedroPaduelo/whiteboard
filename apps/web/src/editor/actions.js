@@ -19,7 +19,8 @@
  *
  * No DOM is required: everything runs under `node --test`. Browser-only bits
  * (the async clipboard, file download, the image picker) are feature-detected
- * and degrade to an in-memory clipboard or a no-op.
+ * and degrade — the clipboard to execCommand('copy'), then to an in-memory
+ * copy that later pastes prefer — or become a no-op.
  *
  * Clipboard format (system clipboard, text/plain):
  *     {"type":"whiteboard/clipboard","elements":[…]}
@@ -810,7 +811,9 @@ export const actions = {
     const s = S();
     const picked = selectedElements(s).filter((el) => !el.locked);
     if (!picked.length || (!dx && !dy)) return false;
-    const patches = moveElements(picked, dx, dy);
+    // With the scene, a bound arrow nudged on its own keeps the ends that are
+    // still close to their shapes instead of unbinding them.
+    const patches = moveElements(picked, dx, dy, { elements: s.elements, zoom: s.view?.zoom ?? 1 });
     const next = applyPatches(s.elements, patches);
     const bind = resolveBindingPatches(
       next,

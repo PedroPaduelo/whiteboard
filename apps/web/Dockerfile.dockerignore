@@ -1,0 +1,20 @@
+# Build-context filter for apps/web/Dockerfile ONLY (BuildKit reads
+# <Dockerfile>.dockerignore next to the Dockerfile; the context is the repo
+# root). Keeps host artefacts out of the build: the host's node_modules (the
+# image installs its own, and it is ~90 MB to upload), a developer's .env
+# files (which would bake a localhost API URL into the bundle), and build
+# output. The image needs package.json, package-lock.json, packages/shared and
+# apps/web/{package.json,index.html,vite.config.js,public,src,nginx.conf}.
+
+**/node_modules
+**/.git
+**/.env
+**/.env.*
+!**/.env.example
+**/*.log
+**/coverage
+**/dist
+apps/api
+apps/web/test
+docs
+scripts

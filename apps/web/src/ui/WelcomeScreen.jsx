@@ -31,7 +31,8 @@ export function WelcomeScreen() {
     (s) => Boolean(s.board) && s.elements.length === 0 && (s.tool === 'select' || s.tool === 'hand') && !s.editingId,
   );
   const libraryOpen = useUi((s) => s.libraryOpen);
-  if (!visible) return null;
+  const textDraft = useUi((s) => s.textDraftOpen);
+  if (!visible || textDraft) return null;
   const ui = useUi.getState;
   return (
     <div className="welcome" data-testid="welcome-screen">

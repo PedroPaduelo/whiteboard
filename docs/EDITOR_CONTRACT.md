@@ -1,10 +1,9 @@
-# Editor contract — the Excalidraw-style rewrite
+# Editor contract
 
-This document is authoritative for the web editor rewrite. Every agent working
-on it codes against the names and shapes here. If you need something from a
-file you do not own, import it by the name in this document; if it does not
-exist yet, code against this contract and move on — do not create or edit
-another agent's files.
+The architecture reference for the web editor: the names, shapes and rules
+the modules of `apps/web` (and the parts of `@whiteboard/shared` they rely on)
+agree on. When code and this document disagree, one of them is a bug; fix the
+code or update this document in the same change.
 
 **Goal.** The editor looks and behaves like Excalidraw: a single HTML canvas
 with a hand-drawn look (roughjs), smooth freehand (perfect-freehand), the
@@ -17,7 +16,7 @@ op-based realtime sync, and the Fastify API.
 `apps/web/src/ui/strings.js` (one exported object `t`). Code comments stay in
 English, matching the codebase.
 
-**Already written (foundation, owned by the orchestrator — read, do not edit):**
+**Foundation modules** (small, shared by every area below; change them with care):
 
 - `apps/web/src/editor/constants.js` — palettes, `DEFAULT_STYLE`, sizes, fonts, handle sizes, zoom steps. The enums `FILL_STYLES`, `STROKE_STYLES`, `ROUNDNESS`, `ARROWHEADS`, `TEXT_ALIGNS` are RE-EXPORTED from `@whiteboard/shared`, never declared again (a web copy of `FILL_STYLES` once lacked `'zigzag'`).
 - `apps/web/src/editor/text.js` — `fontString`, `measureLine`, `measureText`, `wrapText`, `trimTrailingSpaces`, `labelKeyOf`, `textOf`, `labelBox`, `layoutText`, `fitTextElement`, `textColorOf`, `lineHeightPx`.
@@ -27,13 +26,13 @@ English, matching the codebase.
 - Fonts: `apps/web/public/fonts/Virgil-Regular.woff2`, `apps/web/public/fonts/CascadiaCode-Regular.woff2` (both SIL OFL 1.1, from the Excalidraw distribution).
 - Dependencies `roughjs` and `perfect-freehand` are installed in `apps/web`.
 
-The legacy directories `apps/web/src/flow/`, `apps/web/src/dnd/` and
-`apps/web/src/canvas/` (React Flow, dnd-kit, the old renderer) were removed at
-integration; nothing may import them again.
+The editor used to be a React Flow layer plus a separate pen canvas
+(`apps/web/src/flow/`, `dnd/`, `canvas/`). Those were removed in the rewrite;
+nothing may import them again.
 
 ---
 
-## 1. Element model changes (`packages/shared`)
+## 1. Element model (`packages/shared`)
 
 All new fields are OPTIONAL, so every existing board stays valid. Add each to
 `validateElement` AND to `PATCHABLE` + `sanitisePatch` (otherwise creates keep
@@ -81,7 +80,7 @@ rotate the result out), then push the point `gap` units outward along the ray.
 entries), and `WS_MSG.BOARD = 'board'` (server → client: board metadata
 changed, payload `{type:'board', board}`).
 
-## 2. Server fixes (`apps/api`)
+## 2. Server behaviour (`apps/api`)
 
 - WS ack and REST op results carry `applied: string[]` (opIds applied) in
   addition to `appliedOps`. The WS ack omits the full `elements` list (REST
@@ -105,7 +104,7 @@ changed, payload `{type:'board', board}`).
   `roundness: 'round'` on rects, `fontFamily: 'hand'`. Texts in Portuguese.
 - Update `docs/API_CONTRACT.md` to match.
 
-## 3. Store (`apps/web/src/store/boardStore.js`) — additions
+## 3. Store (`apps/web/src/store/boardStore.js`)
 
 Everything in the current store stays. Add / change:
 
@@ -161,18 +160,18 @@ applyRemoteOps(ops)                  // apply a batch, then ONE resolveConnector
 - `api/queries.js` `useUpdateBoard(id).mutate({title})` must PATCH
   `/boards/<id>` with `{title}`.
 
-## 5. Module map and ownership
+## 5. Module map
 
-| Path | Owner |
+| Path | Area |
 | --- | --- |
-| `packages/shared/**`, `apps/api/**`, `docs/API_CONTRACT.md`, `scripts/seed-showcase.mjs` | **model** agent |
-| `apps/web/src/store/boardStore.js`, `store/index.js`, `store/selectors.js`, `store/store.test.js`, `apps/web/src/realtime/**`, `apps/web/src/api/**`, `apps/web/test/realtime.test.js` | **sync** agent |
-| `apps/web/src/editor/render/**`, `apps/web/src/editor/export/**`, `apps/web/src/editor/fonts.js`, `apps/web/test/render.test.js`, `apps/web/test/export.test.js` | **render** agent |
-| `apps/web/src/editor/scene.js`, `editor/hitTest.js`, `editor/interaction.js`, `editor/Canvas.jsx`, `editor/TextEditor.jsx`, `editor/image.js`, `apps/web/test/scene.test.js`, `apps/web/test/hitTest.test.js`, `apps/web/test/interaction.test.js` | **interaction** agent |
-| `apps/web/src/App.jsx`, `main.jsx`, `apps/web/src/ui/**`, `apps/web/src/styles/**`, `apps/web/src/editor/actions.js`, `apps/web/src/store/presets.js`, `apps/web/index.html`, `apps/web/vite.config.js`, `apps/web/package.json`, `apps/web/test/actions.test.js`, `apps/web/test/shortcuts.test.js` | **ui** agent |
-| `apps/web/src/editor/{constants,text,elements,tools,handles}.js`, `apps/web/test/text.test.js`, `apps/web/test/elements.test.js`, `docs/EDITOR_CONTRACT.md`, fonts, `README.md`, `apps/*/README.md`, root `package.json` | orchestrator / core (read-only for agents) |
+| `packages/shared/**`, `apps/api/**`, `docs/API_CONTRACT.md`, `scripts/seed-showcase.mjs` | **model** |
+| `apps/web/src/store/boardStore.js`, `store/index.js`, `store/store.test.js`, `apps/web/src/realtime/**`, `apps/web/src/api/**`, `apps/web/test/realtime.test.js` | **sync** |
+| `apps/web/src/editor/render/**`, `apps/web/src/editor/export/**`, `apps/web/src/editor/fonts.js`, `apps/web/test/render.test.js`, `apps/web/test/export.test.js` | **render** |
+| `apps/web/src/editor/scene.js`, `editor/hitTest.js`, `editor/interaction.js`, `editor/Canvas.jsx`, `editor/TextEditor.jsx`, `editor/image.js`, `apps/web/test/scene.test.js`, `apps/web/test/hitTest.test.js`, `apps/web/test/interaction.test.js` | **interaction** |
+| `apps/web/src/App.jsx`, `main.jsx`, `apps/web/src/ui/**`, `apps/web/src/styles/**`, `apps/web/src/editor/actions.js`, `apps/web/src/store/presets.js`, `apps/web/index.html`, `apps/web/vite.config.js`, `apps/web/package.json`, `apps/web/test/actions.test.js`, `apps/web/test/shortcuts.test.js` | **ui** |
+| `apps/web/src/editor/{constants,text,elements,tools,handles}.js`, `apps/web/test/text.test.js`, `apps/web/test/elements.test.js`, `docs/EDITOR_CONTRACT.md`, fonts, `README.md`, `apps/*/README.md`, root `package.json` | **core** (foundation) |
 
-## 6. Rendering API (render agent)
+## 6. Rendering (area: render)
 
 The static canvas and the interactive canvas are both sized in DEVICE px
 (`canvas.width = cssW * dpr`). Every render function sets its own transform:
@@ -255,7 +254,7 @@ SVG export must embed the Virgil/Cascadia fonts as `@font-face` with a data URL
 only when text is present (fetch `/fonts/…woff2` → base64; in node tests fall
 back to the family name).
 
-## 7. Interaction (interaction agent)
+## 7. Interaction (area: interaction)
 
 ```js
 // editor/scene.js — pure geometry over elements (no DOM)
@@ -366,7 +365,7 @@ export async function fileToImageElement(file, at /*board point*/, style): Promi
 export function openImagePicker(): Promise<File|null>
 ```
 
-## 8. UI (ui agent)
+## 8. UI (area: ui)
 
 Layout (Excalidraw islands, all floating over the full-screen canvas):
 - **Top-left**: hamburger `MainMenu` — Abrir (JSON), Salvar em arquivo,

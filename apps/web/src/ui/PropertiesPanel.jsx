@@ -2,8 +2,8 @@
  * PropertiesPanel.jsx — Excalidraw's left-hand style panel.
  *
  * Visible while a drawing tool is active (keys from `styleKeysForTool`) or
- * while something is selected (union of `styleKeysFor` over the selected
- * types). A row shows the selection's common value, or nothing highlighted
+ * while something is selected (union of `styleKeysForElement` over the selected
+ * elements). A row shows the selection's common value, or nothing highlighted
  * when the selection disagrees. Every edit goes through
  * `actions.applyStyle(patch)`, which updates the default style AND patches the
  * selection (only the keys each type uses) as one undo step per control.
@@ -27,7 +27,7 @@ import {
   FONT_SIZES,
   TEXT_ALIGNS,
 } from '../editor/constants.js';
-import { styleKeysFor, styleKeysForTool } from '../editor/elements.js';
+import { styleKeysForElement, styleKeysForTool } from '../editor/elements.js';
 import { actions, groupAvailability } from '../editor/actions.js';
 import { useBoardStore, useStyle, useTool } from '../store/index.js';
 import { useUi } from './uiStore.js';
@@ -116,7 +116,7 @@ function commonValue(elements, key) {
   let out;
   let seen = false;
   for (const el of elements) {
-    if (!styleKeysFor(el.type).includes(key)) continue;
+    if (!styleKeysForElement(el).includes(key)) continue;
     const v = effective(el, key);
     if (!seen) {
       out = v;
@@ -439,11 +439,18 @@ export function PropertiesPanel() {
   const selected = useSelectedElements();
   const groupMask = useBoardStore(groupButtons);
   const sheetOpen = useUi((s) => s.propsOpen);
+  const editingId = useBoardStore((s) => s.editingId);
 
   const model = useMemo(() => {
     const hasSel = selected.length > 0;
     const types = hasSel ? [...new Set(selected.map((el) => el.type))] : [tool];
-    const keys = new Set(hasSel ? types.flatMap((ty) => styleKeysFor(ty)) : styleKeysForTool(tool));
+    // Per element, not per type: an unlabelled shape has no font controls,
+    // unless its first label is being typed right now.
+    const keys = new Set(
+      hasSel
+        ? selected.flatMap((el) => styleKeysForElement(el, { editing: el.id === editingId }))
+        : styleKeysForTool(tool),
+    );
     const onlySticky = types.every((ty) => ty === 'sticky');
     const value = (k) => {
       if (hasSel) return commonValue(selected, k);
@@ -452,7 +459,7 @@ export function PropertiesPanel() {
       return style[k];
     };
     return { hasSel, types, keys, onlySticky, value };
-  }, [selected, tool, style]);
+  }, [selected, tool, style, editingId]);
 
   const { hasSel, types, keys, onlySticky, value } = model;
   if (!hasSel && keys.size === 0) return null;

@@ -112,11 +112,10 @@ export const DUPLICATE_OFFSET = 10;
 
 /* --- view ----------------------------------------------------------------- */
 
-export const ZOOM_STEP = 1.1;
-export const ZOOM_BUTTON_FACTOR = 1.25;
-export const WHEEL_ZOOM_SENSITIVITY = 0.0015;
+// Zoom range and step live in @whiteboard/shared (ZOOM_LIMITS, ZOOM_STEP,
+// stepZoom); the wheel/pinch curve lives in editor/interaction.js.
 
-/** Grid, when shown, is dots every GRID_SIZE board units (Excalidraw uses 20). */
+/** Grid, when shown, is lines every GRID_SIZE board units, a darker one every 5th (Excalidraw uses 20). */
 export const GRID_SIZE = 20;
 
 /** Canvas background per theme. Dark mode is the light scene run through an

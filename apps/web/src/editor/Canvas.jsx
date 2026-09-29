@@ -50,6 +50,7 @@ import { insertImageFiles, isImageFile, openImagePicker } from './image.js';
 import { actions } from './actions.js';
 import { isControlTarget } from '../ui/shortcuts.js';
 import { useUi } from '../ui/uiStore.js';
+import { gestureHintOf } from '../ui/hints.js';
 import { toast } from '../ui/toast.js';
 import { t } from '../ui/strings.js';
 import TextEditor from './TextEditor.jsx';
@@ -195,7 +196,13 @@ export default function Canvas({ theme = 'light', onContextMenu, onRequestImage 
   // Before paint, so the welcome screen never shows through the new editor.
   const drafting = newText !== null;
   useLayoutEffect(() => publishTextDraft(drafting), [drafting]);
-  useEffect(() => () => publishTextDraft(false), []);
+  useEffect(
+    () => () => {
+      publishTextDraft(false);
+      useUi.getState().setGestureHint(null);
+    },
+    [],
+  );
 
   /* ------------------------------------------------------------ helpers */
 
@@ -297,10 +304,14 @@ export default function Canvas({ theme = 'light', onContextMenu, onRequestImage 
         // A bug in one gesture must not wedge the editor: log, reset, carry on.
         console.error('[canvas] interaction failed', err);
         itRef.current = initialInteraction();
+        useUi.getState().setGestureHint(null);
         scheduleRef.current();
         return false;
       }
       itRef.current = r.state;
+      // Tell the hint line what gesture is in progress (click-click connector,
+      // point editing); the setter ignores repeats, so this is cheap per event.
+      useUi.getState().setGestureHint(gestureHintOf(r.state));
       const canvas = interRef.current;
       applyEffects(r.effects);
       if (canvas && canvas.style.cursor !== r.state.cursor) canvas.style.cursor = r.state.cursor;

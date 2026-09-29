@@ -38,6 +38,7 @@ import {
 import { elementBounds, selectionFrame, transformHandles, rotateAround, commonBounds } from '../handles.js';
 import { isLinear, isRotatable } from '../elements.js';
 import { expandSelectionToGroups } from '../scene.js';
+import { linearShowsBox } from '../interaction.js';
 import { onFontsLoaded } from '../fonts.js';
 import { drawElement, textPaintBounds } from './renderElement.js';
 import { darkPreimage, segmentMidpoints, curveSegments } from './shape.js';
@@ -977,11 +978,15 @@ export function renderInteractive(ctx, p) {
     const hideHandles = mode === 'moving' || mode === 'rotating' || anyLocked;
     if (selected.length === 1) {
       const el = selected[0];
-      if (!(linearEl && linearEl.id === el.id)) {
+      // A connector with more than 2 points also gets the transform box (it
+      // can be resized and rotated, Excalidraw's shouldShowBoundingBox); its
+      // point handles are drawn further down either way.
+      const boxedLinear = linearEl && linearEl.id === el.id && linearShowsBox(el, it.linearEdit);
+      if (!(linearEl && linearEl.id === el.id) || boxedLinear) {
         const f = selectionFrame([el], zoom);
         if (f) {
           strokeFrame(ctx, f, toScreen);
-          if (!hideHandles) drawHandles(ctx, f, zoom, toScreen, { rotatable: isRotatable(el) });
+          if (!hideHandles) drawHandles(ctx, f, zoom, toScreen, { rotatable: boxedLinear || isRotatable(el) });
         }
       }
     } else {
